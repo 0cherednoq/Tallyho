@@ -7,7 +7,8 @@ from uuid import UUID
 import pytest
 
 import tallyho
-from tallyho.model import errors
+import tallyho.model
+from tallyho.model import errors, states
 
 # Снимок родителей: пользователи ловят ошибки по базовым классам.
 PARENTS: dict[type[errors.TallyhoError], type[errors.TallyhoError]] = {
@@ -55,6 +56,15 @@ def test_unsupported_option_with_hint() -> None:
     assert exc.option == "depends_on"
     assert exc.hint == "используйте этапы fed_by"
     assert str(exc).endswith(": используйте этапы fed_by")
+
+
+def test_model_package_reexports_public_names() -> None:
+    sources = {name: getattr(errors, name) for name in errors.__all__}
+    sources |= {name: getattr(states, name) for name in states.__all__}
+    del sources["TERMINAL_THRESHOLD"]
+    assert set(tallyho.model.__all__) == set(sources)
+    for name, obj in sources.items():
+        assert getattr(tallyho.model, name) is obj
 
 
 def test_unsupported_option_without_hint() -> None:
