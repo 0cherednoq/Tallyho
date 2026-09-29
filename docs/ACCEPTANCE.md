@@ -233,12 +233,12 @@ async def some_task(...):
 | A-FQ-06 | `idempotency_key`, `unique_key`, `idempotent=True` пользователя | передаются как есть; повторная отправка relay'ем не создаёт второго выполнения |
 | A-FQ-07 | Несовместимые: `depends_on`, `debounce*`, `@task(batch=...)` | явная ошибка `UnsupportedOption` с подсказкой (этапы `fed_by`) |
 | A-FQ-08 | Ретраи: `max_retries`, `retry_backoff`, `retry_delays`, `max_retry_delay`, `retry_on`, `dont_retry_on` | число выполнений = число попыток flexiq; итог Item: `ok` после успешной попытки, `error("exhausted")` после последней |
-| A-FQ-09 | `retry_budget`, `circuit_breaker` отправляют в DLQ вопреки вердикту `RETRY` | Item становится `error` через `on_dead_letter` или сверку DLQ ≤ `sweep_interval`; батч не зависает |
+| A-FQ-09 | `retry_budget` отправляет в DLQ вопреки вердикту `RETRY`; `circuit_breaker` откладывает джобы до `cooldown` (в DLQ не отправляет) | Item становится `error` через событие `JOB_DEAD` или сверку DLQ ≤ `sweep_interval`; при breaker Item остаётся активным и доделывается после `cooldown`; батч не зависает |
 | A-FQ-10 | `timeout` (жёсткий) — поток продолжает работать после таймаута; `soft_timeout` + `check_timeout()` | жёсткий: ретрай flexiq отсекается живым lease, итог один; мягкий: `SoftTimeoutError` → ретрай или `error` |
 | A-FQ-11 | `cancel_job`, `cancel_running_job` + `check_cancelled()` из flexiq | отменённая джоба → Item `cancelled`; батч финализируется |
 | A-FQ-12 | `rate_limit`, `max_concurrent`, `max_in_flight_per_task` вместе с нашим `max_in_flight` | действуют оба ограничения, фактическая параллельность ≤ минимума |
-| A-FQ-13 | Своя middleware пользователя (глобальная и на задаче), `inject`, `predicate` | вызываются как без tallyho; наша обёртка не мешает `before/after` |
-| A-FQ-14 | `retry_dead`, `replay`, авто-ретрай DLQ из flexiq | новые id джоб → no-op по claim; перезапуск упавших — только `retry_failed` (документировано) |
+| A-FQ-13 | Своя middleware пользователя (глобальная и на задаче), `inject`, `predicate` | вызываются как без tallyho; наша обёртка не мешает `before/after`. Служебный `_th` виден в kwargs у `predicate`, `on_enqueue` и `before_task` (документировано) |
+| A-FQ-14 | `retry_dead`, `replay`, авто-ретрай DLQ из flexiq | новые id джоб → no-op по claim; перезапуск упавших — только `retry_failed` (документировано). `metadata` пользователя этими операциями flexiq не сохраняется (A-FQ-02 проверяется на исходной джобе и её DLQ-записи) |
 | A-FQ-15 | `pool="prefork"` | явная ошибка при `install`; sync-функция под `@fq.task` — ошибка при декорировании |
 | A-FQ-16 | Совместная работа с обычными задачами flexiq | неотслеживаемые задачи в тех же очередях работают как раньше; `th.item.current()` в них — `None` |
 | A-FQ-17 | Совместимость версий | весь §8 зелёный на flexiq 2.0.x (последний патч) и master; при несовместимом API — понятная ошибка при `install` |
