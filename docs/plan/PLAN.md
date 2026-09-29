@@ -1,0 +1,442 @@
+# tallyho v1 — план имплементации
+
+> Версия плана 1.0 · 2026-09-30 · к [ARCHITECTURE.md](../ARCHITECTURE.md) v2.1 и [ACCEPTANCE.md](../ACCEPTANCE.md) 1.0-draft.
+> Прогресс — [PROGRESS.md](PROGRESS.md). Принятые по ходу решения — [DECISIONS.md](DECISIONS.md).
+> План рассчитан на автономное выполнение в `/loop`: **одна итерация = одна задача = серия небольших коммитов** (§0.6).
+
+---
+
+## 0. Протокол итерации `/loop`
+
+Каждая итерация выполняет **ровно одну** задачу и оставляет репозиторий в зелёном состоянии.
+
+### 0.1 Шаги
+
+1. **Сориентироваться.**
+   `git status`, `git log --oneline -5`, прочитать [PROGRESS.md](PROGRESS.md) (таблицу и последние 5 записей журнала) и [DECISIONS.md](DECISIONS.md).
+   Если есть незакоммиченные изменения и задача в статусе `in_progress` — продолжить её, а не брать новую.
+   Если есть незакоммиченные изменения без `in_progress` — разобраться (`git diff`), довести до зелёного или откатить **только свои** изменения этой задачи.
+2. **Выбрать задачу.** Первая сверху в таблице PROGRESS со статусом `todo`, у которой все зависимости `done`.
+   Задачи со статусом `human` и `blocked` пропускаются.
+3. **Отметить** её `in_progress` в PROGRESS.md.
+4. **Прочитать ссылки задачи** в документах (секции указаны в поле «Док»). Историческим документам (DESIGN/API/COUNTERS) верить только там, где они не противоречат ARCHITECTURE.
+5. **Реализовать через тесты маленькими шагами**: тест, который падает → код → гейты → небольшой коммит (§0.6). Повторять, пока задача не готова. Тесты — в `tests/unit/...` (без БД) или `tests/integration/...` (PostgreSQL).
+6. **Прогнать гейты** (§0.2) перед каждым коммитом. Все зелёные — иначе чинить.
+7. **Обновить PROGRESS.md**: статус `done`, хеши коммитов задачи, запись в журнал (дата, задача, что сделано, отклонения, что узнали). Новое архитектурное решение → запись в DECISIONS.md. Это отдельный последний коммит задачи (`T<id>: отметить задачу выполненной`).
+8. Не пушить.
+9. **Решить, продолжать ли цикл** (§0.4).
+
+### 0.2 Гейты (Definition of Done для любой задачи)
+
+| # | Команда | Когда |
+|---|---|---|
+| G1 | `uv run poe check` — ruff format/check, mypy, basedpyright, import-linter, deptry, unit + architecture | всегда |
+| G2 | `uv run poe test-all` — все тесты с PostgreSQL (Docker/testcontainers), покрытие ≥ 95% | всегда, начиная с T0.1 |
+| G3 | DoD задачи из её карточки (конкретные тесты/критерии) | всегда |
+| G4 | `uv run pre-commit run --all-files` | перед коммитом |
+
+Правила, нарушать которые нельзя:
+* **Не ослаблять** линтеры, типизацию, import-linter, покрытие. Точечное подавление — только `# noqa: CODE  # причина`, и это исключение, а не приём.
+* **Не удалять и не отключать** существующие тесты, чтобы стало зелёным. `xfail`/`skip` — только с задачей-владельцем в PROGRESS.
+* **Не менять** архитектурные решения из ARCHITECTURE молча. Если реализация требует отклонения — запись в DECISIONS.md с обоснованием, затем код (отдельным коммитом).
+* Все исключения — подклассы `TallyhoError` (`tallyho.model.errors`). Все модули объявляют `__all__`.
+* Время в SQL — только через `Clock` (D-002). Никаких `datetime.now()` в движке.
+* Только async. Никаких `asyncio.get_event_loop()`, `pickle`, `typing.Any`, `unittest.mock.patch`.
+
+### 0.3 Если задача не получается
+
+* Задача оказалась слишком большой для одной итерации → разбить её в этом файле на подзадачи `Tx.ya`, `Tx.yb` (карточки + строки в PROGRESS), закоммитить сделанную зелёную часть как первую подзадачу.
+* Три честных попытки починить гейты не помогли, или нужен внешний ресурс/решение человека → статус `blocked`, в журнале: причина, что пробовали, что нужно для разблокировки. Незелёный код не коммитить: сохранить его в `git stash` с именем задачи и указать это в журнале. Перейти к следующей доступной задаче.
+* Нашёлся дефект в уже `done` задаче → новая задача `Fix-N` в начало очереди (зависимость — ничего), а не правка «заодно».
+
+### 0.4 Когда останавливать цикл
+
+Цикл работает **без ограничения по времени, пока библиотека не доделана**. Человек недоступен, поэтому цикл не ждёт ответов, а решает сам.
+
+Остановить `/loop` (ScheduleWakeup `stop: true`) и написать сводку **только** если не осталось задач `todo` с выполненными зависимостями (всё `done`, `blocked` или `human`).
+
+Во всех остальных случаях — продолжать:
+* **Противоречие в документах / неясность** → выбрать вариант, наиболее согласованный с ARCHITECTURE и гарантиями §10, записать в DECISIONS.md как `ACCEPTED (автономно, пересмотреть)` с альтернативами и продолжить.
+* **`blocked`-задача** → перейти к следующей доступной. Перед остановкой цикла (когда кажется, что задач нет) один раз вернуться к каждой `blocked` и попробовать снова с учётом того, что сделано позже.
+* **Docker/PostgreSQL недоступен** → не останавливаться: брать задачи, для которых хватает G1 (чистый Python), либо запланировать следующую итерацию через 10 минут и проверить снова. Код, не проверенный G2, не коммитить.
+* **Сеть/установка пакетов упала** → повторить позже (10 минут), не считать это блокировкой задачи сразу.
+
+Задержка между итерациями — 60 с (минимальная).
+
+### 0.5 Окружение
+
+* Windows 11, Git Bash / PowerShell, `uv` 0.10, Docker Desktop. Python ставит `uv` (`uv python install 3.13` при необходимости).
+* Ветка работы — `impl/v1`: pre-commit запрещает коммиты в `main` (`no-commit-to-branch`).
+* PostgreSQL для тестов — testcontainers (`postgres:16-alpine`) или `TALLYHO_TEST_DSN`.
+* Если пакет не ставится под Windows (например, `flexiq` с Rust-расширением) — гонять соответствующие тесты в Linux-контейнере через `scripts/in-docker.sh` (создаётся в T8.0).
+
+### 0.6 Коммиты
+
+* **Небольшие.** Один коммит — одно логически законченное изменение, которое можно прочитать за пару минут: один тип/функция с тестами, один запрос storage, одна правка конфигурации. Ориентир — до ~200 изменённых строк без учёта golden-файлов и lock-файла. Задача обычно даёт 2–6 коммитов.
+* **Каждый коммит зелёный**: гейты G1, G2, G4 проходят на каждом, а не только на последнем. Не коммитить «тест без кода» или «половину функции».
+* **Не смешивать**: рефакторинг, форматирование, новая функциональность и правка документов — разными коммитами.
+* **Сообщение — на русском**:
+  ```
+  T4.3b: CAS завершения Item в групповой транзакции Completer
+
+  Completer блокирует строки th_item в порядке id и обновляет только
+  активные Items; счётчики считаются по вернувшимся строкам, поэтому
+  повторный finish ничего не меняет.
+
+  Co-Authored-By: Claude Opus 5.5 (1M context) <noreply@anthropic.com>
+  ```
+  Заголовок — `T<id>: <что сделано>`, до 72 символов, в безличной форме без точки в конце («добавить», «CAS завершения…», а не «добавил»). Тело — зачем и что важно знать ревьюеру, если это не очевидно из заголовка. Идентификаторы кода, таблиц и команд — как есть, латиницей.
+* **Комментарии и docstring в коде — тоже на русском** (как в текущем скелете), идентификаторы — на английском.
+
+---
+
+## 1. Карта фаз
+
+```
+Ф0 фундамент ─► Ф1 model/protocols ─► Ф2 storage ─► Ф3 hooks ─► Ф4 engine ─► Ф5 runtime ─► Ф6 api ─► Ф7 testing
+                                                                                                  │
+                                           Ф8 flexiq ◄────────────────────────────────────────────┤
+                                           Ф9 примеры ARCHITECTURE §12–13 как тесты ◄─────────────┤
+                                           Ф10 надёжность, наблюдаемость, CLI ◄───────────────────┤
+                                           Ф11 приёмочный стенд ACCEPTANCE ◄──────────────────────┘
+                                           Ф12 документация и релиз
+```
+
+Слои пакета заданы import-linter в `pyproject.toml` (ARCHITECTURE §3.3):
+`cli | adapters | testing` → `api | runtime` → `engine` → `hooks | storage` → `protocols` → `model`.
+Код каждой задачи кладётся в свой слой; нарушение контракта ловит G1.
+
+---
+
+## 2. Задачи
+
+Формат карточки: **Зависит** · **Док** (ссылки) · **Сделать** · **DoD** (помимо гейтов G1–G4).
+
+### Ф0. Фундамент
+
+#### T0.1 — Репозиторий собирается и гейты зелёные на скелете
+* **Зависит:** —
+* **Док:** `pyproject.toml`, `.github/workflows/ci.yml`, `.pre-commit-config.yaml`
+* **Сделать:**
+  * `git checkout -b impl/v1` (коммитов ещё нет — ветка создаётся на «нерождённом» HEAD).
+  * Создать `README.md` (кратко: что это, статус pre-alpha, ссылка на docs), `LICENSE` (MIT, автор из `pyproject`), `CHANGELOG.md` (Keep a Changelog, `Unreleased`). Без них не собирается wheel.
+  * `.gitignore` (Python, uv, `.idea/`, coverage, `.venv`).
+  * `uv lock`, `uv sync --all-extras`. Если `flexiq` не ставится на Windows — `uv sync --extra asyncpg --extra psycopg --extra alembic`, записать в DECISIONS и журнал.
+  * Разнести покрытие: `poe test` = unit без покрытия (`--no-cov`), `poe test-all` = всё с покрытием `fail_under=95` (D-003). Добавить `poe check-all` = `check` + `test-all`.
+  * `uv run pre-commit install`.
+* **DoD:** G1–G4 зелёные на скелете; первый коммит в `impl/v1`, включающий `docs/`, `pyproject.toml`, `uv.lock`.
+
+#### T0.2 — Инфраструктура тестов
+* **Зависит:** T0.1
+* **Док:** ARCHITECTURE §12.6 (фикстуры), ACCEPTANCE §1
+* **Сделать:** в `tests/integration/conftest.py` — фикстура `schema` (уникальная схема на тест, `DROP SCHEMA ... CASCADE` после), фикстура `connection`/`session` (`AsyncSession`), маркер `slow`. Хелпер `tests/helpers/db.py`: счётчик дедлоков (`pg_stat_database.deadlocks`), чтение `pg_locks`. Проверить, что `pytest -n auto` работает с testcontainers (один контейнер на сессию xdist-воркера или общий DSN).
+* **DoD:** пример интеграционного теста использует `schema`; `pytest -n 4` зелёный.
+
+### Ф1. model и protocols (чистый Python, без БД)
+
+#### T1.1 — Перечисления состояний и иерархия ошибок
+* **Зависит:** T0.1
+* **Док:** ARCHITECTURE §2, §6, §11.2; ACCEPTANCE A-DB-05, A-FQ-07, A-UC-13, A-UC-18
+* **Сделать:** `tallyho.model.states`: `BatchState` (`open, sealed, finalizing, succeeded, completed_with_errors, failed, cancelled`), `ItemState` (`active, ok, skip, error, cancelled`), `ResultClass`, `OnFeederFailed`, `CancelReason` (`cancel, deadline, fail_fast, policy`) — `IntEnum`/`StrEnum` со значениями `smallint` из D-005; `is_terminal`. Ошибки: `SpawnTargetError`, `DownstreamFinalized`, `UnsupportedOption`, `HookTransactionError`, `HookMissingError`, `BatchPurged`, `ConcurrentModification`, `SealError` (seal этапа с `fed_by`, add после seal/cancel). Превышение `max_items`/`max_depth` — не ошибка, а счётчик `skipped_by_limit`.
+* **DoD:** юнит-тесты: значения enum стабильны (снимок), терминальность, все ошибки в иерархии.
+
+#### T1.2 — Value-объекты: Progress, BatchSummary, PolicyBreach, FailurePolicy, TaskCall
+* **Зависит:** T1.1
+* **Док:** ARCHITECTURE §3.4 (классы), §7.2, §11.2 (политики), §12.4 (использование в хуках)
+* **Сделать:** frozen `dataclass(slots=True)`: `Progress`, `BatchSummary` (с `children: Mapping[str, BatchSummary]`, `labels`, `metrics`, `seq`, `reason`), `BatchView`, `ItemView`, `InFlightItem`, `PolicyBreach` (`batch_key`, `labels`, `ratio`, `action`). `FailurePolicy.continue_() / fail_fast() / threshold(ratio=, min_processed=, labels=, action="fail"|"pause")` + `evaluate(counts, labels) -> Verdict`. `TaskCall` (task_name, args, kwargs, opts: key, weight, queue, broker-опции как `Mapping[str, object]`).
+* **DoD:** тесты на `FailurePolicy.evaluate` (граничные значения, `min_processed`, фильтр labels); hypothesis: `threshold` монотонна по числу ошибок.
+
+#### T1.3 — Математика прогресса (чистые функции)
+* **Зависит:** T1.2
+* **Док:** ARCHITECTURE §9.3–9.4, §13.3 (таблица t1–t5 и расчёт t2), DYNAMIC_WORKFLOWS §4
+* **Сделать:** `tallyho.model.progress`: `found/done/pending/queued`, правило `expected` (4 строки таблицы §9.4), оценка Кнута по `fed_by` рекурсивно, порог `min(estimate_min_basis, estimate_min_share × expected_F)`, `ratio` по весам для батча и корня, ETA через EMA (`eta_window`). Вход — «сырые» счётчики дерева, выход — `Progress` на каждый узел.
+* **DoD:** тест-таблица, воспроизводящая §13.3 t1…t5 (включая «≈700», «≈1 785», «≈19%»); кейсы §12.6 `expected == 10_000 and expected_is_estimate`; hypothesis: `expected ≥ found`, `0 ≤ ratio ≤ 1` для sealed, sealed ⇒ `expected == found`.
+
+#### T1.4 — Протоколы и базовые реализации
+* **Зависит:** T1.1
+* **Док:** ARCHITECTURE §4.2, §11.3; API.md §3 (контракт адаптера — исторический); D-002, D-006
+* **Сделать:** `tallyho.protocols`: `Message`, `Verdict` (`RETRY/FINAL`), `Dispatcher` (`task_name(fn)`, `dispatch(messages)`), `Runtime` (`wrap(fn)`, `retry_verdict(exc)`, `reconcile_dead(since)`), `Serializer` + `JsonSerializer`, `Clock` (`sql_now()` → SQL-выражение, `monotonic()`), `SystemClock` (`func.now()`), `IdFactory` + `UuidV7Factory` (свой UUIDv7 ≈30 строк; на 3.14 — `uuid.uuid7`), `Observer` + `NullObserver` (события: `item_finished`, `batch_finalized`, `hook_failed`, `hook_missing`, `relay_dispatched`, `completer_flush` …).
+  Внимание: `protocols` не может импортировать `sqlalchemy` (контракт import-linter). Поэтому `Clock.sql_now()` отдаёт не SQL-выражение, а **маркер** — решение, как DB-время передаётся в `storage`, зафиксировать в DECISIONS (D-002 уточнить): например, `Clock.now() -> datetime | None`, где `None` = «используй `now()` БД», а `FakeClock` возвращает значение, которое storage биндит параметром.
+* **DoD:** тест UUIDv7: версия/вариант, монотонность в пределах миллисекунды, сортировка = порядок генерации; `JsonSerializer` round-trip; `runtime_checkable` протоколы проверяются на фейках.
+
+### Ф2. storage (SQLAlchemy Core, PostgreSQL)
+
+#### T2.1 — Описание таблиц и индексов
+* **Зависит:** T1.1
+* **Док:** ARCHITECTURE §5.1, §5.2 (все индексы), §11.4 (`th_expiry`), §5 «`th_meta`»; COUNTERS §3.6 (storage params)
+* **Сделать:** `tallyho.storage.tables`: фабрика `build_metadata(prefix: str) -> Tables` со всеми таблицами: `th_batch, th_item, th_outbox, th_lease, th_feed, th_counter, th_counter_delta, th_metric, th_item_mark, th_expiry, th_meta`. Все partial-индексы §5.2, `fillfactor`, per-table autovacuum для `th_counter/th_metric/th_lease/th_outbox/th_counter_delta`. **Никаких индексов по изменяемым колонкам `th_item`.** Никаких FK. Схема — через `schema_translate_map`.
+* **DoD:** юнит: DDL компилируется под диалект PG, снимок DDL (golden-файл) — чтобы изменения схемы были видны в diff; тест-правило: ни один индекс `th_item` не содержит `state/label/result/error/finished_at`.
+
+#### T2.2 — Миграции и установка в схему
+* **Зависит:** T2.1, T0.2
+* **Док:** ARCHITECTURE §11.1 (`migrate`, alembic), ACCEPTANCE A-NF-01..03
+* **Сделать:** `tallyho.storage.migrations`: версия 1 как список операций; `migrate(engine, schema, prefix)` под `pg_advisory_xact_lock`, `SET LOCAL lock_timeout`, запись версии в `th_meta`, идемпотентность. `tallyho.storage.alembic.upgrade(op, version=1, schema=...)` (модуль импортирует alembic лениво; extra `alembic`). Экранирование имён схемы/префикса, валидация префикса (`^[a-z_][a-z0-9_]{0,15}$`).
+* **DoD:** интеграция: повторный `migrate` — no-op; две установки в разных схемах одной БД не видят друг друга; схема со спецсимволами в имени работает (A-NF-03); миграция через alembic `op` в тестовом окружении.
+
+#### T2.3 — Транзакции: приём сессии пользователя, свои транзакции, ретраи
+* **Зависит:** T2.1, T1.4
+* **Док:** ARCHITECTURE §1 (NFR), §7.3 (правила хука), §10 (дедлок/чужая блокировка), COUNTERS §3.6, §2 P10; ACCEPTANCE A-DB-05, A-DB-09, A-DB-10
+* **Сделать:** `tallyho.storage.tx`: `resolve_connection(session | connection)` (`AsyncSession`, `AsyncConnection`; учёт `begin_nested`), `own_transaction(engine)` c `SET LOCAL lock_timeout/statement_timeout`, retry на `40001/40P01/55P03` с экспоненциальным backoff и джиттером (детерминированным от `Clock`/seed в тестах), `after_commit(session, callback)` — регистрация через события SQLAlchemy (для `AsyncSession` — `sync_session`), срабатывает только при реальном commit внешней транзакции. `HookSession` — обёртка `AsyncSession`, у которой `commit/rollback/close` бросают `HookTransactionError`.
+* **DoD:** интеграция: after_commit не вызывается при rollback и при откате savepoint; вызывается один раз при commit; retry повторяет на искусственном `40P01`; `HookSession.commit()` → `HookTransactionError`.
+
+#### T2.4 — Запросы счётчиков: чтение, upsert слота, дельты, свёртка
+* **Зависит:** T2.2, T2.3
+* **Док:** ARCHITECTURE §9.1–9.3; COUNTERS §3.3–3.4
+* **Сделать:** `tallyho.storage.counters`: `read_counters(conn, batch_ids)` одним statement (`sum(counter) + sum(delta)` LATERAL, §9.3), `upsert_slots(conn, deltas)` в порядке `(batch_id, slot)`, `insert_delta(conn, …)`, `fold_deltas(conn, batch_ids)` через `DELETE … RETURNING`, `reconcile(conn, batch_id)` по `count(*) GROUP BY state` под `FOR UPDATE` строки батча, `upsert_metrics`.
+* **DoD:** интеграция: чтение не «мигает» при параллельной свёртке (конкурентный тест 1 000 итераций); reconcile чинит искусственный дрейф; дельты из незакоммиченной транзакции не сворачиваются.
+
+### Ф3. hooks
+
+#### T3.1 — Реестр tx-хуков и `hook_modules`
+* **Зависит:** T1.2
+* **Док:** ARCHITECTURE §7.2, §7.5, §12.4 (правило fallback `on_policy_breach` на kind корня)
+* **Сделать:** `tallyho.hooks.registry`: `HookRegistry` с `on_finalized(kind)`, `on_progress(kind, every)`, `on_policy_breach(kind)`; дубль регистрации → `ConfigurationError`; `required_hooks(kind) -> tuple[str, ...]` (то, что пишется в `th_batch.hooks`); импорт `hook_modules`; типизированные сигнатуры (`Protocol` для хуков).
+* **DoD:** юнит: регистрация, дубль, fallback breach-хука на корень, `required_hooks`.
+
+### Ф4. engine — ядро
+
+> Все задачи Ф4 тестируются интеграционно на PostgreSQL. Брокер — минимальный фейковый `Dispatcher`, записывающий сообщения в список (полноценный InlineBroker — T7.1). Воркер эмулируется прямыми вызовами Completer.
+
+#### T4.1 — Продюсер: создание батча, под-батчей, `th_feed`, добавление Items, seal, expect
+* **Зависит:** T2.4, T3.1
+* **Док:** ARCHITECTURE UC-01, UC-02, §8.1 п.1–2, §6.1 (seal этапа — ошибка), §11.2 (параметры batch/sub_batch)
+* **Сделать:** `tallyho.engine.producer`: `create_root` (`INSERT … ON CONFLICT (kind,key) DO NOTHING RETURNING` → существующий), `create_sub_batch` (идемпотентно по `(root_id, key)`, виртуальный Item у родителя, наследование `retention/release_required/max_items`), `add_feed` + проверка ациклимости и «тот же родитель», `add_items` чанками по 1 000 через `unnest` (items + outbox + `total/w_total`, дедуп по `key`: `found/duplicates`), `seal` (ошибка для `fed_by`-этапа, для отменённого), `expect(n)` (`GREATEST`). `start_at` → `available_at` outbox. Всё — на переданном соединении (транзакция пользователя или своя).
+* **DoD:** интеграция: повторный `create_root` с тем же key → тот же id; rollback пользователя не оставляет ни строки; цикл `fed_by` → ошибка; 100k Items добавляются O(чанков) запросов; дубли по key считаются в `duplicates`.
+
+#### T4.2 — Relay: fast-path и scan, окно `max_in_flight`, `start_at`, пауза
+* **Зависит:** T4.1
+* **Док:** ARCHITECTURE §6.3, UC-01 (шаги relay), UC-10, §11.3 (группировка по task_name, чанки 1 000), §15 (`relay_grace`, `relay_claim_ttl`)
+* **Сделать:** `tallyho.engine.relay.Relay`: `kick(batch_ids)` (fast-path после commit), `scan_once()` (claim `UPDATE th_outbox SET available_at = now + claim_ttl … FOR UPDATE SKIP LOCKED RETURNING`), сборка `Message` (с `_th`/заголовками через адаптер), `dispatch` группами по `task_name`, `DELETE th_outbox` + `dispatched += n`. Окно `max_in_flight`: при превышении запись остаётся с `available_at = ∞` (parked), освобождение — при finish (T4.3b) и в scan. Пауза: не отправлять Items батча с `paused_at`.
+* **DoD:** интеграция: падение между claim и dispatch → повторная отправка после `relay_claim_ttl`; два параллельных scan не отправляют одно и то же; `max_in_flight=3` — одновременно отправлено ≤ 3; `start_at` в будущем → 0 отправок до срока (FakeClock).
+
+#### T4.3a — Completer: буфер, групповой коммит, claim / heartbeat / release
+* **Зависит:** T4.2
+* **Док:** ARCHITECTURE UC-03, UC-04, §6.2 (производные состояния), §11.3 (чужой живой lease → успех), §15 (tick 20 мс / 500 / backpressure 10 000, lease 60 с / heartbeat 20 с); COUNTERS §3.2
+* **Сделать:** `tallyho.engine.completer.Completer`: очередь операций с futures, flush по тику или размеру, backpressure; ленивое создание в текущем loop; `claim` (`INSERT th_lease ON CONFLICT DO NOTHING` при `state=active`; исходы: `CLAIMED / DUPLICATE / TERMINAL / PARKED(pause) / CANCELLED(lazy cancel) / EXPIRED`), `heartbeat(+progress)`, `release(attempt+1)`. Graceful shutdown: дослать буфер; `SIGTERM`-путь освобождает lease сразу (A-CH-08).
+* **DoD:** интеграция: 1 000 claim → ≤ ceil(1000/500)+1 транзакций; повторный claim того же Item → `DUPLICATE`; claim на паузе → Item в outbox с `available_at=∞`; heartbeat продлевает `lease_until`.
+
+#### T4.3b — Completer: finish (путь A) без spawn
+* **Зависит:** T4.3a
+* **Док:** ARCHITECTURE §9.2 шаги 1–3, 6, 8–9, §11.2 (метки по умолчанию, `mark=`), UC-03
+* **Сделать:** `finish(item, result_class, label, result, error, metrics)`: `SELECT … ORDER BY id FOR UPDATE`, CAS `state=active` с `RETURNING` (считать только вернувшиеся), `DELETE th_lease`, `th_item_mark` для `error` (и `mark=True`), агрегация дельт по `(batch_id, slot процесса)` в порядке сортировки, `th_metric` (labels + `incr`), освобождение окна `max_in_flight`. После commit — резолв futures, `relay.kick`, вызов `finalizer.try_finalize` для затронутых `sealed` батчей (интерфейс-заглушка до T4.4).
+* **DoD:** интеграция: двойной finish → счётчики изменились один раз; 64 конкурентных «воркера» × 10 000 finish → счётчики = `count(*)` (I-05), `deadlocks = 0`; `th_lease` пуст после finish.
+
+#### T4.3c — Spawn, sub_batch из задачи, `into=`, лимиты, дедуп, depth, expect
+* **Зависит:** T4.3b
+* **Док:** ARCHITECTURE UC-05, UC-06, §8.1 п.2, 5, 6; §9.2 шаги 4–5, 7; DYNAMIC_WORKFLOWS §3
+* **Сделать:** в finish: вставка spawned Items в свой батч или `into=` (разрешение ключа этапа через кэш структуры дерева в процессе), правило записи (`SpawnTargetError` — проверяется **в момент `spawn()`**, до БД), `ON CONFLICT (batch_id,key) DO NOTHING RETURNING` → `found/duplicates`, `max_items` по `tree_total` корня (мягкий), `max_depth` (depth+1 в свой батч, 0 при `into=`) → `skipped_by_limit`, sub_batch из задачи (виртуальный Item), `expect(n, into=)`. Всё в той же транзакции, что CAS родителя: `pending` не проходит через 0.
+* **DoD:** интеграция: падение транзакции → нет ни детей, ни завершения родителя; повторный finish родителя не создаёт детей; `found + duplicates + skipped_by_limit` = число вызовов spawn; `max_depth=1` отсекает цикл; spawn в этап, не являющийся получателем, → `SpawnTargetError`.
+
+#### T4.4 — Finalizer: транзакция хука, CAS, колбэки, дерево, авто-seal этапов
+* **Зависит:** T4.3c
+* **Док:** ARCHITECTURE §6.1 (все переходы и примечания), §7.3, §7.5 (hook missing), UC-07, UC-17, §8.1 п.3, 4, 7; §10
+* **Сделать:** `tallyho.engine.finalizer.Finalizer.try_finalize(batch_id)`: чтение счётчиков + проверка условия; `BEGIN` → `on_finalized(HookSession, summary)` с `hook_timeout` → CAS `state IN (open, sealed)` → итог (succeeded / completed_with_errors / failed по `FailurePolicy` и `cancel_reason` / cancelled) → outbox колбэков (`on_succeeded`, `on_completed_with_errors`, `on_failed`, `on_cancelled`, `on_finalized_task`) со стабильным `callback_id` → завершение виртуального Item родителя (счётчики родителя) → авто-seal получателей `th_feed` (`FOR UPDATE` в порядке id, `on_feeder_failed`) → `COMMIT` → рекурсивно `try_finalize` для родителя и закрытых этапов. Ошибка хука → откат, `hook_attempts+1`, `hook_error`, `updated_at` для backoff. Хук требуется, но не зарегистрирован → не финализировать, `Observer.hook_missing`.
+* **DoD:** интеграция: две конкурентные финализации → один commit, хук выполнился ≤ 2 раз, закоммитился 1 раз; пустой этап финализируется сразу и каскадом закрывает следующий; два источника финализируются одновременно (100 повторов) → этап всегда закрыт; `on_finalized` детей закоммичен раньше родителя; хук с `session.commit()` → `HookTransactionError`, финализации нет.
+
+#### T4.5 — Путь B: `complete_in(session)` и свёртка дельт
+* **Зависит:** T4.4
+* **Док:** ARCHITECTURE UC-08, §9.1; COUNTERS §3.3 «Путь B»; ACCEPTANCE A-DB-01, A-DB-06, A-DB-07, A-DB-09
+* **Сделать:** `tallyho.engine.completion.complete_in(conn, item, …)`: HOT-update `th_item`, `DELETE th_lease`, `INSERT th_counter_delta` (+ дельты метрик, spawns — те же правила, что в T4.3c, но через дельты), флаг «уже завершён» для обёртки; `after_commit` → `Completer.fold(batch_id)` → `try_finalize`.
+* **DoD:** интеграция: исключение до commit → нет ни доменной строки, ни завершения; savepoint откатился → Item не завершён; пользователь в `REPEATABLE READ` и `SERIALIZABLE` под нагрузкой → 0 `40001` из-за таблиц tallyho; 20% транзакций держатся 2 с → в `pg_locks` нет ожиданий на `th_counter` > 100 мс.
+
+#### T4.6 — Политики ошибок и `on_policy_breach`
+* **Зависит:** T4.4
+* **Док:** ARCHITECTURE UC-11 (авто-пауза), §7.2, §11.2 (политики), §12.4 (fallback хука), ACCEPTANCE A-UC-10
+* **Сделать:** оценка политики после flush Completer для затронутых батчей (`min_processed`, labels, ratio); `action="pause"` → пауза **всего дерева** + `on_policy_breach` в одной транзакции; `action="fail"` / `fail_fast` → `cancel_requested_at`, `cancel_reason`; однократность срабатывания.
+* **DoD:** интеграция: 8% `hard_bounce` при пороге 5% после `min_processed` → дерево на паузе, хук вызван ровно один раз; `fail_fast` → остаток `cancelled`, итог `failed`.
+
+#### T4.7 — Операции над деревом: pause / resume / cancel / reschedule / retry_failed / retry_finalize / release
+* **Зависит:** T4.6
+* **Док:** ARCHITECTURE UC-10, UC-11, UC-12, UC-14 (release), UC-16 (+ `DownstreamFinalized`), §6.1 (флаг отмены), §6.2; ACCEPTANCE A-DB-03, A-DB-08, A-UC-08, 09, 11, 13
+* **Сделать:** `tallyho.engine.operations`: каждая операция принимает соединение пользователя, каскад по `parent_id` в порядке id, работа с outbox чанками; `cancel` — флаг + немедленная отмена неотправленных + ленивая при claim; `retry_failed(labels)` — CAS терминальный → sealed, чанками по `th_item_mark`, переоткрытие этапов от источников к получателям на корне; `retry_finalize` — сброс backoff; `release`.
+* **DoD:** интеграция: rollback пользователя → состояние не изменилось; пауза → новые claim паркуются; resume → всё доделывается; отмена до `start_at` → `cancelled`, 0 dispatch; `retry_failed` на этапе с финализированным получателем → `DownstreamFinalized`; пользователь держит `FOR UPDATE` доменной строки + `pause` параллельно с финализацией → 0 дедлоков до пользователя.
+
+#### T4.8 — Sweeper
+* **Зависит:** T4.7
+* **Док:** ARCHITECTURE UC-15 (все строки), §7.6, §10 (таблица восстановления), §11.4 (`th_expiry`), §15
+* **Сделать:** `tallyho.engine.sweeper.Sweeper`: `expire_leases` (retry → outbox / исчерпано → `error("lease_expired")` / lease терминального → delete), `finalize_stuck` (sealed + pending 0 + `finalize_grace`; `hook_error` с backoff 1 с → 5 мин), `enforce_deadlines`, `seal_orphan_stages`, `reconcile_drift` (sealed, pending > 0, нет lease/outbox), `fold_stale_deltas`, `expire_unclaimed` (`th_expiry` → `error("expired")`), `retention` (деревья, от листьев к корню, чанками по 1 000, `release_required`). Каждый шаг — отдельная короткая транзакция, `SKIP LOCKED`, ограничение размера пачки.
+* **DoD:** интеграция на каждый шаг: сценарий «сломали → один `sweep` → починилось»; retention не трогает батч без `release()` при `release_required`; после retention `view()` → `BatchPurged`.
+
+#### T4.9 — Snapshotter
+* **Зависит:** T4.8
+* **Док:** ARCHITECTURE §7.4, UC-09, §9.4 (ETA), ACCEPTANCE I-08, A-UC-19
+* **Сделать:** `tallyho.engine.snapshotter.Snapshotter.tick()`: расписание в памяти по partial-индексу, чтение счётчиков пачкой, пропуск без изменений, транзакция `on_progress` + CAS по `snap_seq` и state, EMA скорости для ETA.
+* **DoD:** интеграция: снимок после финализации откатывается вместе с изменениями хука; `seq` строго растёт; без изменений счётчиков — 0 записей в БД.
+
+#### T4.10 — Maintenance: лидерство, цикл, `run_maintenance_once`, `watch`
+* **Зависит:** T4.9
+* **Док:** ARCHITECTURE §3.2 (leader election), UC-13, §15 (`sweep_interval`, `watch_throttle`), ACCEPTANCE A-CH-07, A-UC-20
+* **Сделать:** `tallyho.engine.maintenance.Maintenance`: лидер через `pg_try_advisory_lock` на выделенном соединении (потеря соединения = потеря лидерства), циклы relay scan / sweeper / snapshotter, корректная остановка; `run_maintenance_once()` для тестов; `NOTIFY th_progress` с троттлингом и `watch()` через `LISTEN` (финальное состояние не теряется).
+* **DoD:** интеграция: два экземпляра — работает ровно один лидер; kill соединения лидера → второй берёт лидерство ≤ 2 × `sweep_interval`; `watch` не присылает чаще троттла и всегда присылает финал.
+
+#### T4.11 — Чтение: `view`, `in_flight`, `items(label)`, `find`, `child`
+* **Зависит:** T4.4
+* **Док:** ARCHITECTURE UC-13, §9.3–9.4, §3.4 (`BatchHandle`), §7.6 (`BatchPurged`)
+* **Сделать:** `tallyho.engine.reads`: сводка дерева одним-двумя запросами (счётчики + метрики + `th_feed` + `count(th_lease)`), сборка `BatchSummary`/`Progress` через T1.3; `in_flight(limit)` из `th_lease`; `items(label)` страницами по `th_item_mark` (keyset); `find(kind, key)`; `child(key)`.
+* **DoD:** интеграция: число запросов `view()` не зависит от размера дерева (счётчик statement'ов); удалённый батч → `BatchPurged`.
+
+### Ф5. runtime
+
+#### T5.1 — `ItemContext`, `th.item.*`, `th.tracked`, `th.callback.current()`
+* **Зависит:** T4.5, T4.7
+* **Док:** ARCHITECTURE §3.4 (`ItemContext`), UC-03, UC-04, UC-08, §11.2 «Задача», §11.3 (служебный `_th`, `retry_verdict`); API.md §4.3, §5.1 (исторический)
+* **Сделать:** `tallyho.runtime`: `ContextVar[ItemContext | None]`; модуль-фасад `item` (`id, spawn, spawn_call, sub_batch, expect, progress, incr, ok, skip, error, complete_in, cancelled, current`) — вне задачи `current()` = `None`, остальные — no-op или ошибка по настройке; `tracked(fn)` — `async`-обёртка с `functools.wraps`: извлечь `_th`, claim, heartbeat-таск, вызов, finish/release по `Runtime.retry_verdict`, сброс контекста; проверка «только `async def`»; `callback.current()` для колбэк-задач.
+* **DoD:** юнит + интеграция: `_th` не попадает в функцию; дубль доставки → функция не вызвана; исключение с `RETRY` → `release`, с `FINAL` → `error("exhausted")`; `th.item.current()` вне задачи → `None`.
+
+### Ф6. api
+
+#### T6.1 — `Tallyho`, конфигурация, `install`, `migrate`
+* **Зависит:** T5.1, T4.10, T4.11
+* **Док:** ARCHITECTURE §3.4 (`Tallyho`), §11.1, §15 (все значения по умолчанию)
+* **Сделать:** `tallyho.api`: `Settings` (frozen dataclass, значения §15, валидация), `Tallyho(engine, schema=, prefix=, hook_modules=, clock=, id_factory=, observer=, serializer=, **settings)`, `install(adapter)`, `migrate()`, `maintenance()`, `run_maintenance_once()`, декораторы хуков. `api` не импортирует `runtime`/`storage` напрямую (контракт import-linter) — связка через `engine`. Реэкспорт публичного API из `tallyho/__init__.py`.
+* **DoD:** юнит: значения по умолчанию = таблица §15 (тест-таблица); неверная конфигурация → `ConfigurationError`.
+
+#### T6.2 — `th.batch(...)` → `BatchBuilder`, `sub_batch`, `BatchHandle`
+* **Зависит:** T6.1
+* **Док:** ARCHITECTURE §11.2 (сводка), §12.4 (`schedule`), §13.2 (`start_import`), UC-01, UC-02
+* **Сделать:** асинхронный контекст-менеджер: на выходе seal корня и этапов без `fed_by`; при исключении — ничего не пишется в чужую сессию сверх уже сделанного (rollback — забота пользователя), в своей — откат; `add/map/add_calls/sub_batch/expect/seal/handle`; `BatchHandle` — делегирование в engine (view/watch/wait/in_flight/операции).
+* **DoD:** интеграция: примеры `schedule` из §12.4 и `start_import` из §13.2 выполняются как тесты с фейковым брокером.
+
+#### T6.3 — `th.call(...)` с `ParamSpec` и типовые тесты
+* **Зависит:** T6.1
+* **Док:** API.md §2 п.1, ARCHITECTURE §11.2 «Вызовы», ACCEPTANCE A-NF-04
+* **Сделать:** `call(fn: Callable[P, Awaitable[R]], *args: P.args, **kwargs: P.kwargs) -> Call[P, R]` + `.opts(key=, weight=, queue=, **broker_opts)`; то же для `add`, `spawn`. Типовые тесты: файл `tests/typing/cases.py` с `assert_type` и негативными случаями, проверяемыми прогоном basedpyright в тесте (ожидаемые ошибки в конкретных строках).
+* **DoD:** неверный аргумент в `th.call`/`batch.add`/`th.item.spawn` — ошибка basedpyright и mypy; корректные вызовы — без ошибок.
+
+### Ф7. testing
+
+#### T7.1 — `tallyho.testing`: `InlineBroker`, `FakeClock`, фикстуры
+* **Зависит:** T6.2
+* **Док:** ARCHITECTURE §12.6 «Тесты» (API `step`, `drain`, `kill_worker_after`, `duplicate_delivery_rate`, `seed`)
+* **Сделать:** `InlineBroker` (адаптер `Dispatcher`+`Runtime`: очередь в памяти, выполнение через `tracked`, ретраи с `max_retries`, дубли доставки по seed, `step(n)`, `drain()`, эмуляция kill -9 — прерывание задачи без finish), `FakeClock` (`advance(**timedelta)`), pytest-плагин с фикстурами (`tallyho_env`), `run_maintenance_once`.
+* **DoD:** тесты самого InlineBroker; все интеграционные тесты Ф4, где был самописный фейк, переведены на `InlineBroker` (если это упрощает их).
+
+### Ф8. Адаптер flexiq
+
+#### T8.0 — Спайк: проверка фактов о flexiq
+* **Зависит:** T0.1
+* **Док:** ARCHITECTURE §11.3 (таблица фактов), §16 «Открытые вопросы» п.1
+* **Сделать:** установить `flexiq>=2.0,<3` (Windows или Linux-контейнер: `scripts/in-docker.sh`), поднять живой воркер `pool="thread"` на PG, проверить: `functools.wraps` не ломает имя задачи; kwarg `_th` проходит сериализацию и попадает в DLQ; `on_dead_letter` срабатывает при `retry_budget`; поведение `prefork` с async; сигнатуры `enqueue_many`, `current_job.retry_count`, `dead_letters_after`. Результат — `docs/plan/FLEXIQ_SPIKE.md` + запись в DECISIONS о расхождениях с §11.3.
+* **DoD:** спайк-скрипты лежат в `tests/contract/flexiq/spike_*.py` (не в CI); каждый факт таблицы §11.3 отмечен «подтверждён / опровергнут / не проверен».
+* Если flexiq недоступен ни в Windows, ни в контейнере → `blocked`, Ф8 целиком ждёт человека.
+
+#### T8.1 — `FlexiqAdapter`: dispatch, `fq.task`, `retry_verdict`, DLQ
+* **Зависит:** T8.0, T7.1
+* **Док:** ARCHITECTURE §11.1, §11.3 (решения в правой колонке), §11.4 (опции); ACCEPTANCE §8
+* **Сделать:** `tallyho.adapters.flexiq`: `FlexiqAdapter(queue)`, `fq.task(**opts)` = `queue.task(**opts)(th.tracked(fn))` с запретом `debounce*`/`batch=` и sync-функций; dispatch через `enqueue_many` группами по `task_name`, чанками по 1 000, в своём executor; `idempotency_key=f"th:{item_id}"`, если пользователь не задал свой; `metadata`/`notes` — байт в байт; `expires` → `th_expiry`; `depends_on` → `UnsupportedOption`; `retry_verdict` по конфигу задачи и `retry_count`; `on_dead_letter` → `call_soon_threadsafe` → finish; `reconcile_dead(since)` по курсору; `install` → ошибка для `prefork` и несовместимой версии.
+* **DoD:** юнит на маппинг опций; импорт `flexiq` только в `tallyho.adapters.flexiq` (import-linter).
+
+#### T8.2 — Контрактные тесты A-FQ-01…17
+* **Зависит:** T8.1
+* **Док:** ACCEPTANCE §8 (вся таблица)
+* **Сделать:** `tests/contract/flexiq/` — по тесту на каждый A-FQ с живыми воркерами в отдельных процессах; маркер `integration` + `flexiq`; job в CI (Linux).
+* **DoD:** все A-FQ зелёные на flexiq 2.0.x. Прогон на `master` flexiq — отметить `human` (нужен доступ к репозиторию/CI-матрица).
+
+### Ф9. Сквозные примеры как тесты
+
+#### T9.1 — Рассылки (ARCHITECTURE §12) на `InlineBroker`
+* **Зависит:** T7.1
+* **Док:** ARCHITECTURE §12.4, §12.6 (мок-провайдер, датасет, все 9 тестов)
+* **Сделать:** `tests/examples/mailing/` — доменная модель, команды, хуки, задачи, мок-провайдер, датасет; все тесты из §12.6 (статус, числа `(9100, 600, 300, 40)`, breakdown, монотонность снимков, retention, падающий хук, пауза, авто-пауза, kill воркера).
+* **DoD:** все тесты §12.6 зелёные без изменения ожидаемых чисел.
+
+#### T9.2 — Конвейер парсинга (ARCHITECTURE §13) на `InlineBroker`
+* **Зависит:** T7.1
+* **Док:** ARCHITECTURE §13, DYNAMIC_WORKFLOWS §5, ACCEPTANCE A-UC-04, 05, 06, 15
+* **Сделать:** `tests/examples/catalog/` — детерминированный генератор каталога, задачи `parse_page/parse_card/download_pdf`, хуки; тесты: параллельность этапов, каскад seal, пустой этап, упавший источник (`seal`/`cancel`), `max_depth`, `max_items`, прогресс по моментам t1–t5 из §13.3.
+* **DoD:** числа совпадают с эталоном генератора; I-12/I-13 проверяются в тестах.
+
+#### T9.3 — Исполняемые примеры из документации
+* **Зависит:** T9.1, T9.2
+* **Док:** ACCEPTANCE A-NF-07
+* **Сделать:** тест, извлекающий python-блоки из README и помеченные блоки ARCHITECTURE, которые должны исполняться (маркер-комментарий), и прогоняющий их на `InlineBroker`.
+* **DoD:** A-NF-07 зелёный для README и §12/§13.
+
+### Ф10. Надёжность, наблюдаемость, CLI
+
+#### T10.1 — Приёмка A-DB-01…12
+* **Зависит:** T9.1
+* **Док:** ACCEPTANCE §5
+* **Сделать:** `tests/integration/acceptance_db/` — тест на каждый пункт. A-DB-11 (pgbouncer) — контейнер `edoburu/pgbouncer` в transaction mode, asyncpg `statement_cache_size=0` и psycopg 3. A-DB-12 — доменная таблица в другой схеме.
+* **DoD:** все A-DB зелёные.
+
+#### T10.2 — Стресс: дедлоки, конкурентные финализации, рандомизированные конвейеры
+* **Зависит:** T9.2
+* **Док:** ARCHITECTURE §14 «Дополнительно», COUNTERS §3.5, §4
+* **Сделать:** стресс-тесты (маркер `slow`): `deadlock_timeout=100ms`, параллельные pause/cancel/финализации/несколько источников → `deadlocks = 0`; 1 000 прогонов конвейера со случайными пустыми этапами, падениями источников и «kill» воркеров (hypothesis stateful или seed-цикл) → нет open-этапа с терминальными источниками, ровно одна финализация на батч; 10% дублей доставки → 1 финализация.
+* **DoD:** всё зелёное 3 прогона подряд с разными seed.
+
+#### T10.3 — EXPLAIN-гард
+* **Зависит:** T10.2
+* **Док:** COUNTERS §4.2, ARCHITECTURE §14
+* **Сделать:** фикстура «заполненная БД» (≥ 1M Items, генерация `generate_series`, маркер `slow`), реестр запросов горячего пути (каждый запрос storage регистрирует себя), тест `EXPLAIN (FORMAT JSON)` → нет `Seq Scan` по `th_item/th_batch/th_counter`.
+* **DoD:** гард падает, если убрать любой индекс из §5.2 (проверить вручную один раз и записать в журнал).
+
+#### T10.4 — Наблюдаемость и логи
+* **Зависит:** T6.1
+* **Док:** ACCEPTANCE A-NF-08, A-NF-09; ARCHITECTURE §7.3 (`th_hook_failures`), §7.5 (`th_hook_missing`)
+* **Сделать:** события `Observer` во всех точках; `tallyho.observability.otel` (опционально, extra `otel`) — спаны create/claim/finish/finalize; метрики: `th_hook_failures`, `th_hook_missing`, лаг relay, размер буфера Completer, возраст самого старого lease, внутренние ретраи `40P01`. Логи без аргументов задач; ошибки хуков — с `batch_id`, `kind`, попыткой.
+* **DoD:** тест-шпион `Observer` видит все события сценария §12; тест: в логах нет payload (подставить секрет в аргумент и проверить `caplog`).
+
+#### T10.5 — CLI
+* **Зависит:** T6.1
+* **Док:** ARCHITECTURE §3.2 (maintenance отдельным процессом), §16 v1.x (`inspect`)
+* **Сделать:** `tallyho migrate --dsn --schema`, `tallyho maintenance --dsn --schema --hook-module ...` (graceful SIGTERM), `tallyho inspect <batch_id|kind:key>` (дерево и прогресс).
+* **DoD:** тесты CLI на PG; `sys.exit` только в `__main__`.
+
+#### T10.6 — Мутационное тестирование CAS-запросов
+* **Зависит:** T10.2
+* **Док:** ACCEPTANCE A-NF-06
+* **Сделать:** `mutmut` на модулях с CAS (finish, finalize, snapshot, claim, retry_failed); покрытие `engine`/`storage` ≥ 90% веток.
+* **DoD:** 0 выживших мутантов в целевых функциях или обоснованные исключения в DECISIONS.
+
+### Ф11. Приёмочный стенд (ACCEPTANCE §2–4, §6, §7, §9)
+
+#### T11.1 — Эталонное приложение и генераторы
+* **Зависит:** T8.2, T9.2
+* **Док:** ACCEPTANCE §3 (всё), §3.2 (генератор сайта)
+* **Сделать:** `tests/acceptance/app` — домены S1/S2/S3, общие правила задачи (`network()`, инъекция ошибок от seed), `hook_log`, фейковый сайт каталога на aiohttp (эталонная истина), фейковый почтовый провайдер с журналом; `docker compose` стенда (PG 16, toxiproxy, N воркеров flexiq, 2 реплики API).
+* **DoD:** S1/S2/S3 на малом объёме проходят без хаоса.
+
+#### T11.2 — Оракул инвариантов I-01…I-14
+* **Зависит:** T11.1
+* **Док:** ACCEPTANCE §4
+* **Сделать:** `tests/acceptance/oracle.py` — каждая проверка отдельной функцией с числовым отчётом; ожидание `T_rec`.
+* **DoD:** оракул ловит специально внесённые нарушения (по тесту на инвариант: сломали данные → красный).
+
+#### T11.3 — Хаос-контроллер и сценарии A-CH-01…12
+* **Зависит:** T11.2
+* **Док:** ACCEPTANCE §6
+* **Сделать:** контроллер (kill -9 воркеров, `docker kill`/`pg_ctl stop -m immediate`, toxiproxy toxics, libfaketime, SIGTERM, `requeue/replay/retry_dead`, долгая транзакция), расписание от seed, `make acceptance SEED=... SCENARIO=... CHAOS=...` (или `poe acceptance`), журнал хаоса.
+* **DoD:** каждый A-CH на S1/S2/S3 по 2 минуты локально зелёный. Длинные прогоны (10/60 мин, 2 ч) — `human`.
+
+#### T11.4 — Сценарии A-UC-01…20 на стенде
+* **Зависит:** T11.2
+* **Док:** ACCEPTANCE §7
+* **Сделать:** по сценарию на каждый A-UC поверх стенда с оракулом.
+* **DoD:** все A-UC зелёные на функциональном объёме.
+
+#### T11.5 — Бенчмарк-харнесс A-PERF
+* **Зависит:** T11.1
+* **Док:** ACCEPTANCE §9, COUNTERS §4, ARCHITECTURE §14
+* **Сделать:** генераторы нагрузки P-01…P-11, сбор p50/p99 по операциям, графики, отчёт; локальный «дымовой» прогон на малых объёмах.
+* **DoD:** дымовой прогон формирует отчёт. Полные замеры на эталонном стенде — `human`.
+
+### Ф12. Документация и релиз
+
+#### T12.1 — Пользовательская документация
+* **Зависит:** T9.3
+* **Док:** ACCEPTANCE чек-лист §11 (ограничения v1), COUNTERS §3.6 (эксплуатация), §2 P10 (pgbouncer)
+* **Сделать:** README (быстрый старт), `docs/guide/`: установка и миграции, батчи и конвейеры, хуки, эксплуатация PG (autovacuum, `backend_xmin`, pgbouncer), ограничения v1 (только PG, `pool="thread"`, несовместимые опции flexiq, мягкий `max_items`), CHANGELOG.
+* **DoD:** примеры исполняются (T9.3).
+
+#### T12.2 — CI: nightly и матрица
+* **Зависит:** T11.4
+* **Док:** ACCEPTANCE §11 (уровни PR / nightly / pre-release)
+* **Сделать:** workflow `nightly.yml` (A-CH по 10 мин, P-01, P-04 1k×1k + история 5M), job для контрактных тестов flexiq (2.0.x + master), PR-уровень ≤ 15 мин.
+* **DoD:** workflow валиден (`check-github-workflows`); запуск в GitHub — `human`.
+
+#### T12.3 — Подписание релиза
+* **Зависит:** всё
+* **Сделать:** чек-лист ACCEPTANCE §11: pre-release прогон, 3 зелёных nightly, замеры на эталонном стенде, решение владельца о целевых числах.
+* **Статус изначально:** `human`.
