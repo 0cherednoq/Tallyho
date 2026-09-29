@@ -16,6 +16,14 @@ from tallyho.model.errors import (
     TallyhoError,
     UnsupportedOption,
 )
+from tallyho.model.policy import (
+    FailurePolicy,
+    OutcomeCounts,
+    PolicyAction,
+    PolicyBreach,
+    PolicyKind,
+    PolicyVerdict,
+)
 from tallyho.model.states import (
     BatchState,
     CancelReason,
@@ -41,6 +49,7 @@ __all__ = [
     "ConcurrentModification",
     "ConfigurationError",
     "DownstreamFinalized",
+    "FailurePolicy",
     "HookMissingError",
     "HookTransactionError",
     "InFlightItem",
@@ -50,6 +59,11 @@ __all__ = [
     "NotFoundError",
     "OnFeederFailed",
     "OutboxKind",
+    "OutcomeCounts",
+    "PolicyAction",
+    "PolicyBreach",
+    "PolicyKind",
+    "PolicyVerdict",
     "Progress",
     "ResultClass",
     "SealError",
