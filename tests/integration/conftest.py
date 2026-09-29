@@ -37,7 +37,7 @@ def postgres_dsn() -> Iterator[str]:
     if dsn := os.environ.get("TALLYHO_TEST_DSN"):
         yield dsn
         return
-    from testcontainers.postgres import PostgresContainer  # ruff: ignore[import-outside-top-level]  # тяжёлый импорт только при нужде
+    from testcontainers.community.postgres import PostgresContainer  # ruff: ignore[import-outside-top-level]  # тяжёлый импорт только при нужде
 
     with PostgresContainer(POSTGRES_IMAGE, driver="asyncpg") as pg:
         yield pg.get_connection_url()
