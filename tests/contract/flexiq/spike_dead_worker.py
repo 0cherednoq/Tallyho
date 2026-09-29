@@ -1,6 +1,7 @@
 """Спайк T8.0: как быстро flexiq возвращает джобу убитого воркера (нет per-job heartbeat).
 
-Запуск (нужен Docker): ``uv run python tests/contract/flexiq/spike_dead_worker.py``.
+Запуск (нужен Docker): ``uv run python -m tests.contract.flexiq.spike_dead_worker``
+из корня репозитория.
 Родитель поднимает PostgreSQL, ставит длинную джобу, убивает процесс воркера посреди неё
 (TerminateProcess / SIGKILL), запускает второй воркер и меряет, через сколько секунд
 джоба снова исполняется. Не тест и не часть CI.
@@ -15,11 +16,15 @@ import time
 from pathlib import Path
 
 from flexiq import Queue, current_job
-from spike_support import postgres_url, say, wait_until  # pyright: ignore[reportImplicitRelativeImport]  # скрипт запускают напрямую, sys.path[0] — его каталог
+
+from tests.contract.flexiq.spike_support import postgres_url, say, wait_until
 
 __all__ = ["main"]
 
 HERE = Path(__file__).resolve()
+ROOT = HERE.parents[3]
+# Имя задачи во flexiq: для ``__main__`` берётся ``__spec__.name`` (запуск только через ``-m``).
+MODULE = __spec__.name
 DONE_FAST = 1
 
 
@@ -38,7 +43,8 @@ async def long_task() -> int:
 
 def spawn_worker(url: str) -> subprocess.Popen[bytes]:
     return subprocess.Popen(  # ruff: ignore[subprocess-without-shell-equals-true]  # аргументы — константы
-        [sys.executable, str(HERE), "worker", url],
+        [sys.executable, "-m", "tests.contract.flexiq.spike_dead_worker", "worker", url],
+        cwd=ROOT,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
     )
@@ -56,7 +62,7 @@ def run_parent() -> None:
         first = spawn_worker(url)
         second: subprocess.Popen[bytes] | None = None
         try:
-            job = queue.enqueue(task_name=f"{HERE.stem}.long_task", max_retries=3, timeout=300)
+            job = queue.enqueue(task_name=f"{MODULE}.long_task", max_retries=3, timeout=300)
             wait_until(lambda: job_state(queue, job.id)[0] == "running", 60)
             say("D1.running_before_kill", job_state(queue, job.id))
             first.kill()

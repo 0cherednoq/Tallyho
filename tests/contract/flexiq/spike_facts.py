@@ -1,6 +1,7 @@
 """Спайк T8.0: факты ARCHITECTURE §11.3 о flexiq на живом воркере ``pool="thread"`` и PostgreSQL.
 
-Запуск (нужен Docker): ``uv run python tests/contract/flexiq/spike_facts.py``.
+Запуск (нужен Docker): ``uv run python -m tests.contract.flexiq.spike_facts``
+из корня репозитория.
 Каждая строка вывода — ``<факт>: <наблюдение>``; разбор — в docs/plan/FLEXIQ_SPIKE.md.
 Не тест и не часть CI: pytest собирает только ``test_*.py``.
 """
@@ -19,8 +20,9 @@ from pathlib import Path
 from typing import TYPE_CHECKING, ParamSpec, TypeVar, cast
 
 from flexiq import EventType, JsonSerializer, Queue, TaskMiddleware, current_job
-from spike_support import postgres_url, say, wait_until, worker_thread  # pyright: ignore[reportImplicitRelativeImport]  # скрипт запускают напрямую, sys.path[0] — его каталог
 from typing_extensions import override
+
+from tests.contract.flexiq.spike_support import postgres_url, say, wait_until, worker_thread
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Coroutine

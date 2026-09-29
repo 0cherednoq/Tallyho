@@ -8,8 +8,8 @@
 
 | Скрипт | Что делает | Запуск |
 |---|---|---|
-| `tests/contract/flexiq/spike_facts.py` | PostgreSQL 16 (testcontainers) + живой воркер `pool="thread"` в фоновом потоке; модель `th.tracked` (async-обёртка через `functools.update_wrapper`, вынимает `_th`); middleware-регистратор всех хуков; ~15 сценариев | `uv run python tests/contract/flexiq/spike_facts.py` |
-| `tests/contract/flexiq/spike_dead_worker.py` | воркер в отдельном процессе убивается посреди джобы (`Popen.kill`), второй воркер подхватывает | `uv run python tests/contract/flexiq/spike_dead_worker.py` |
+| `tests/contract/flexiq/spike_facts.py` | PostgreSQL 16 (testcontainers) + живой воркер `pool="thread"` в фоновом потоке; модель `th.tracked` (async-обёртка через `functools.update_wrapper`, вынимает `_th`); middleware-регистратор всех хуков; ~15 сценариев | `uv run python -m tests.contract.flexiq.spike_facts` |
+| `tests/contract/flexiq/spike_dead_worker.py` | воркер в отдельном процессе убивается посреди джобы (`Popen.kill`), второй воркер подхватывает | `uv run python -m tests.contract.flexiq.spike_dead_worker` |
 | `tests/contract/flexiq/spike_prefork.py` | `pool="prefork"` с `async def`-задачей; самодостаточный (flexiq + SQLite) | Windows: `uv run python …`; Linux: `docker run --rm -v "$PWD/tests/contract/flexiq:/spike" -w /spike python:3.11-slim sh -c "pip install -q flexiq==2.0.0 && python spike_prefork.py"` |
 | `tests/contract/flexiq/spike_support.py` | общая обвязка: PostgreSQL, воркер в потоке, вывод | — |
 
