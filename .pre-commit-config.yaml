@@ -1,0 +1,93 @@
+# Установка: uv run pre-commit install
+# Прогон по всем файлам: uv run pre-commit run --all-files
+default_install_hook_types: [pre-commit, pre-push]
+default_stages: [pre-commit]
+fail_fast: false
+
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: check-added-large-files
+        args: [--maxkb=500]
+      - id: check-ast
+      - id: check-case-conflict
+      - id: check-merge-conflict
+      - id: check-toml
+      - id: check-yaml
+      - id: debug-statements
+      - id: end-of-file-fixer
+      - id: mixed-line-ending
+        args: [--fix=lf]
+      - id: trailing-whitespace
+      - id: no-commit-to-branch
+        args: [--branch, main]
+
+  - repo: https://github.com/astral-sh/uv-pre-commit
+    rev: 0.10.12
+    hooks:
+      - id: uv-lock
+
+  - repo: https://github.com/codespell-project/codespell
+    rev: v2.4.1
+    hooks:
+      - id: codespell
+        additional_dependencies: [tomli]
+
+  - repo: https://github.com/python-jsonschema/check-jsonschema
+    rev: 0.33.0
+    hooks:
+      - id: check-github-workflows
+      - id: check-dependabot
+
+  # Всё ниже запускается из окружения проекта (uv run), чтобы версии совпадали с CI.
+  - repo: local
+    hooks:
+      # -X utf8: иначе на Windows pyproject.toml с кириллицей читается в cp1251.
+      - id: validate-pyproject
+        name: validate pyproject.toml
+        entry: uv run --frozen python -X utf8 -m validate_pyproject pyproject.toml
+        language: system
+        files: ^pyproject\.toml$
+        pass_filenames: false
+      - id: ruff-format
+        name: ruff format
+        entry: uv run --frozen ruff format
+        language: system
+        types_or: [python, pyi]
+      - id: ruff-check
+        name: ruff check
+        entry: uv run --frozen ruff check --fix --exit-non-zero-on-fix
+        language: system
+        types_or: [python, pyi]
+      - id: mypy
+        name: mypy
+        entry: uv run --frozen mypy
+        language: system
+        types_or: [python, pyi]
+        pass_filenames: false
+      - id: basedpyright
+        name: basedpyright
+        entry: uv run --frozen basedpyright
+        language: system
+        types_or: [python, pyi]
+        pass_filenames: false
+      - id: import-linter
+        name: import-linter (architecture)
+        entry: uv run --frozen lint-imports
+        language: system
+        types: [python]
+        pass_filenames: false
+      - id: deptry
+        name: deptry
+        entry: uv run --frozen deptry src
+        language: system
+        files: ^(src/.*\.py|pyproject\.toml)$
+        pass_filenames: false
+      - id: pytest-unit
+        name: pytest (unit + architecture)
+        entry: uv run --frozen pytest -m "not integration" -q -p no:randomly --no-cov
+        language: system
+        types: [python]
+        pass_filenames: false
+        stages: [pre-push]

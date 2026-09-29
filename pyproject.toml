@@ -1,0 +1,421 @@
+# =============================================================================
+# tallyho — packaging + all tool configuration.
+#
+# Линтеры настроены максимально строго: код пишется в основном LLM, поэтому
+# всё, что можно проверить машиной, проверяется машиной. Ослаблять правила
+# можно только точечно (`# noqa: CODE  # причина`) и с обоснованием.
+# =============================================================================
+
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "tallyho"
+version = "0.0.1"
+description = "Batch accounting, dynamic fan-out and stage pipelines on top of any task broker, backed by PostgreSQL."
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ email = "0cherednoq@users.noreply.github.com" }]
+keywords = ["asyncio", "batch", "postgresql", "sqlalchemy", "task-queue", "outbox", "fan-out"]
+classifiers = [
+  "Development Status :: 2 - Pre-Alpha",
+  "Framework :: AsyncIO",
+  "Intended Audience :: Developers",
+  "Operating System :: OS Independent",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Topic :: Database",
+  "Topic :: Software Development :: Libraries",
+  "Typing :: Typed",
+]
+dependencies = [
+  "sqlalchemy[asyncio]>=2.0.30",
+  "typing-extensions>=4.10",
+]
+
+[project.optional-dependencies]
+asyncpg = ["asyncpg>=0.29"]
+psycopg = ["psycopg[binary]>=3.1"]
+flexiq = ["flexiq>=2.0,<3"]
+alembic = ["alembic>=1.13"]
+
+[project.scripts]
+tallyho = "tallyho.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/0cherednoq/tallyho"
+Documentation = "https://github.com/0cherednoq/tallyho/tree/main/docs"
+Repository = "https://github.com/0cherednoq/tallyho"
+Issues = "https://github.com/0cherednoq/tallyho/issues"
+Changelog = "https://github.com/0cherednoq/tallyho/blob/main/CHANGELOG.md"
+
+[dependency-groups]
+lint = [
+  "ruff==0.16.9",
+  "mypy==2.3.1",
+  "basedpyright==1.40.1",
+  "import-linter==2.15",
+  "deptry==0.25.1",
+  "validate-pyproject[all]>=0.24",
+]
+test = [
+  "pytest>=9.1",
+  "pytest-asyncio>=1.4",
+  "pytest-cov>=6",
+  "pytest-timeout>=2.3",
+  "pytest-randomly>=3.16",
+  "pytest-xdist>=3.6",
+  "hypothesis>=6.120",
+  "testcontainers[postgres]>=4.9",
+  "asyncpg>=0.29",
+]
+dev = [
+  { include-group = "lint" },
+  { include-group = "test" },
+  "pre-commit>=4",
+  "poethepoet>=0.48",
+]
+
+[tool.uv]
+default-groups = ["dev"]
+
+# -----------------------------------------------------------------------------
+# Build
+# -----------------------------------------------------------------------------
+[tool.hatch.build.targets.wheel]
+packages = ["src/tallyho"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/tallyho", "tests", "docs", "README.md", "CHANGELOG.md", "LICENSE"]
+
+# -----------------------------------------------------------------------------
+# Task runner: `uv run poe <task>`
+# -----------------------------------------------------------------------------
+[tool.poe.tasks]
+fmt = { sequence = [
+  { cmd = "ruff format ." },
+  { cmd = "ruff check --fix ." },
+], help = "Format and autofix" }
+lint = { sequence = [
+  { cmd = "ruff format --check ." },
+  { cmd = "ruff check ." },
+], help = "Style + lint" }
+mypy = { cmd = "mypy", help = "mypy --strict (+extras)" }
+pyright = { cmd = "basedpyright", help = "basedpyright, all rules" }
+types = { sequence = ["mypy", "pyright"], help = "Both type checkers" }
+imports = { cmd = "lint-imports", help = "Architecture contracts (import-linter)" }
+deps = { cmd = "deptry src", help = "Declared vs used dependencies" }
+test = { cmd = "pytest -m 'not integration' --cov-fail-under=0", help = "Unit + architecture tests (coverage gate is enforced on test-all / CI)" }
+test-all = { cmd = "pytest", help = "All tests incl. PostgreSQL integration (needs Docker or TALLYHO_TEST_DSN)" }
+check = { sequence = ["lint", "types", "imports", "deps", "test"], help = "Everything CI runs, except integration" }
+
+# -----------------------------------------------------------------------------
+# Ruff: style (formatter) + lint. Все правила включены, отключено минимум.
+# -----------------------------------------------------------------------------
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+src = ["src", "tests"]
+extend-exclude = ["docs"]
+
+[tool.ruff.format]
+docstring-code-format = true
+line-ending = "lf"
+
+[tool.ruff.lint]
+preview = true           # больше правил (DOC*, FURB*, PLR6* ...)
+explicit-preview-rules = false
+select = ["ALL"]
+ignore = [
+  # Конфликтуют с форматтером (см. доку ruff "conflicting lint rules").
+  "missing-trailing-comma",
+  "prohibited-trailing-comma",
+  "single-line-implicit-string-concatenation",
+  "multi-line-implicit-string-concatenation",
+  "indentation-with-invalid-multiple",
+  "indentation-with-invalid-multiple-comment",
+  "over-indented",
+  "tab-indentation",
+  "docstring-tab-indentation",
+  "triple-single-quotes",
+  "bad-quotes-inline-string",
+  "bad-quotes-multiline-string",
+  "bad-quotes-docstring",
+  "avoidable-escaped-quote",
+  # Взаимоисключающие пары docstring-правил (выбран google-стиль ниже).
+  "incorrect-blank-line-before-class",
+  "multi-line-summary-second-line",
+  # Copyright-заголовок в каждом файле не нужен.
+  "missing-copyright-notice",
+]
+# Ничего не чинить «молча» из того, что меняет семантику.
+unfixable = ["unused-import", "unused-variable", "commented-out-code", "zip-without-explicit-strict"]
+# Документация и сообщения на русском: кириллица — не «путаница» с латиницей.
+allowed-confusables = [
+  "а", "в", "е", "к", "м", "н", "о", "р", "с", "т", "у", "х",
+  "А", "В", "Е", "К", "М", "Н", "О", "Р", "С", "Т", "Х", "З", "б", "г", "п", "ь",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = [
+  "assert",                      # основа pytest
+  "D",                           # docstrings в тестах не обязательны
+  "DOC",
+  "magic-value-comparison",      # литералы в assert'ах
+  "no-self-use",                 # методы тест-классов без self
+  "implicit-namespace-package",  # tests/ не пакет (pytest importmode=importlib)
+  "unused-function-argument",    # фикстуры-аргументы
+]
+"src/tallyho/testing/**" = ["assert"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+ignore-decorators = ["typing.overload"]
+
+[tool.ruff.lint.pydoclint]
+ignore-one-line-docstrings = false
+
+[tool.ruff.lint.flake8-tidy-imports]
+ban-relative-imports = "all"
+
+[tool.ruff.lint.flake8-tidy-imports.banned-api]
+"asyncio.get_event_loop".msg = "Используй asyncio.get_running_loop()."
+"datetime.datetime.utcnow".msg = "Naive datetime запрещены. datetime.now(UTC)."
+"datetime.datetime.utcfromtimestamp".msg = "Naive datetime запрещены. datetime.fromtimestamp(ts, UTC)."
+"logging.basicConfig".msg = "Библиотека не настраивает логирование — это решает приложение."
+"logging.root".msg = "Используй logging.getLogger(__name__)."
+"pickle".msg = "pickle небезопасен; используй Serializer-протокол."
+"sys.exit".msg = "Библиотека не завершает процесс; бросай исключение (разрешено только в tallyho.cli)."
+"typing.Any".msg = "Any запрещён. Используй object, TypeVar, Protocol или точный тип. Исключение — с `# noqa: TID251  # причина`."
+"typing_extensions.Any".msg = "Any запрещён. См. typing.Any."
+"unittest.mock.patch".msg = "Не патчи модули; внедряй зависимости через протоколы (Clock, IdFactory, ...)."
+
+[tool.ruff.lint.flake8-type-checking]
+strict = true
+runtime-evaluated-base-classes = []
+
+[tool.ruff.lint.flake8-pytest-style]
+fixture-parentheses = false
+mark-parentheses = false
+parametrize-names-type = "tuple"
+
+[tool.ruff.lint.flake8-bugbear]
+extend-immutable-calls = []
+
+[tool.ruff.lint.isort]
+known-first-party = ["tallyho"]
+required-imports = ["from __future__ import annotations"]
+force-sort-within-sections = false
+split-on-trailing-comma = true
+
+[tool.ruff.lint.mccabe]
+max-complexity = 10
+
+[tool.ruff.lint.pylint]
+max-args = 6
+max-positional-args = 3
+max-branches = 12
+max-returns = 6
+max-statements = 50
+max-nested-blocks = 4
+max-bool-expr = 4
+max-locals = 15
+
+# -----------------------------------------------------------------------------
+# mypy: --strict + всё, что сверху.
+# -----------------------------------------------------------------------------
+[tool.mypy]
+python_version = "3.11"
+files = ["src", "tests"]
+mypy_path = "src"
+strict = true
+extra_checks = true
+strict_bytes = true
+warn_unreachable = true
+warn_unused_ignores = true
+disallow_any_explicit = true
+disallow_any_decorated = true
+disallow_any_unimported = true
+disallow_any_generics = true
+disallow_subclassing_any = true
+local_partial_types = true
+no_implicit_reexport = true
+strict_equality = true
+show_error_codes = true
+show_error_context = true
+pretty = true
+enable_error_code = [
+  "ignore-without-code",
+  "redundant-cast",
+  "redundant-expr",
+  "redundant-self",
+  "truthy-bool",
+  "truthy-iterable",
+  "possibly-undefined",
+  "unused-awaitable",
+  "unused-ignore",
+  "explicit-override",
+  "mutable-override",
+  "exhaustive-match",
+  "deprecated",
+  "unimported-reveal",
+  "narrowed-type-not-subtype",
+]
+
+[[tool.mypy.overrides]]
+module = ["tests.*"]
+# pytest-декораторы (fixture/parametrize) типизированы через Any.
+disallow_any_decorated = false
+
+# -----------------------------------------------------------------------------
+# basedpyright: режим "all" (строже, чем pyright --strict из ACCEPTANCE A-NF-04).
+# -----------------------------------------------------------------------------
+[tool.basedpyright]
+pythonVersion = "3.11"
+include = ["src", "tests"]
+typeCheckingMode = "all"
+failOnWarnings = true
+enableTypeIgnoreComments = false   # подавление — только `# pyright: ignore[rule]`
+reportIgnoreCommentWithoutRule = "error"
+reportUnnecessaryTypeIgnoreComment = "error"
+reportImplicitOverride = "error"
+reportMissingSuperCall = "none"    # ложные срабатывания на Protocol/ABC/миксинах
+reportUnusedCallResult = "none"    # дублирует mypy unused-awaitable, шумит на builder-API
+reportImportCycles = "error"
+reportPrivateUsage = "error"
+reportUninitializedInstanceVariable = "error"
+executionEnvironments = [
+  # pytest-фикстуры и декораторы отдают Any наружу.
+  { root = "tests", reportAny = "none", reportUnknownMemberType = "none", reportUntypedFunctionDecorator = "none", reportPrivateUsage = "none" },
+  { root = "src" },
+]
+
+# -----------------------------------------------------------------------------
+# import-linter: архитектурные границы из docs/ARCHITECTURE.md section 3.3.
+# -----------------------------------------------------------------------------
+[tool.importlinter]
+root_package = "tallyho"
+include_external_packages = true
+
+[[tool.importlinter.contracts]]
+name = "Layers (docs/ARCHITECTURE.md section 3.3): upper may import lower, never the reverse"
+type = "layers"
+containers = ["tallyho"]
+layers = [
+  "cli | adapters | testing",
+  "api | runtime",
+  "engine",
+  "hooks | storage",
+  "protocols",
+  "model",
+]
+exhaustive = true
+
+[[tool.importlinter.contracts]]
+name = "Adapters know only protocols, runtime and model"
+type = "forbidden"
+source_modules = ["tallyho.adapters"]
+forbidden_modules = ["tallyho.api", "tallyho.engine", "tallyho.storage", "tallyho.hooks", "tallyho.cli", "tallyho.testing"]
+
+[[tool.importlinter.contracts]]
+name = "storage knows nothing about brokers or protocols"
+type = "forbidden"
+source_modules = ["tallyho.storage"]
+forbidden_modules = ["tallyho.protocols", "tallyho.hooks", "flexiq"]
+
+[[tool.importlinter.contracts]]
+name = "api does not depend on runtime or storage directly"
+type = "forbidden"
+source_modules = ["tallyho.api"]
+forbidden_modules = ["tallyho.runtime", "tallyho.storage"]
+
+[[tool.importlinter.contracts]]
+name = "model and protocols are pure Python (no DB libraries)"
+type = "forbidden"
+source_modules = ["tallyho.model", "tallyho.protocols"]
+forbidden_modules = ["sqlalchemy", "asyncpg", "psycopg", "alembic", "flexiq"]
+
+[[tool.importlinter.contracts]]
+name = "flexiq is imported only by tallyho.adapters.flexiq"
+type = "forbidden"
+source_modules = ["tallyho.api", "tallyho.runtime", "tallyho.engine", "tallyho.hooks", "tallyho.storage", "tallyho.protocols", "tallyho.model", "tallyho.cli", "tallyho.testing"]
+forbidden_modules = ["flexiq"]
+
+[[tool.importlinter.contracts]]
+name = "DB drivers are never imported directly (SQLAlchemy only)"
+type = "forbidden"
+source_modules = ["tallyho"]
+forbidden_modules = ["asyncpg", "psycopg"]
+ignore_imports = []
+
+# -----------------------------------------------------------------------------
+# deptry: все импорты объявлены, все зависимости используются.
+# -----------------------------------------------------------------------------
+[tool.deptry]
+known_first_party = ["tallyho"]
+
+[tool.deptry.per_rule_ignores]
+# Скелет ещё не импортирует эти пакеты. Удаляй из списка по мере появления кода —
+# иначе deptry не заметит, что зависимость стала лишней.
+DEP002 = ["sqlalchemy", "asyncpg", "psycopg", "flexiq", "alembic", "typing-extensions"]
+
+# -----------------------------------------------------------------------------
+# pytest
+# -----------------------------------------------------------------------------
+[tool.pytest.ini_options]
+minversion = "9.0"
+testpaths = ["tests"]
+addopts = [
+  "--import-mode=importlib",
+  "--strict-markers",
+  "--strict-config",
+  "-ra",
+  "--cov",
+  "--cov-report=term-missing:skip-covered",
+]
+xfail_strict = true
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+asyncio_default_test_loop_scope = "function"
+timeout = 60
+filterwarnings = ["error"]
+markers = [
+  "integration: требует PostgreSQL (Docker/testcontainers или TALLYHO_TEST_DSN)",
+  "slow: долгие тесты (хаос, нагрузка)",
+]
+
+[tool.coverage.run]
+source = ["tallyho"]
+branch = true
+omit = ["*/__main__.py"]
+parallel = true
+
+[tool.coverage.paths]
+source = ["src/tallyho", "*/site-packages/tallyho"]
+
+[tool.coverage.report]
+fail_under = 95
+show_missing = true
+skip_covered = true
+exclude_also = [
+  "if TYPE_CHECKING:",
+  "@overload",
+  "raise NotImplementedError",
+  "\\.\\.\\.$",
+  "class .*\\(Protocol\\):",
+  "assert_never\\(",
+]
+
+# -----------------------------------------------------------------------------
+# codespell
+# -----------------------------------------------------------------------------
+[tool.codespell]
+skip = "*.lock,docs/*,.git,*.svg"
+check-filenames = true

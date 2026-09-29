@@ -1,0 +1,91 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  UV_FROZEN: "1"
+  FORCE_COLOR: "1"
+
+jobs:
+  lint:
+    name: Lint, types, architecture
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+      - run: uv sync --all-extras
+      - run: uv run ruff format --check .
+      - run: uv run ruff check --output-format=github .
+      - run: uv run mypy
+      - run: uv run basedpyright
+      - run: uv run lint-imports
+      - run: uv run deptry src
+      - uses: pre-commit/action@v3.0.1
+        env:
+          SKIP: no-commit-to-branch,ruff-format,ruff-check,mypy,basedpyright,import-linter,deptry
+
+  test:
+    name: Tests (py${{ matrix.python }}, pg${{ matrix.postgres }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.12", "3.13", "3.14"]
+        postgres: ["16"]
+        include:
+          - python: "3.11"
+            postgres: "14"
+          - python: "3.14"
+            postgres: "17"
+    services:
+      postgres:
+        image: postgres:${{ matrix.postgres }}-alpine
+        env:
+          POSTGRES_USER: tallyho
+          POSTGRES_PASSWORD: tallyho
+          POSTGRES_DB: tallyho
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U tallyho"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      TALLYHO_TEST_DSN: postgresql+asyncpg://tallyho:tallyho@localhost:5432/tallyho
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          python-version: ${{ matrix.python }}
+      - run: uv sync --all-extras
+      - run: uv run pytest -n auto --cov-report=xml
+      - uses: actions/upload-artifact@v4
+        if: matrix.python == '3.11' && matrix.postgres == '16'
+        with:
+          name: coverage
+          path: coverage.xml
+
+  build:
+    name: Build distribution
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v7
+      - run: uv build
+      - run: uvx twine check --strict dist/*
+      - name: Smoke-test wheel in clean env
+        run: uv run --isolated --no-project --with dist/*.whl python -c "import tallyho; print(tallyho.__version__)"
