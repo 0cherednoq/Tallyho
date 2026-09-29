@@ -12,14 +12,14 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pytest
-from sqlalchemy.ext.asyncio import create_async_engine
+from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 
 from tests.helpers.db import temporary_schema
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Iterator
 
-    from sqlalchemy.ext.asyncio import AsyncEngine
+    from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 POSTGRES_IMAGE = "postgres:16-alpine"
 
@@ -59,3 +59,17 @@ async def schema(engine: AsyncEngine) -> AsyncIterator[str]:
     """Пустая схема, уникальная для теста; после теста — ``DROP SCHEMA ... CASCADE``."""
     async with temporary_schema(engine) as name:
         yield name
+
+
+@pytest.fixture
+async def connection(engine: AsyncEngine) -> AsyncIterator[AsyncConnection]:
+    """Соединение без открытой транзакции; незакоммиченное откатывается при закрытии."""
+    async with engine.connect() as conn:
+        yield conn
+
+
+@pytest.fixture
+async def session(engine: AsyncEngine) -> AsyncIterator[AsyncSession]:
+    """``AsyncSession`` пользователя — как в приложении, которое вызывает tallyho."""
+    async with AsyncSession(engine, expire_on_commit=False) as sess:
+        yield sess

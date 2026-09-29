@@ -9,7 +9,7 @@ from sqlalchemy import column, func, insert, select, table, text
 from tests.helpers.db import schema_exists, temporary_schema
 
 if TYPE_CHECKING:
-    from sqlalchemy.ext.asyncio import AsyncEngine
+    from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, AsyncSession
 
 
 async def test_schema_fixture_creates_empty_schema(engine: AsyncEngine, schema: str) -> None:
@@ -45,3 +45,29 @@ async def test_temporary_schema_is_dropped_with_contents(engine: AsyncEngine) ->
 async def test_schema_names_are_unique(engine: AsyncEngine) -> None:
     async with temporary_schema(engine) as first, temporary_schema(engine) as second:
         assert first != second
+
+
+async def test_connection_fixture_rolls_back_uncommitted(
+    connection: AsyncConnection, engine: AsyncEngine, schema: str
+) -> None:
+    await connection.execute(text(f'CREATE TABLE "{schema}".probe (id int)'))
+    assert connection.in_transaction()
+    await connection.rollback()
+    async with engine.connect() as other:
+        tables = await other.scalar(
+            text("SELECT count(*) FROM pg_tables WHERE schemaname = :schema"),
+            {"schema": schema},
+        )
+    assert tables == 0
+
+
+async def test_session_fixture_commits_into_schema(
+    session: AsyncSession, engine: AsyncEngine, schema: str
+) -> None:
+    probe = table("probe", column("id"), schema=schema)
+    conn = await session.connection()
+    await conn.execute(text(f'CREATE TABLE "{schema}".probe (id int)'))
+    await session.execute(insert(probe).values(id=7))
+    await session.commit()
+    async with engine.connect() as other:
+        assert await other.scalar(select(probe.c.id)) == 7
