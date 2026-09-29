@@ -21,6 +21,7 @@ if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 __all__ = [
+    "SCHEMA_PREFIX",
     "LockRow",
     "deadlock_count",
     "held_locks",
