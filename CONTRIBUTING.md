@@ -50,7 +50,20 @@ tests/
   unit/          быстрые тесты без БД
   architecture/  AST-проверки соглашений
   integration/   PostgreSQL
+  helpers/       общие хелперы тестов (импорт: `tests.helpers.*`)
 ```
+
+## Интеграционные тесты
+
+* Фикстуры в `tests/integration/conftest.py`: `engine`, `schema` (пустая схема,
+  уникальная на тест, после теста — `DROP SCHEMA ... CASCADE`), `connection`
+  (`AsyncConnection`), `session` (`AsyncSession`). Таблицы теста создавайте только
+  в `schema`.
+* `tests/helpers/db.py`: `deadlock_count` (`pg_stat_database.deadlocks`, сравнивать
+  разницу до/после), `held_locks` (`pg_locks`).
+* Параллельно: `uv run pytest -n 4`. Без `TALLYHO_TEST_DSN` каждый xdist-воркер
+  поднимает свой контейнер PostgreSQL, с ним — все делят одну БД.
+* Долгие тесты помечаются `@pytest.mark.slow`; пропустить их: `-m "not slow"`.
 
 Слои и запреты импортов описаны в `[tool.importlinter]` в `pyproject.toml`
 и соответствуют [docs/ARCHITECTURE.md §3.3](docs/ARCHITECTURE.md).
