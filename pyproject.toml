@@ -36,7 +36,7 @@ classifiers = [
   "Typing :: Typed",
 ]
 dependencies = [
-  "sqlalchemy[asyncio]>=2.0.30",
+  "sqlalchemy[asyncio]>=2.1",
   "typing-extensions>=4.10",
 ]
 
