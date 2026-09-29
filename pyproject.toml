@@ -211,7 +211,7 @@ parametrize-names-type = "tuple"
 extend-immutable-calls = []
 
 [tool.ruff.lint.isort]
-known-first-party = ["tallyho"]
+known-first-party = ["tallyho", "tests"]
 required-imports = ["from __future__ import annotations"]
 force-sort-within-sections = false
 split-on-trailing-comma = true
@@ -235,7 +235,8 @@ max-locals = 15
 [tool.mypy]
 python_version = "3.11"
 files = ["src", "tests"]
-mypy_path = "src"
+mypy_path = ["src", "."]
+explicit_package_bases = true
 strict = true
 extra_checks = true
 strict_bytes = true
@@ -294,7 +295,7 @@ reportPrivateUsage = "error"
 reportUninitializedInstanceVariable = "error"
 executionEnvironments = [
   # pytest-фикстуры и декораторы отдают Any наружу.
-  { root = "tests", reportAny = "none", reportUnknownMemberType = "none", reportUntypedFunctionDecorator = "none", reportPrivateUsage = "none" },
+  { root = "tests", extraPaths = ["."], reportAny = "none", reportUnknownMemberType = "none", reportUntypedFunctionDecorator = "none", reportPrivateUsage = "none" },
   { root = "src" },
 ]
 
@@ -373,6 +374,7 @@ DEP002 = ["sqlalchemy", "asyncpg", "psycopg", "flexiq", "alembic", "typing-exten
 [tool.pytest.ini_options]
 minversion = "9.0"
 testpaths = ["tests"]
+pythonpath = ["."]  # импорт общих хелперов как `tests.helpers.*`
 addopts = [
   "--import-mode=importlib",
   "--strict-markers",

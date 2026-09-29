@@ -14,6 +14,8 @@ from typing import TYPE_CHECKING
 import pytest
 from sqlalchemy.ext.asyncio import create_async_engine
 
+from tests.helpers.db import temporary_schema
+
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Iterator
 
@@ -50,3 +52,10 @@ async def engine(postgres_dsn: str) -> AsyncIterator[AsyncEngine]:
         yield eng
     finally:
         await eng.dispose()
+
+
+@pytest.fixture
+async def schema(engine: AsyncEngine) -> AsyncIterator[str]:
+    """Пустая схема, уникальная для теста; после теста — ``DROP SCHEMA ... CASCADE``."""
+    async with temporary_schema(engine) as name:
+        yield name
