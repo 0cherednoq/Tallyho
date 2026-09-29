@@ -2,4 +2,9 @@
 
 from __future__ import annotations
 
-__all__: list[str] = []
+from tallyho.protocols.clock import Clock, SystemClock
+
+__all__ = [
+    "Clock",
+    "SystemClock",
+]
