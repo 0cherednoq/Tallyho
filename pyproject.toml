@@ -115,6 +115,7 @@ deps = { cmd = "deptry src", help = "Declared vs used dependencies" }
 test = { cmd = "pytest -m 'not integration' --cov-fail-under=0", help = "Unit + architecture tests (coverage gate is enforced on test-all / CI)" }
 test-all = { cmd = "pytest", help = "All tests incl. PostgreSQL integration (needs Docker or TALLYHO_TEST_DSN)" }
 check = { sequence = ["lint", "types", "imports", "deps", "test"], help = "Everything CI runs, except integration" }
+check-all = { sequence = ["lint", "types", "imports", "deps", "test-all"], help = "Всё, включая PostgreSQL и покрытие ≥ 95%" }
 
 # -----------------------------------------------------------------------------
 # Ruff: style (formatter) + lint. Все правила включены, отключено минимум.

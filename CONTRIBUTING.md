@@ -19,6 +19,7 @@ uv run pre-commit install
 | `test` | юнит- и архитектурные тесты |
 | `test-all` | всё, включая PostgreSQL (Docker или `TALLYHO_TEST_DSN`) |
 | `check` | `lint` → `types` → `imports` → `deps` → `test` |
+| `check-all` | то же, но с `test-all`: PostgreSQL и покрытие ≥ 95% |
 
 ## Что проверяется и где
 
