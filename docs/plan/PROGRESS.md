@@ -6,20 +6,20 @@
 ## Текущее состояние
 
 * **Ветка:** `impl/v1`
-* **Текущая волна:** 1 — T0.2, T1.1, T8.0
-* **Последний зелёный коммит:** 4a713d4
+* **Текущая волна:** 2 — T1.2, T1.4, T2.1
+* **Последний зелёный коммит:** 2a781c2
 
 ## Задачи
 
 | ID | Задача | Зависит | Статус | Коммиты |
 |---|---|---|---|---|
 | T0.1 | Репозиторий собирается, гейты зелёные на скелете | — | done | d287135, 97cc124, 6ea6779, 4a713d4 |
-| T0.2 | Инфраструктура тестов (схема на тест, xdist) | T0.1 | in_progress | |
-| T1.1 | Перечисления состояний и иерархия ошибок | T0.1 | in_progress | |
-| T1.2 | Value-объекты, FailurePolicy, TaskCall | T1.1 | todo | |
+| T0.2 | Инфраструктура тестов (схема на тест, xdist) | T0.1 | done | 25fcbe6..81c68c3 (5), merge 69a40fa |
+| T1.1 | Перечисления состояний и иерархия ошибок | T0.1 | done | 7c5a33d..345efab (3), merge 0de5f86 |
+| T1.2 | Value-объекты, FailurePolicy, TaskCall | T1.1 | in_progress | |
 | T1.3 | Математика прогресса | T1.2 | todo | |
-| T1.4 | Протоколы и базовые реализации (Clock, UUIDv7, Serializer, Observer) | T1.1 | todo | |
-| T2.1 | Таблицы и индексы | T1.1 | todo | |
+| T1.4 | Протоколы и базовые реализации (Clock, UUIDv7, Serializer, Observer) | T1.1 | in_progress | |
+| T2.1 | Таблицы и индексы | T1.1 | in_progress | |
 | T2.2 | Миграции, установка в схему, alembic | T2.1, T0.2 | todo | |
 | T2.3 | Транзакции: сессия пользователя, ретраи, after_commit, HookSession | T2.1, T1.4 | todo | |
 | T2.4 | Запросы счётчиков, дельты, свёртка, reconcile | T2.2, T2.3 | todo | |
@@ -42,7 +42,7 @@
 | T6.2 | th.batch → BatchBuilder, BatchHandle | T6.1 | todo | |
 | T6.3 | th.call с ParamSpec, типовые тесты | T6.1 | todo | |
 | T7.1 | tallyho.testing: InlineBroker, FakeClock | T6.2 | todo | |
-| T8.0 | Спайк flexiq | T0.1 | in_progress | |
+| T8.0 | Спайк flexiq | T0.1 | done | 4d318d0..f4155a6 (3), merge 9395ea6, b41b30d, 2a781c2 |
 | T8.1 | FlexiqAdapter | T8.0, T7.1 | todo | |
 | T8.2 | Контрактные тесты A-FQ | T8.1 | todo | |
 | T9.1 | Пример «рассылки» (§12) как тесты | T7.1 | todo | |
@@ -71,6 +71,24 @@
 - Отклонения от плана/доков: … (или «нет»)
 - Узнали / на что обратить внимание дальше: …
 -->
+
+### 2026-09-30 · волна 2 запущена · T1.2, T1.4, T2.1
+
+### 2026-09-30 · волна 1 влита · T0.2, T1.1, T8.0
+- **T0.2 · done.** Фикстуры `schema`/`connection`/`session`; `tests/helpers/db.py`: `deadlock_count`, `held_locks`, `temporary_schema`. `pytest -n 4` зелёный. Решения D-009 (импорт `tests.*`), D-010 (контейнер на xdist-воркер).
+- **T1.1 · done.** `model/states.py` (коды по D-005, `TERMINAL_THRESHOLD=10`), ошибки движка, реэкспорт из `tallyho.model`. Решение D-011.
+- **T8.0 · done.** Спайк на живом воркере: `docs/plan/FLEXIQ_SPIKE.md`, скрипты `tests/contract/flexiq/spike_*.py`. D-006 закрыто (payload — кодек задачи flexiq), D-012…D-015; ARCHITECTURE §11.3/§16 и ACCEPTANCE A-FQ-09/13/14 поправлены (2a781c2).
+- **Починка после вливания (b41b30d).** После D-009 спайки больше не находили `spike_support`. Теперь они импортируют `tests.contract.flexiq.spike_support` и запускаются через `python -m`. Оба спайка перепроверены живым прогоном.
+- **Для следующих задач:**
+  - SQL-проверка «активен» — `state < 10`.
+  - Длинные строки собирать через переменные: basedpyright запрещает неявную конкатенацию (`reportImplicitStringConcatenation`). Если позиционных аргументов больше трёх, остальные — keyword-only (PLR0917).
+  - Имя схемы в SQL — в двойных кавычках или через `table(..., schema=)`; f-строки с DML ruff ловит как S608.
+  - `deadlock_count` сравнивать только по разнице и опрашивать: статистика приходит с задержкой около 1 с.
+  - В `th.tracked` нужен `functools.update_wrapper`, а не `@wraps`: mypy `disallow_any_decorated`.
+  - `retry_verdict` → FINAL, если `retry_count >= max_retries`, или `dont_retry_on`, или исключение не подходит под непустой `retry_on`.
+  - `max_payload_bytes` (1 MiB) проверять у продюсера.
+  - Жёсткий `timeout` flexiq не отменяет корутину. Claim при живом lease обязателен.
+  - Имя задачи flexiq для `__main__` берётся из `__spec__.name`.
 
 ### 2026-09-30 · волна 1 запущена · T0.2, T1.1, T8.0
 - Параллельный режим (PLAN §0.7): три сабагента в отдельных worktree.

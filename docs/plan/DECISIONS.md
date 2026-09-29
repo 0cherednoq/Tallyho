@@ -23,11 +23,37 @@
 * `th_batch.on_feeder_failed`: `seal=0, cancel=1`.
 Значения фиксируются снимок-тестом в T1.1: менять только миграцией.
 
-## D-006 · Сериализация payload · ACCEPTED (проверить в T8.0)
-`th_item.payload` хранит аргументы вызова для (пере)отправки relay'ем. Кодек — `Serializer` адаптера, по умолчанию `JsonSerializer`. Для flexiq, где аргументы сериализует сам брокер (cloudpickle/msgpack/cbor), payload должен позволять восстановить ровно те объекты, что передал пользователь (A-FQ-01). Если JSON этого не обеспечивает, адаптер предоставляет свой кодек — решить по итогам спайка T8.0.
+## D-006 · Сериализация payload — кодеком задачи flexiq · ACCEPTED (T8.0)
+JSON не подходит: он теряет bytes, datetime и Decimal, превращает кортежи в списки, а int-ключи в строки (нарушается A-FQ-01). `th_item.payload` хранит байты `queue._encode_payload(task, args, kwargs)`. Relay декодирует их через `queue._deserialize_payload`, добавляет `_th` и вызывает `enqueue_many`. Так пользовательские `serializer`/`codecs`/шифрование flexiq действуют и на хранение в `th_item`. Цена — зависимость от приватного API: `install()` проверяет его наличие, контрактный тест его закрепляет. Протокол `Serializer` остаётся для адаптеров без собственного кодека (по умолчанию JSON). Подробности — [FLEXIQ_SPIKE.md](FLEXIQ_SPIKE.md).
 
 ## D-007 · Ветка и коммиты · ACCEPTED
 Работа в ветке `impl/v1` (pre-commit `no-commit-to-branch` запрещает `main`). Коммиты небольшие и зелёные, несколько на задачу; сообщения на русском, формат — PLAN §0.6. Push и PR — только по просьбе человека.
 
 ## D-008 · Автономность · ACCEPTED
 Цикл работает без ограничения по времени, пока библиотека не доделана, и не ждёт человека: неясности решает сам с записью `ACCEPTED (автономно, пересмотреть)` в этом файле. Статус `OPEN` не используется. Правила — PLAN §0.4.
+
+## D-009 · Общие хелперы тестов — пакет `tests.*` · ACCEPTED (T0.2)
+Хелперы импортируются как `tests.helpers.*`. Для этого pytest `pythonpath=["."]`, mypy `mypy_path=["src", "."]` + `explicit_package_bases`, basedpyright `extraPaths=["."]` для tests, ruff isort `tests` в known-first-party. Иначе mypy видит один файл под двумя именами. Следствие: скрипты в `tests/` запускаются только как модули (`python -m tests....`).
+
+## D-010 · PostgreSQL на xdist-воркер · ACCEPTED (T0.2)
+При `pytest -n` каждый xdist-воркер лениво поднимает свой контейнер (только если ему достались интеграционные тесты), поэтому unit-прогоны не требуют Docker. С `TALLYHO_TEST_DSN` все воркеры делят одну БД; тесты изолирует уникальная схема (фикстура `schema`).
+
+## D-011 · Коды ResultClass/OutboxKind и CancelReason · ACCEPTED (T1.1)
+`ResultClass` — `IntEnum` с кодами 10–13, совпадающими с терминальными `ItemState`: в `th_item.state` хранится `active` или класс итога. `OutboxKind` (item=0, callback=1) закреплён снимком. `CancelReason` — `StrEnum` (`cancel, deadline, fail_fast, policy`; `th_batch.cancel_reason` — text). `policy` — порог политики с `action="fail"`. Итог: `cancel` → cancelled, остальные причины → failed. Имена ошибок без суффикса `Error` (`BatchPurged`, `DownstreamFinalized`, `UnsupportedOption`, `ConcurrentModification`) — как в ARCHITECTURE/ACCEPTANCE; N818 подавлено точечно.
+
+## D-012 · Relay передаёт умолчания задачи явно · ACCEPTED (автономно, пересмотреть) (T8.0)
+`enqueue_many` с `None` берёт умолчания Queue (3 ретрая, приоритет 0, таймаут 300 с), а не `@task`. Relay передаёт `priority, queue, max_retries, timeout, expires` явно: из опций вызова, иначе из опций декоратора, зафиксированных в `fq.task`. Ключ группы для `enqueue_many` — `(task_name, queue, priority, max_retries, timeout)`.
+
+## D-013 · Дубль `idempotency_key` в `enqueue_many` → поштучный повтор · ACCEPTED (автономно, пересмотреть) (T8.0)
+Пачка с ключом, занятым pending-джобой, целиком падает (`RuntimeError: duplicate key … idx_jobs_unique_key`) и ничего не вставляет; одиночный `enqueue` возвращает существующий id. Relay при этой ошибке повторяет чанк поштучно через `enqueue`.
+
+## D-014 · Страховка DLQ: событие + сверка · ACCEPTED (автономно, пересмотреть) (T8.0)
+Основной путь — `queue.on_event(EventType.JOB_DEAD)` в `install()`. Сверка: `dead_letters_after` → `get_job(original_job_id)` → декодирование payload → `_th` (в записи DLQ payload нет). Middleware `on_dead_letter` не используется: она ставится только при создании Queue, её можно выключить из дашборда, а `ctx.retry_count` в ней равен 0.
+
+## D-015 · Поправки к ARCHITECTURE §11.3 и ACCEPTANCE по итогам спайка · ACCEPTED (T8.0)
+* Circuit breaker не отправляет джобы в DLQ, а откладывает их до `cooldown` (A-FQ-09 — только `retry_budget`).
+* `retry_dead`/`replay` не сохраняют `metadata` пользователя; kwargs (и `_th`) переносятся (A-FQ-02, A-FQ-14).
+* Мёртвый воркер обнаруживается за ~43 с (не 30), повтор съедает попытку.
+* Prefork выполняет async-задачу через `asyncio.run` в новом loop, на Windows — `NotImplementedError`: `install()` даёт явную ошибку.
+* `_th` видят чужие предикаты, `on_enqueue` и `before_task` (задокументировать в A-FQ-13).
+Документы исправлены отдельным коммитом (AGENTS.md: «сначала обнови документ»).
