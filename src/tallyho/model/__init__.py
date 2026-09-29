@@ -24,21 +24,33 @@ from tallyho.model.states import (
     OutboxKind,
     ResultClass,
 )
+from tallyho.model.views import (
+    BatchSummary,
+    BatchView,
+    InFlightItem,
+    ItemView,
+    Progress,
+)
 
 __all__ = [
     "BatchPurged",
     "BatchState",
+    "BatchSummary",
+    "BatchView",
     "CancelReason",
     "ConcurrentModification",
     "ConfigurationError",
     "DownstreamFinalized",
     "HookMissingError",
     "HookTransactionError",
+    "InFlightItem",
     "InvalidStateError",
     "ItemState",
+    "ItemView",
     "NotFoundError",
     "OnFeederFailed",
     "OutboxKind",
+    "Progress",
     "ResultClass",
     "SealError",
     "SpawnTargetError",
