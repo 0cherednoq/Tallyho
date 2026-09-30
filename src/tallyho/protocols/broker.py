@@ -1,0 +1,148 @@
+"""Контракт адаптера брокера: :class:`Dispatcher` и :class:`Runtime` (ARCHITECTURE §4.2).
+
+Сторона продюсера — :class:`Dispatcher`: relay читает ``th_outbox`` и отдаёт
+брокеру пачку :class:`Message`. Отправка at-least-once: дубль отсекает claim.
+
+Сторона воркера — :class:`Runtime`: обёртка исполнения задачи, вердикт «будет ли
+ретрай» после исключения и сверка с DLQ брокера (страховка на случай, когда
+брокер убил задачу вопреки вердикту ``RETRY``, ARCHITECTURE §11.3, D-014).
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from enum import StrEnum
+from typing import TYPE_CHECKING, ParamSpec, Protocol, TypeVar, runtime_checkable
+
+if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable, Mapping, Sequence
+    from uuid import UUID
+
+    from tallyho.model.states import OutboxKind
+
+__all__ = ["DeadLetters", "Dispatcher", "Message", "Runtime", "Verdict"]
+
+P = ParamSpec("P")
+R = TypeVar("R")
+
+
+def _no_options() -> Mapping[str, object]:
+    return {}
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class Message:
+    """Одна запись outbox к отправке брокеру.
+
+    Attributes:
+        id: ``item_id`` для ``kind=ITEM``; стабильный ``callback_id`` (id записи
+            outbox) для ``kind=CALLBACK`` — по нему брокер и tallyho отсекают дубли.
+        batch_id: батч Item или батч, чей колбэк ставится.
+        kind: что отправляется — Item или колбэк финализации.
+        task_name: имя задачи у брокера (:meth:`Dispatcher.task_name`).
+        payload: аргументы вызова, закодированные
+            :class:`~tallyho.protocols.PayloadCodec` адаптера.
+        options: опции постановки брокера из ``th.call(...).opts`` (priority,
+            queue, delay, metadata, …); JSON-совместимые значения.
+    """
+
+    id: UUID
+    batch_id: UUID
+    kind: OutboxKind
+    task_name: str
+    payload: bytes
+    options: Mapping[str, object] = field(default_factory=_no_options)
+
+
+class Verdict(StrEnum):
+    """Что брокер сделает после исключения задачи."""
+
+    RETRY = "retry"
+    """Брокер повторит задачу: Item отпускается (``release``), попытка +1."""
+    FINAL = "final"
+    """Повтора не будет: Item завершается ошибкой (``finish(error)``)."""
+
+
+@dataclass(frozen=True, slots=True)
+class DeadLetters:
+    """Результат одного шага сверки с DLQ брокера.
+
+    Attributes:
+        item_ids: Items, чьи задачи брокер окончательно отправил в DLQ.
+        cursor: непрозрачный курсор для следующего вызова
+            :meth:`Runtime.reconcile_dead`; ``None`` — начать сначала.
+    """
+
+    item_ids: tuple[UUID, ...]
+    cursor: str | None
+
+
+@runtime_checkable
+class Dispatcher(Protocol):
+    """Сторона продюсера: имена задач и отправка пачки сообщений брокеру."""
+
+    def task_name(self, fn: Callable[P, object]) -> str:
+        """Имя, под которым брокер знает функцию задачи.
+
+        Args:
+            fn: функция задачи (как её передал пользователь).
+
+        Returns:
+            Имя задачи у брокера.
+        """
+        ...
+
+    async def dispatch(self, messages: Sequence[Message]) -> None:
+        """Поставить сообщения в брокер.
+
+        Возврат без исключения означает, что все сообщения приняты брокером и
+        записи outbox можно удалить. При исключении relay повторит всю пачку.
+
+        Args:
+            messages: пачка сообщений одного прохода relay.
+        """
+        ...
+
+
+@runtime_checkable
+class Runtime(Protocol):
+    """Сторона воркера: исполнение задачи под учётом tallyho."""
+
+    def wrap(self, fn: Callable[P, Awaitable[R]]) -> Callable[P, Awaitable[R]]:
+        """Обернуть функцию задачи для регистрации в брокере.
+
+        Обёртка вынимает служебный маркер Item из аргументов, захватывает Item
+        и после исполнения сообщает итог. Имя задачи у брокера не меняется.
+
+        Args:
+            fn: ``async def``-функция задачи.
+
+        Returns:
+            Обёртка с той же сигнатурой.
+        """
+        ...
+
+    def retry_verdict(self, exc: BaseException) -> Verdict:
+        """Будет ли брокер повторять текущую задачу после исключения ``exc``.
+
+        Вызывается внутри исполнения задачи, поэтому адаптер знает текущую
+        попытку и конфиг ретраев задачи.
+
+        Args:
+            exc: исключение, брошенное функцией задачи.
+
+        Returns:
+            :attr:`Verdict.RETRY` или :attr:`Verdict.FINAL`.
+        """
+        ...
+
+    async def reconcile_dead(self, since: str | None) -> DeadLetters:
+        """Найти Items, чьи задачи брокер отправил в DLQ после курсора ``since``.
+
+        Args:
+            since: курсор из прошлого :class:`DeadLetters` или ``None``.
+
+        Returns:
+            Items из DLQ и курсор для следующего вызова.
+        """
+        ...
