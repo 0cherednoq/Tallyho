@@ -513,6 +513,11 @@ class _Tx:
 
     async def _park(self, item_ids: list[UUID]) -> None:
         # Пауза (UC-11): Item обратно в outbox до resume; relay его снова отправит.
+        await self._to_outbox(item_ids, _INFINITY)
+        for item_id in item_ids:
+            self._result(item_id, ClaimOutcome.PARKED)
+
+    async def _to_outbox(self, item_ids: list[UUID], available_at: ColumnElement[datetime]) -> None:
         if not item_ids:
             return
         item = self.tables.item
@@ -523,7 +528,7 @@ class _Tx:
             item.c.batch_id,
             item.c.id,
             item.c.task_name,
-            _INFINITY,
+            available_at,
         ).where(item.c.id == any_(_uuids(sorted(item_ids))))
         result = await self.conn.execute(
             insert(outbox)
@@ -534,8 +539,29 @@ class _Tx:
         for (batch_id,) in result:
             # Item больше не у брокера: окно max_in_flight считает dispatched - done.
             self.deltas[batch_id] += CounterDelta(dispatched=-1)
-        for item_id in item_ids:
-            self._result(item_id, ClaimOutcome.PARKED)
+
+    async def requeue(self, refs: Iterable[ItemRef]) -> None:
+        """Свои lease — сразу обратно в outbox, как после их истечения (A-CH-08).
+
+        Попытка не тратится: задача не упала, процесс останавливается.
+        """
+        refs = list(refs)
+        await self.lock_batches(ref.batch_id for ref in refs)
+        await self.lock_items(ref.id for ref in refs)
+        await self.lock_leases(ref.id for ref in refs)
+        own = self._owned(ref.id for ref in refs)
+        await self._delete_leases(own)
+        waiting: list[UUID] = []
+        paused: list[UUID] = []
+        for item_id in own:
+            row = self.items.get(item_id)
+            if row is None or row.state.is_terminal:
+                continue
+            flags = self.batches.get(row.batch_id)
+            (paused if flags is not None and flags.paused else waiting).append(item_id)
+        await self._to_outbox(waiting, self.now)
+        await self._to_outbox(paused, _INFINITY)
+        self.applied.released.update(own)
 
     async def _delete_expiry(self, item_ids: list[UUID]) -> None:
         if not item_ids:
@@ -671,7 +697,7 @@ class Completer:
         self._full = asyncio.Event()
         self._capacity = asyncio.Semaphore(settings.backpressure)
         self._closing = False
-        self._held: set[UUID] = set()
+        self._held: dict[UUID, ItemRef] = {}
 
     # --- публичные операции ------------------------------------------------------------
 
@@ -736,17 +762,45 @@ class Completer:
         future = self._new_future(bool)
         return await self._submit(_Release(item, future), future)
 
-    async def close(self) -> None:
+    async def close(self, *, requeue_held: bool = False) -> None:
         """Мягкая остановка: дослать буфер и остановить задачу сброса.
 
-        Новые операции после вызова бросают ``InvalidStateError``. Повторный
-        вызов ничего не делает.
+        Новые операции после вызова бросают ``InvalidStateError``; операции,
+        принятые раньше, выполняются. Повторный вызов только досылает
+        ``requeue_held``.
+
+        Args:
+            requeue_held: Путь ``SIGTERM`` (A-CH-08): lease, которые процесс
+                ещё держит (задачи не успели доработать), сразу вернуть в
+                outbox, не дожидаясь ``lease_ttl``. Попытка не тратится.
+
+        Raises:
+            CompleterError: транзакция возврата lease не прошла; их вернёт
+                sweeper по истечении.
         """
         self._closing = True
         self._wakeup.set()
         self._full.set()
         if self._task is not None:
             await self._task
+        if not (requeue_held and self._held):
+            return
+        refs = list(self._held.values())
+        self._held.clear()
+        try:
+            _ = await run_transaction(
+                self.engine,
+                lambda conn: self._requeue(conn, refs),
+                settings=self.settings.tx,
+                policy=self.settings.retry,
+            )
+        except Exception as exc:
+            raise CompleterError(_FLUSH_FAILED) from exc
+
+    async def _requeue(self, conn: AsyncConnection, refs: list[ItemRef]) -> None:
+        tx = _Tx(self, conn)
+        await tx.requeue(refs)
+        await tx.write_counters()
 
     # --- буфер -------------------------------------------------------------------------
 
@@ -862,7 +916,7 @@ class Completer:
                 value = op.item.id in applied.released and op.item.id not in released
                 released.add(op.item.id)
             if not value or isinstance(op, _Release):
-                self._held.discard(op.item.id)
+                _ = self._held.pop(op.item.id, None)
             if not op.future.done():
                 op.future.set_result(value)
 
@@ -873,7 +927,7 @@ class Completer:
                 outcome=ClaimOutcome.DUPLICATE, attempt=result.attempt, depth=result.depth
             )
         elif result.run:
-            self._held.add(op.item.id)
+            self._held[op.item.id] = op.item
         if not op.future.done():
             op.future.set_result(result)
 
