@@ -180,6 +180,7 @@ class ItemColumns(TypedColumns):
     depth = _small(default=0)
     task_name = _text()
     payload = Column(LargeBinary(), nullable=False)
+    options = _jsonb(nullable=True)
     key = _text(nullable=True)
     child_batch_id = _uuid(nullable=True)
     weight = _int(default=1)

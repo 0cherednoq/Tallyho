@@ -188,6 +188,35 @@ async def test_payload_limit(env: Env) -> None:
             _ = await producer.add_items(conn, root.id, [TaskCall(task_name="t", args=("x" * 80,))])
 
 
+async def test_call_options_stored_in_item(env: Env) -> None:
+    # D-033: queue и опции брокера живут в th_item.options; без опций — NULL.
+    calls = [
+        call(1),
+        call(2).opts(queue="mail"),
+        call(3).opts(priority=7, expires=30.5, metadata='{"a": 1}'),
+        call(4).opts(queue="bulk", priority=1),
+    ]
+    async with env.transaction() as conn:
+        root = await env.producer.create_root(conn, RootSpec(kind=KIND))
+        _ = await env.producer.add_items(conn, root.id, calls)
+    item = env.tables.item
+    async with env.connection() as conn:
+        stored = list(await conn.scalars(select(item.c.options).order_by(item.c.id)))
+    assert stored == [
+        None,
+        {"queue": "mail"},
+        {"priority": 7, "expires": 30.5, "metadata": '{"a": 1}'},
+        {"priority": 1, "queue": "bulk"},
+    ]
+
+
+async def test_call_options_must_be_json(env: Env) -> None:
+    async with env.transaction() as conn:
+        root = await env.producer.create_root(conn, RootSpec(kind=KIND))
+        with pytest.raises(ConfigurationError, match="JSON"):
+            _ = await env.producer.add_items(conn, root.id, [call(1).opts(when=object())])
+
+
 async def test_user_rollback_leaves_nothing(env: Env) -> None:
     tables = env.tables
     async with AsyncSession(env.engine) as session:

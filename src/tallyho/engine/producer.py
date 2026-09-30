@@ -39,7 +39,7 @@ from sqlalchemy import (
     update,
 )
 from sqlalchemy import cast as sql_cast
-from sqlalchemy.dialects.postgresql import ARRAY, insert
+from sqlalchemy.dialects.postgresql import ARRAY, JSONB, insert
 
 from tallyho.model.errors import (
     ConfigurationError,
@@ -87,7 +87,7 @@ MAX_PAYLOAD_BYTES: Final = 1024 * 1024
 """Предел закодированного payload по умолчанию: ``max_payload_bytes`` flexiq (1 MiB)."""
 
 ITEM_CHUNK: Final = 1000
-"""Вызовов в одном запросе add_items: массивы unnest, 5 параметров на чанк."""
+"""Вызовов в одном запросе add_items: массивы unnest, 6 параметров на чанк."""
 
 VIRTUAL_TASK: Final = "tallyho.sub_batch"
 """``task_name`` виртуального Item под-батча: он не отправляется брокеру."""
@@ -114,6 +114,7 @@ class CallbackName(StrEnum):
 
 _CALLBACK_BROKEN = "options.callbacks: повреждённая запись колбэка"
 _OPTIONS_NOT_JSON = "опции колбэка должны сериализоваться в JSON"
+_CALL_OPTIONS_NOT_JSON = "опции вызова (queue, опции брокера) должны сериализоваться в JSON"
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -585,12 +586,14 @@ class Producer:
         Строка батча держится ``FOR SHARE``: параллельные продюсеры не мешают
         друг другу, а seal, отмена и финализация ждут commit.
 
-        Опции брокера из ``TaskCall`` (``queue``, ``options``) здесь не
-        сохраняются: в ``th_item`` для них нет колонки.
+        Опции постановки из ``TaskCall`` (``queue`` и ``options``) пишутся в
+        ``th_item.options`` (D-033): relay передаёт их в ``Message.options``
+        при каждой отправке, в том числе повторной.
 
         Ошибки: ``SpawnTargetError`` — батч является этапом с ``fed_by``;
         ``SealError`` — батч закрыт, финализирован или отменяется;
-        ``ConfigurationError`` — payload больше ``max_payload_bytes``.
+        ``ConfigurationError`` — payload больше ``max_payload_bytes`` или
+        опции вызова не сериализуются в JSON.
 
         Args:
             conn: Соединение в открытой транзакции.
@@ -628,6 +631,7 @@ class Producer:
     ) -> tuple[int, int]:
         ids = [self.ids.new_id() for _ in calls]
         payloads = [self._encode(call) for call in calls]
+        options = [_call_options(call) for call in calls]
         item = self.tables.item
         outbox = self.tables.outbox
         rows = (
@@ -637,8 +641,9 @@ class Producer:
                 literal(payloads, ARRAY(LargeBinary())),
                 literal([call.key for call in calls], ARRAY(Text())),
                 literal([call.weight for call in calls], ARRAY(Integer())),
+                literal(options, ARRAY(Text())),
             )
-            .table_valued("id", "task_name", "payload", "key", "weight")
+            .table_valued("id", "task_name", "payload", "key", "weight", "options")
             .render_derived("u")
         )
         source = select(
@@ -649,12 +654,23 @@ class Producer:
             rows.c.payload,
             rows.c.key,
             rows.c.weight,
+            sql_cast(rows.c.options, JSONB),
             sql_now(self.clock),
         )
         inserted = (
             insert(item)
             .from_select(
-                ["id", "batch_id", "state", "task_name", "payload", "key", "weight", "created_at"],
+                [
+                    "id",
+                    "batch_id",
+                    "state",
+                    "task_name",
+                    "payload",
+                    "key",
+                    "weight",
+                    "options",
+                    "created_at",
+                ],
                 source,
             )
             .on_conflict_do_nothing(
@@ -865,6 +881,19 @@ class Producer:
         if isinstance(deadline, timedelta):
             return sql_now(self.clock) + literal(deadline, Interval())
         return literal(deadline, DateTime(timezone=True))
+
+
+def _call_options(call: TaskCall) -> str | None:
+    # Опции постановки Item (D-033): queue вызова и опции брокера; пусто → NULL.
+    options = dict(call.options)
+    if call.queue is not None:
+        options["queue"] = call.queue
+    if not options:
+        return None
+    try:
+        return json.dumps(options)
+    except (TypeError, ValueError) as exc:
+        raise ConfigurationError(_CALL_OPTIONS_NOT_JSON) from exc
 
 
 def _chunked(calls: Iterable[TaskCall], size: int) -> Iterator[list[TaskCall]]:

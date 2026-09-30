@@ -107,6 +107,7 @@ CREATE TABLE th_item (
 	depth SMALLINT DEFAULT 0 NOT NULL,
 	task_name TEXT NOT NULL,
 	payload BYTEA NOT NULL,
+	options JSONB,
 	key TEXT,
 	child_batch_id UUID,
 	weight INTEGER DEFAULT 1 NOT NULL,
