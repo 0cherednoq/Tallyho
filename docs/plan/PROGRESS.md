@@ -6,8 +6,8 @@
 ## Текущее состояние
 
 * **Ветка:** `impl/v1`
-* **Текущая волна:** T7.1
-* **Последний зелёный коммит:** eb6633a
+* **Текущая волна:** T8.1
+* **Последний зелёный коммит:** fa2b5df
 
 ## Задачи
 
@@ -42,9 +42,9 @@
 | T6.1 | Tallyho, Settings, install, migrate | T5.1, T4.10, T4.11 | done | 5d9a433 |
 | T6.2 | th.batch → BatchBuilder, BatchHandle | T6.1 | done | 3c5f331 |
 | T6.3 | th.call с ParamSpec, типовые тесты | T6.1 | done | eb6633a |
-| T7.1 | tallyho.testing: InlineBroker, FakeClock | T6.2 | in_progress | |
+| T7.1 | tallyho.testing: InlineBroker, FakeClock | T6.2 | done | fa2b5df |
 | T8.0 | Спайк flexiq | T0.1 | done | 4d318d0..f4155a6 (3), merge 9395ea6, b41b30d, 2a781c2 |
-| T8.1 | FlexiqAdapter | T8.0, T7.1 | todo | |
+| T8.1 | FlexiqAdapter | T8.0, T7.1 | in_progress | |
 | T8.2 | Контрактные тесты A-FQ | T8.1 | todo | |
 | T9.1 | Пример «рассылки» (§12) как тесты | T7.1 | todo | |
 | T9.2 | Пример «конвейер парсинга» (§13) как тесты | T7.1 | todo | |
@@ -72,6 +72,17 @@
 - Отклонения от плана/доков: … (или «нет»)
 - Узнали / на что обратить внимание дальше: …
 -->
+### 2026-09-30 · T8.1 · in_progress · —
+- Начата реализация production-адаптера flexiq по подтверждённым контрактам спайка.
+
+### 2026-09-30 · T7.1 · done · fa2b5df
+- Сделано: `InlineBroker` одновременно реализует `Dispatcher`, `Runtime`, `PayloadCodec` и runtime installer; регистрирует задачи по `module.qualname`, исполняет сообщения через настоящий `TaskRuntime`, поддерживает последовательные `step`/`drain`, `max_retries`, DLQ и детерминированные дубли доставки по seed.
+- `kill_worker_after(n)` захватывает Item и оставляет lease без finish/release, а после sweep повторно доставляет сообщение; отдельно покрыты kill callback и дубля уже завершённого Item. `FakeClock.advance(...)` синхронно двигает календарное и монотонное время.
+- Добавлены `TallyhoTestEnv` и подключаемый pytest-плагин с фикстурой `tallyho_env`; testing extra устанавливает `pytest-asyncio`.
+- Проверка: 21 точечный тест; `poe check` зелёный (744 unit/architecture); `poe test-all` — 1041 passed, 1 platform skip, покрытие 96,12% (`testing/broker.py` 98%); pre-commit зелёный.
+- Отклонения от плана/доков: минимальные самописные dispatcher'ы Ф4 оставлены там, где они наблюдают SQL batching/ошибки dispatch и замена на исполняющий брокер усложнила бы тесты.
+- Дальше: T8.1 `FlexiqAdapter`.
+
 ### 2026-09-30 · T7.1 · in_progress · —
 - Начата реализация публичного тестового контура: `InlineBroker`, управляемые доставка/дубли/kill, `FakeClock` и pytest-фикстуры.
 
