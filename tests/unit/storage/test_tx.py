@@ -6,10 +6,12 @@ from typing import TYPE_CHECKING
 
 import pytest
 from sqlalchemy.exc import OperationalError
-from sqlalchemy.ext.asyncio import AsyncConnection, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession, create_async_engine
 
+from tallyho.model.errors import HookTransactionError
 from tallyho.storage.tx import (
     RETRYABLE_SQLSTATES,
+    HookSession,
     RetryPolicy,
     after_commit,
     is_retryable,
@@ -107,3 +109,15 @@ async def test_after_commit_needs_open_connection() -> None:
 
     with pytest.raises(TypeError, match="AsyncConnection"):
         await after_commit(conn, lambda: None)
+
+
+async def test_hook_session_forbids_transaction_control() -> None:
+    session = HookSession()
+
+    assert isinstance(session, AsyncSession)
+    with pytest.raises(HookTransactionError, match="commit"):
+        await session.commit()
+    with pytest.raises(HookTransactionError, match="rollback"):
+        await session.rollback()
+    with pytest.raises(HookTransactionError, match="close"):
+        await session.close()

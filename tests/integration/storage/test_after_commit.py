@@ -6,16 +6,21 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 
 import pytest
 from sqlalchemy import Table
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession
-from sqlalchemy.orm import registry
 
 from tallyho.storage.tx import after_commit, resolve_connection
-from tests.helpers.probe import ProbeColumns, committed_ids, create_probe, insert_id
+from tests.helpers.probe import (
+    ProbeColumns,
+    ProbeRow,
+    committed_ids,
+    create_probe,
+    insert_id,
+    mapped_probe,
+)
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Callable
@@ -212,26 +217,15 @@ async def test_failing_callback_is_logged_and_others_run(
     assert any(record.exc_info for record in caplog.records)
 
 
-@dataclass
-class ProbeRow:
-    """ORM-объект пользователя поверх таблицы-зонда."""
-
-    id: int
-
-
 async def test_orm_flush_keeps_callbacks(engine: AsyncEngine, probe: Probe) -> None:
     calls = Calls()
-    orm = registry()
-    _ = orm.map_imperatively(ProbeRow, probe)
-    try:
+    with mapped_probe(probe):
         async with AsyncSession(engine, autoflush=False) as session:
             await after_commit(session, calls.callback("a"))
             session.add(ProbeRow(1))
             # flush открывает и закрывает внутреннюю под-транзакцию сессии.
             await session.flush()
             await session.commit()
-    finally:
-        orm.dispose()
 
     assert calls.names == ["a"]
     assert await committed_ids(engine, probe) == [1]

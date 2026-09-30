@@ -11,7 +11,9 @@
   (deadlock) и ``55P03`` (lock not available) с экспоненциальным backoff и
   джиттером;
 * :func:`after_commit` вызывает колбэк только после commit внешней транзакции
-  пользователя (откат транзакции или savepoint'а его отбрасывает).
+  пользователя (откат транзакции или savepoint'а его отбрасывает);
+* tx-хук получает :class:`HookSession` (:func:`hook_session`): commit, rollback
+  и close в ней бросают ``HookTransactionError``.
 """
 
 from __future__ import annotations
@@ -29,8 +31,9 @@ from weakref import WeakKeyDictionary
 from sqlalchemy import event, text
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
+from typing_extensions import override
 
-from tallyho.model.errors import ConcurrentModification
+from tallyho.model.errors import ConcurrentModification, HookTransactionError
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Awaitable
@@ -42,9 +45,11 @@ if TYPE_CHECKING:
 __all__ = [
     "RETRYABLE_SQLSTATES",
     "AfterCommit",
+    "HookSession",
     "RetryPolicy",
     "TxSettings",
     "after_commit",
+    "hook_session",
     "is_retryable",
     "own_transaction",
     "resolve_connection",
@@ -400,6 +405,9 @@ async def after_commit(target: AsyncSession | AsyncConnection, callback: AfterCo
     Raises:
         TypeError: ``AsyncConnection`` ещё не открыт.
     """
+    if isinstance(target, HookSession):
+        # Сессия хука не коммитится сама: колбэк ждёт commit нашей транзакции.
+        target = await target.connection()
     if isinstance(target, AsyncSession):
         _ = await target.connection()
         _session_pending(target.sync_session).callbacks.append(callback)
@@ -408,3 +416,73 @@ async def after_commit(target: AsyncSession | AsyncConnection, callback: AfterCo
     if sync is None:
         raise TypeError(_NOT_STARTED)
     _connection_pending(sync).callbacks.append(callback)
+
+
+# --- HookSession ----------------------------------------------------------------------
+
+_HOOK_COMMIT = "commit() внутри tx-хука запрещён: транзакцией хука управляет tallyho"
+_HOOK_ROLLBACK = "rollback() внутри tx-хука запрещён: бросьте исключение, tallyho откатит всё"
+_HOOK_CLOSE = "close() внутри tx-хука запрещён: сессию закрывает tallyho"
+
+
+class HookSession(AsyncSession):
+    """Сессия tx-хука (ARCHITECTURE §7.3, A-DB-05).
+
+    Обычная ``AsyncSession``, привязанная к нашему соединению и транзакции:
+    ORM и Core пользователя работают в той же транзакции, что и CAS
+    финализации. ``commit()``, ``rollback()`` и ``close()`` бросают
+    :class:`~tallyho.model.errors.HookTransactionError`: транзакцией владеет
+    tallyho. Создаётся только через :func:`hook_session`. Вложенные
+    ``begin_nested()`` разрешены. :func:`after_commit` для неё срабатывает при
+    commit нашей транзакции.
+    """
+
+    @override
+    async def commit(self) -> None:
+        """Запрещено в хуке.
+
+        Raises:
+            HookTransactionError: Всегда.
+        """
+        raise HookTransactionError(_HOOK_COMMIT)
+
+    @override
+    async def rollback(self) -> None:
+        """Запрещено в хуке.
+
+        Raises:
+            HookTransactionError: Всегда.
+        """
+        raise HookTransactionError(_HOOK_ROLLBACK)
+
+    @override
+    async def close(self) -> None:
+        """Запрещено в хуке.
+
+        Raises:
+            HookTransactionError: Всегда.
+        """
+        raise HookTransactionError(_HOOK_CLOSE)
+
+
+@contextlib.asynccontextmanager
+async def hook_session(conn: AsyncConnection) -> AsyncGenerator[HookSession]:
+    """:class:`HookSession` в транзакции ``conn`` на время вызова хука.
+
+    На выходе без исключения сбрасывает (``flush``) изменения ORM хука, чтобы
+    они попали в БД до следующих шагов транзакции (CAS финализации). Сессия
+    закрывается в любом случае; commit/rollback транзакции ``conn`` остаются
+    за вызывающим (``own_transaction``).
+
+    Args:
+        conn: Соединение нашей транзакции.
+
+    Yields:
+        Сессия для хука пользователя.
+    """
+    session = HookSession(bind=conn, expire_on_commit=False)
+    try:
+        yield session
+        await session.flush()
+    finally:
+        await AsyncSession.close(session)
