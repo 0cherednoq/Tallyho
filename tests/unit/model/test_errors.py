@@ -16,6 +16,7 @@ PARENTS: dict[type[errors.TallyhoError], type[errors.TallyhoError]] = {
     errors.NotFoundError: errors.TallyhoError,
     errors.InvalidStateError: errors.TallyhoError,
     errors.ConcurrentModification: errors.TallyhoError,
+    errors.CompleterError: errors.TallyhoError,
     errors.HookTransactionError: errors.TallyhoError,
     errors.SealError: errors.InvalidStateError,
     errors.SpawnTargetError: errors.InvalidStateError,
