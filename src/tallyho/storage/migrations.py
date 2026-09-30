@@ -1,0 +1,280 @@
+"""Миграции схемы tallyho и установка в схему пользователя (ARCHITECTURE §11.1).
+
+Миграция — список SQL-операций для одной версии схемы. Её выполняют два
+пути, и оба получают одни и те же операции:
+
+* :func:`migrate` — сам tallyho: своя транзакция, ``pg_advisory_xact_lock``,
+  ``SET LOCAL lock_timeout``, текущая версия читается из ``th_meta``,
+  применяются только недостающие версии (повторный вызов ничего не делает);
+* :func:`tallyho.storage.alembic.upgrade` — ревизия Alembic пользователя.
+
+Имена схемы и таблиц не подставляются в SQL строками: операции строятся из
+копии :func:`~tallyho.storage.tables.build_metadata` со схемой, а кавычки
+расставляет диалект. Префикс проверяется регулярным выражением, схема — по
+ограничениям PostgreSQL на идентификаторы.
+
+Схема версии 1 — ровно то, что описывает ``build_metadata``. Когда схема
+изменится, операции версии 1 нужно заморозить, а изменения описать версией 2.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import re
+from dataclasses import dataclass
+from datetime import timedelta
+from typing import TYPE_CHECKING, Final
+
+from sqlalchemy import MetaData, func, select, text
+from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy.schema import CreateIndex, CreateSchema, CreateTable
+
+from tallyho.model.errors import ConfigurationError
+from tallyho.storage.tables import DEFAULT_PREFIX, build_metadata
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Mapping
+
+    from sqlalchemy import Table, TypedColumns
+    from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
+    from sqlalchemy.sql.base import Executable
+
+    from tallyho.storage.tables import MetaColumns
+
+__all__ = [
+    "DEFAULT_LOCK_TIMEOUT",
+    "SCHEMA_VERSION",
+    "VERSION_KEY",
+    "migrate",
+    "migration_statements",
+    "validate_prefix",
+    "validate_schema",
+]
+
+SCHEMA_VERSION: Final = 1
+"""Версия схемы, которую знает эта версия библиотеки."""
+
+VERSION_KEY: Final = "schema_version"
+"""Ключ версии схемы в ``th_meta``."""
+
+DEFAULT_LOCK_TIMEOUT: Final = timedelta(seconds=5)
+"""``lock_timeout`` миграции (ARCHITECTURE §15): DDL не ждёт чужие блокировки дольше."""
+
+_PREFIX_RE: Final = re.compile(r"[a-z_][a-z0-9_]{0,15}")
+# PostgreSQL молча обрезает идентификаторы длиннее NAMEDATALEN - 1 байт.
+_MAX_IDENTIFIER_BYTES: Final = 63
+_LOCK_NAMESPACE: Final = "tallyho.migrate"
+
+_PREFIX_ERROR: Final = "Префикс должен соответствовать ^[a-z_][a-z0-9_]{0,15}$"
+_SCHEMA_ERROR: Final = "Имя схемы должно быть непустым, без NUL и не длиннее 63 байт в UTF-8"
+_LOCK_TIMEOUT_ERROR: Final = "lock_timeout не может быть отрицательным"
+_UNKNOWN_VERSION_ERROR: Final = "Неизвестная версия схемы tallyho"
+_NEWER_SCHEMA_ERROR: Final = "Схема tallyho в БД новее, чем знает эта версия библиотеки"
+
+
+def validate_prefix(prefix: str) -> str:
+    """Проверить префикс имён таблиц.
+
+    Args:
+        prefix: префикс, например ``"th_"``.
+
+    Returns:
+        Тот же префикс.
+
+    Raises:
+        ConfigurationError: префикс не соответствует ``^[a-z_][a-z0-9_]{0,15}$``.
+    """
+    if _PREFIX_RE.fullmatch(prefix) is None:
+        raise ConfigurationError(_PREFIX_ERROR)
+    return prefix
+
+
+def validate_schema(schema: str | None) -> str | None:
+    """Проверить имя схемы.
+
+    Спецсимволы допустимы (A-NF-03): имя всегда экранируется диалектом.
+
+    Args:
+        schema: имя схемы или ``None`` (схема из ``search_path``).
+
+    Returns:
+        То же имя.
+
+    Raises:
+        ConfigurationError: имя пустое, содержит NUL или длиннее 63 байт.
+    """
+    if schema is None:
+        return None
+    if not schema or "\x00" in schema or len(schema.encode()) > _MAX_IDENTIFIER_BYTES:
+        raise ConfigurationError(_SCHEMA_ERROR)
+    return schema
+
+
+@dataclass(frozen=True, slots=True)
+class _Installation:
+    """Таблицы одной установки в её схеме (в порядке имён, как ``sorted_tables``)."""
+
+    schema: str | None
+    tables: list[Table[TypedColumns]]
+    meta: Table[MetaColumns]
+
+
+def _installation(schema: str | None, prefix: str) -> _Installation:
+    """Таблицы ``build_metadata(prefix)`` в схеме ``schema``.
+
+    Returns:
+        Таблицы установки; при ``schema=None`` — без квалификатора схемы.
+    """
+    source = build_metadata(prefix)
+    meta = source.meta
+    tables: list[Table[TypedColumns]] = [
+        source.batch,
+        source.item,
+        source.outbox,
+        source.lease,
+        source.feed,
+        source.counter,
+        source.counter_delta,
+        source.metric,
+        source.item_mark,
+        source.expiry,
+    ]
+    if schema is not None:
+        target = MetaData()
+        meta = meta.to_metadata(target, schema=schema)
+        tables = [table.to_metadata(target, schema=schema) for table in tables]
+    return _Installation(
+        schema=schema, tables=sorted([*tables, meta], key=lambda t: t.name), meta=meta
+    )
+
+
+def _v1(installation: _Installation) -> list[Executable]:
+    statements: list[Executable] = []
+    if installation.schema is not None:
+        statements.append(CreateSchema(installation.schema, if_not_exists=True))
+    for table in installation.tables:
+        statements.append(CreateTable(table))
+        statements.extend(
+            CreateIndex(index) for index in sorted(table.indexes, key=lambda i: str(i.name))
+        )
+    return statements
+
+
+_MIGRATIONS: Final[Mapping[int, Callable[[_Installation], list[Executable]]]] = {1: _v1}
+
+
+def _lock_timeout_statement(lock_timeout: timedelta) -> Executable:
+    if lock_timeout < timedelta(0):
+        raise ConfigurationError(_LOCK_TIMEOUT_ERROR)
+    milliseconds = lock_timeout // timedelta(milliseconds=1)
+    # SET LOCAL не принимает параметры; set_config(..., true) — то же самое.
+    return text("SELECT set_config('lock_timeout', :value, true)").bindparams(
+        value=f"{milliseconds}ms"
+    )
+
+
+def _set_version_statement(meta: Table[MetaColumns], version: int) -> Executable:
+    stmt = insert(meta).values(key=VERSION_KEY, value=str(version))
+    return stmt.on_conflict_do_update(
+        index_elements=[meta.c.key], set_={"value": stmt.excluded.value}
+    )
+
+
+def migration_statements(
+    version: int,
+    *,
+    schema: str | None,
+    prefix: str = DEFAULT_PREFIX,
+    lock_timeout: timedelta = DEFAULT_LOCK_TIMEOUT,
+) -> list[Executable]:
+    """Операции одной миграции: ``lock_timeout``, DDL версии и запись версии в ``th_meta``.
+
+    Операции выполняются в одной транзакции; управлять ею — дело вызывающего.
+
+    Args:
+        version: номер версии схемы (1 … :data:`SCHEMA_VERSION`).
+        schema: схема установки или ``None`` (из ``search_path``).
+        prefix: префикс имён таблиц.
+        lock_timeout: сколько DDL ждёт чужие блокировки.
+
+    Returns:
+        Список выполняемых конструкций SQLAlchemy.
+
+    Raises:
+        ConfigurationError: неизвестная версия, неверные схема, префикс или
+            ``lock_timeout``.
+    """
+    validate_schema(schema)
+    validate_prefix(prefix)
+    migration = _MIGRATIONS.get(version)
+    if migration is None:
+        raise ConfigurationError(_UNKNOWN_VERSION_ERROR)
+    installation = _installation(schema, prefix)
+    return [
+        _lock_timeout_statement(lock_timeout),
+        *migration(installation),
+        _set_version_statement(installation.meta, version),
+    ]
+
+
+def _advisory_key(schema: str | None) -> int:
+    # Ключ — по схеме, а не по префиксу: CREATE SCHEMA IF NOT EXISTS из двух
+    # установок с разными префиксами тоже должен идти по очереди.
+    digest = hashlib.blake2b(f"{_LOCK_NAMESPACE}:{schema or ''}".encode(), digest_size=8).digest()
+    return int.from_bytes(digest, "big", signed=True)
+
+
+async def _current_version(conn: AsyncConnection, meta: Table[MetaColumns]) -> int:
+    qualified = conn.dialect.identifier_preparer.format_table(meta)
+    # to_regclass разбирает квалифицированное имя и не падает, если схемы нет.
+    exists = await conn.scalar(select(func.to_regclass(qualified).is_not(None)))
+    if not exists:
+        return 0
+    value = await conn.scalar(select(meta.c.value).where(meta.c.key == VERSION_KEY))
+    return 0 if value is None else int(value)
+
+
+async def migrate(
+    engine: AsyncEngine,
+    schema: str | None,
+    prefix: str = DEFAULT_PREFIX,
+    *,
+    lock_timeout: timedelta = DEFAULT_LOCK_TIMEOUT,
+) -> int:
+    """Установить или обновить схему tallyho до :data:`SCHEMA_VERSION`.
+
+    Всё выполняется в одной своей транзакции под ``pg_advisory_xact_lock``:
+    параллельные вызовы идут по очереди, повторный вызов ничего не меняет.
+
+    Args:
+        engine: движок SQLAlchemy приложения.
+        schema: схема установки (создаётся, если её нет) или ``None``.
+        prefix: префикс имён таблиц.
+        lock_timeout: сколько DDL ждёт чужие блокировки.
+
+    Returns:
+        Версия схемы после миграции.
+
+    Raises:
+        ConfigurationError: неверные схема, префикс или ``lock_timeout``;
+            схема в БД новее библиотеки.
+    """
+    validate_schema(schema)
+    validate_prefix(prefix)
+    lock = _lock_timeout_statement(lock_timeout)
+    meta = _installation(schema, prefix).meta
+    async with engine.begin() as conn:
+        # Сначала ждём свою очередь, потом ограничиваем ожидание DDL.
+        await conn.execute(
+            text("SELECT pg_advisory_xact_lock(:key)"), {"key": _advisory_key(schema)}
+        )
+        await conn.execute(lock)
+        current = await _current_version(conn, meta)
+        if current > SCHEMA_VERSION:
+            raise ConfigurationError(_NEWER_SCHEMA_ERROR)
+        for version in range(current + 1, SCHEMA_VERSION + 1):
+            for statement in migration_statements(
+                version, schema=schema, prefix=prefix, lock_timeout=lock_timeout
+            ):
+                await conn.execute(statement)
+    return SCHEMA_VERSION
