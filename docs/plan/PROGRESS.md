@@ -6,8 +6,8 @@
 ## Текущее состояние
 
 * **Ветка:** `impl/v1`
-* **Текущая волна:** T4.8
-* **Последний зелёный коммит:** 5ae8fc1
+* **Текущая волна:** T4.9
+* **Последний зелёный коммит:** ba9ed0f
 
 ## Задачи
 
@@ -34,8 +34,8 @@
 | T4.5 | Путь B: complete_in и свёртка | T4.4, Fix-1 | done | acd5006 |
 | T4.6 | Политики ошибок, on_policy_breach | T4.4 | done | ea67545 |
 | T4.7 | Операции над деревом | T4.6 | done | 5ae8fc1 |
-| T4.8 | Sweeper | T4.7 | in_progress | |
-| T4.9 | Snapshotter | T4.8 | todo | |
+| T4.8 | Sweeper | T4.7 | done | ba9ed0f |
+| T4.9 | Snapshotter | T4.8 | in_progress | |
 | T4.10 | Maintenance, лидерство, watch | T4.9 | todo | |
 | T4.11 | Чтение: view, in_flight, items, find | T4.4 | done | 8b45a88 |
 | T5.1 | Runtime: ItemContext, th.item, tracked | T4.5, T4.7 | todo | |
@@ -72,6 +72,16 @@
 - Отклонения от плана/доков: … (или «нет»)
 - Узнали / на что обратить внимание дальше: …
 -->
+
+### 2026-09-30 · T4.9 · in_progress · —
+- Начата реализация Snapshotter после зелёной T4.8.
+
+### 2026-09-30 · T4.8 · done · ba9ed0f
+- Сделано: `engine.sweeper.Sweeper` выполняет независимыми короткими транзакциями восстановление истёкших lease, финализации/backoff хуков, дедлайнов, orphan-этапов, дрейфа счётчиков, старых delta, expiry и retention дерева.
+- Для точного условия «delta старше grace» схема поднята до v2: `th_counter_delta.created_at`, индекс `(created_at, id)`, backfill и безопасная Alembic/встроенная миграция v1→v2; исторический DDL v1 заморожен отдельным golden.
+- Проверка: сценарии «сломали → sweep → исправилось» для всех проходов; retention проверен с `release_required`, чанком размера 1 и итоговым `view() → BatchPurged`. `poe check` зелёный; `poe test-all` — 869 passed, покрытие 96,46% (`sweeper.py` 98%); pre-commit зелёный.
+- Отклонения от плана/доков: нет; ARCHITECTURE дополнена обязательным timestamp/index, без которого возраст delta нельзя было определить.
+- Дальше: T4.9 Snapshotter.
 
 ### 2026-09-30 · T4.8 · in_progress · —
 - Начата реализация коротких восстановительных проходов Sweeper после зелёной T4.7.
