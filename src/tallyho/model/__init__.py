@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from tallyho.model.calls import TaskCall
 from tallyho.model.errors import (
     BatchPurged,
     ConcurrentModification,
@@ -69,5 +70,6 @@ __all__ = [
     "SealError",
     "SpawnTargetError",
     "TallyhoError",
+    "TaskCall",
     "UnsupportedOption",
 ]

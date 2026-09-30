@@ -8,7 +8,7 @@ import pytest
 
 import tallyho
 import tallyho.model
-from tallyho.model import errors, policy, states, views
+from tallyho.model import calls, errors, policy, states, views
 
 # Снимок родителей: пользователи ловят ошибки по базовым классам.
 PARENTS: dict[type[errors.TallyhoError], type[errors.TallyhoError]] = {
@@ -63,6 +63,7 @@ def test_model_package_reexports_public_names() -> None:
     sources |= {name: getattr(states, name) for name in states.__all__}
     sources |= {name: getattr(views, name) for name in views.__all__}
     sources |= {name: getattr(policy, name) for name in policy.__all__}
+    sources |= {name: getattr(calls, name) for name in calls.__all__}
     del sources["TERMINAL_THRESHOLD"]
     assert set(tallyho.model.__all__) == set(sources)
     for name, obj in sources.items():
