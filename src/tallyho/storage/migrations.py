@@ -25,7 +25,7 @@ from dataclasses import dataclass
 from datetime import timedelta
 from typing import TYPE_CHECKING, Final
 
-from sqlalchemy import MetaData, func, select, text
+from sqlalchemy import MetaData, Text, func, literal_column, select, text
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.schema import CreateIndex, CreateSchema, CreateTable
 
@@ -167,14 +167,17 @@ def _lock_timeout_statement(lock_timeout: timedelta) -> Executable:
     if lock_timeout < timedelta(0):
         raise ConfigurationError(_LOCK_TIMEOUT_ERROR)
     milliseconds = lock_timeout // timedelta(milliseconds=1)
-    # SET LOCAL не принимает параметры; set_config(..., true) — то же самое.
-    return text("SELECT set_config('lock_timeout', :value, true)").bindparams(
-        value=f"{milliseconds}ms"
-    )
+    # SET не принимает bind-параметры; значение — целое число, которое мы посчитали сами.
+    return text(f"SET LOCAL lock_timeout = '{milliseconds}ms'")
 
 
 def _set_version_statement(meta: Table[MetaColumns], version: int) -> Executable:
-    stmt = insert(meta).values(key=VERSION_KEY, value=str(version))
+    # Значения — литералами, без bind-параметров: offline-режим Alembic
+    # (``upgrade --sql``) печатает параметры как есть, а не подставляет их.
+    stmt = insert(meta).values(
+        key=literal_column(f"'{VERSION_KEY}'", Text()),
+        value=literal_column(f"'{version:d}'", Text()),
+    )
     return stmt.on_conflict_do_update(
         index_elements=[meta.c.key], set_={"value": stmt.excluded.value}
     )

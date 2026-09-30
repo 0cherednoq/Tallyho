@@ -49,11 +49,11 @@ def test_version_one_matches_tables_snapshot() -> None:
 
 def test_statements_order() -> None:
     statements = migration_statements(1, schema="app")
-    assert compiled(statements[0]).startswith("SELECT set_config('lock_timeout'")
+    assert compiled(statements[0]) == "SET LOCAL lock_timeout = '5000ms'"
     assert isinstance(statements[1], CreateSchema)
     last = compiled(statements[-1])
     assert last.startswith("INSERT INTO app.th_meta")
-    assert "ON CONFLICT (key) DO UPDATE" in last
+    assert "VALUES ('schema_version', '1') ON CONFLICT (key) DO UPDATE" in last
 
 
 def test_schema_none_has_no_create_schema() -> None:
@@ -87,9 +87,7 @@ def test_prefix_applies_to_all_objects() -> None:
 )
 def test_lock_timeout_value(timeout: timedelta, expected: str) -> None:
     statement = migration_statements(1, schema="app", lock_timeout=timeout)[0]
-    assert isinstance(statement, ClauseElement)
-    params = statement.compile(dialect=DIALECT).params
-    assert params == {"value": expected}
+    assert compiled(statement) == f"SET LOCAL lock_timeout = '{expected}'"
 
 
 def test_negative_lock_timeout_rejected() -> None:
