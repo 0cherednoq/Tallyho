@@ -6,8 +6,8 @@
 ## Текущее состояние
 
 * **Ветка:** `impl/v1`
-* **Текущая волна:** 6 — T4.2, T4.3a
-* **Последний зелёный коммит:** 0080570
+* **Текущая волна:** — (цикл остановлен по просьбе пользователя после волны 6)
+* **Последний зелёный коммит:** c364a2d
 
 ## Задачи
 
@@ -26,8 +26,8 @@
 | T3.1 | Реестр tx-хуков | T1.2 | done | 27b762a..880903c (2), merge 4521aa4 |
 | Fix-1 | d_* колонки в th_counter_delta для пути B | T2.4 | done | b58dd92..3a07ef4 (3), merge 1bb1b8a |
 | T4.1 | Продюсер: батчи, под-батчи, th_feed, add, seal, expect | T2.4, T3.1 | done | ec5f273..16b7f8d (4), merge 0080570 |
-| T4.2 | Relay | T4.1 | in_progress | |
-| T4.3a | Completer: буфер, claim/heartbeat/release | T4.1 | in_progress | |
+| T4.2 | Relay | T4.1 | done | 1fc674d..7dc194e (6), merge 41ede95 |
+| T4.3a | Completer: буфер, claim/heartbeat/release | T4.1 | done | 1e029d8..03ce255 (4), merge c364a2d |
 | T4.3b | Completer: finish без spawn | T4.3a, T4.2 | todo | |
 | T4.3c | Spawn, into=, лимиты, дедуп, sub_batch из задачи | T4.3b | todo | |
 | T4.4 | Finalizer | T4.3c | todo | |
@@ -72,6 +72,23 @@
 - Отклонения от плана/доков: … (или «нет»)
 - Узнали / на что обратить внимание дальше: …
 -->
+
+### 2026-09-30 · цикл остановлен · —
+- По просьбе пользователя: волна 6 доведена и влита, новые волны не запускались.
+- **Следующая доступная задача:** T4.3b (finish без spawn), её зависимости T4.3a и T4.2 выполнены. Параллельно с ней — ничего: T4.11 ждёт T4.4, T8.1 ждёт T7.1.
+- **Продолжить:** `/loop` с тем же промптом (PLAN §0.7), оркестратор начнёт с T4.3b.
+
+### 2026-09-30 · волна 6 влита · T4.2, T4.3a
+- **T4.2 · done.** `th_item.options` (D-033), `th_window` + `th_outbox.options` + индекс `(batch_id, available_at)`. `engine/relay.py`: `Relay` с методами `kick`/`flush_kicked`/`run`/`scan_once`, dispatch по `task_name`, `th_expiry` для `expires`, окно `max_in_flight` с `release_window`/`refill_window`. ARCHITECTURE §5.1/§5.2/§11.2 (0ffc885). D-035.
+- **T4.3a · done.** `engine/completer.py`: `Completer` — буфер, групповой коммит, backpressure. Операции `claim` (CLAIMED/DUPLICATE/TERMINAL/PARKED/CANCELLED/EXPIRED), `heartbeat`, `release`, `close(requeue_held)`. `CompleterError` в `model/errors.py`. D-036.
+- **Вливание:** без конфликтов, 769 тестов, покрытие 99,55%.
+- **Для следующих задач (T4.3b):**
+  - Finish — новый тип операции `_Finish` в `_Completer._apply`: добавить ids в `tx.lock_items`/`tx.lock_leases`, затем CAS, удаление lease, `tx.deltas[...] += CounterDelta(...)`, один `tx.write_counters()` вместе с `fold_deltas` (D-028).
+  - После CAS вызвать `release_window(conn, tables, ids)`, после commit — `relay.kick(batch_ids)`. Добавить `release_window` в пути PARKED и CANCELLED при claim (D-035, D-036).
+  - Снять завершённые Items из `_held`.
+  - Хелперы тестов: `tests/integration/engine/completer_env.py`, `tests/helpers/relay.py` (`ManualClock`, `RecordingDispatcher`, `relay_env`).
+  - asyncpg отдаёт `infinity` как naive `datetime.max`, поэтому в тестах сравнивать через SQL.
+  - Relay запускает владелец (T6.1): `run()` — fast-path в каждом процессе, `scan_once()` — в Maintenance.
 
 ### 2026-09-30 · волна 6 запущена · T4.2, T4.3a
 - Зависимость T4.3a от T4.2 снята (D-034), чтобы цепочка engine шла в две ветки.

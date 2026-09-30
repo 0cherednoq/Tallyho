@@ -120,3 +120,14 @@ Completer складывает результат свёртки со своим
 
 ## D-034 · Completer claim/heartbeat/release не зависит от Relay · ACCEPTED
 T4.3a зависит только от T4.1, T4.3b — от T4.3a и T4.2 (там нужны `relay.kick` и окно `max_in_flight`). Так T4.2 и T4.3a идут в одной волне.
+
+## D-035 · Окно `max_in_flight` — таблица `th_window` · ACCEPTED (автономно, пересмотреть) (T4.2)
+В `th_window(item_id PK, batch_id)` одна строка на отправленный и ещё не завершённый Item, поэтому таблица не больше суммы окон. По счётчикам окно не посчитать: `dispatched` накопительный, отмена и виртуальные Items его искажают. Захват окна батча сериализован `pg_try_advisory_xact_lock`: занятый батч пропускается, а не ждёт. **Все пути, которые завершают Item или удаляют его запись outbox, вызывают `release_window`** — finish, отмена неотправленных, ленивая отмена при claim, парковка при claim, sweeper `lease_expired`/`expired`. Страховка — `refill_window` в `scan_once`. Если освобождённое место вернуло запись из парковки, у неё `available_at = -infinity`, а пауза и окно паркуют в `infinity`. Колонка `th_outbox.options` хранит опции колбэков. Индекс outbox — `(batch_id, available_at)`. ARCHITECTURE §5.1, §5.2, §11.2 обновлены (0ffc885).
+
+## D-036 · Completer: claim, перехват истёкшего lease, возврат в outbox · ACCEPTED (автономно, пересмотреть) (T4.3a)
+* Claim блокирует `th_batch FOR SHARE` → `th_item FOR UPDATE` → `th_lease FOR UPDATE`, пачки отсортированы по id. Без этих блокировок гонки с pause/resume/cancel оставляли Item в outbox с `infinity` навсегда. Это отход от COUNTERS §3.2; HOT при этом сохраняется.
+* Истёкший lease claim перехватывает сам: `attempt += 1`, исход CLAIMED. Живой lease даёт DUPLICATE. Sweeper берёт `th_lease` через SKIP LOCKED и перепроверяет `lease_until`.
+* Возврат Item в outbox (PARKED, `close(requeue_held=True)`) делает `dispatched -= 1`, но только если запись реально вставлена.
+* Ленивая отмена при claim: `label='cancelled'`, счётчики `cancelled` и `w_done`. Схему label-метрик задаёт T4.3b, отмену в T4.7 согласовать с ней.
+* `heartbeat` возвращает `bool` («lease ещё мой»). Ошибка групповой транзакции → `CompleterError` (с `__cause__`) каждой операции пачки.
+* **Для T4.3b:** claim при PARKED и CANCELLED тоже должен вызывать `release_window` (D-035), сейчас он этого не делает.
