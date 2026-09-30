@@ -111,6 +111,7 @@ async def test_result_survives_retention(mailing_app: MailingApp) -> None:
     campaign_id = await mailing_app.create_campaign(audience)
     batch_id = await mailing_app.start_now(campaign_id)
     _ = await mailing_app.drain()
+    before = await mailing_app.get(campaign_id)
 
     _ = mailing_app.clock.advance(days=15)
     _ = await mailing_app.th.run_maintenance_once()
@@ -118,8 +119,7 @@ async def test_result_survives_retention(mailing_app: MailingApp) -> None:
     with pytest.raises(BatchPurged):
         _ = await mailing_app.th.handle(batch_id).view()
     campaign = await mailing_app.get(campaign_id)
-    assert campaign.status == "completed_with_errors"
-    assert campaign.sent == 640
+    assert campaign == before
 
 
 async def test_failing_hook_blocks_finalization_then_recovers(
