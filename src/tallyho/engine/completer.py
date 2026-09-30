@@ -105,6 +105,7 @@ __all__ = [
     "FinalizeTrigger",
     "FinishResult",
     "ItemRef",
+    "PolicyTrigger",
     "RelayTrigger",
     "SpawnRequest",
     "SubBatchRequest",
@@ -236,6 +237,14 @@ class FinalizeTrigger(Protocol):
         ...
 
 
+class PolicyTrigger(Protocol):
+    """Оценка политик для батчей, чьи счётчики изменил flush."""
+
+    async def evaluate(self, batch_ids: Iterable[UUID]) -> tuple[UUID, ...]:
+        """Применить breach и вернуть кандидатов на финализацию."""
+        ...
+
+
 class RelayTrigger(Protocol):
     """Минимальный интерфейс Relay для fast-path после commit."""
 
@@ -249,6 +258,7 @@ class CompleterTriggers:
     """Получатели действий Completer после успешного commit."""
 
     finalizer: FinalizeTrigger | None = None
+    policy: PolicyTrigger | None = None
     relay: RelayTrigger | None = None
     producer: Producer | None = None
     tree_cache: TreeCache | None = None
@@ -1438,9 +1448,15 @@ class Completer:
                 self.triggers.tree_cache.invalidate(root_id)
         if self.triggers.relay is not None and applied.kick:
             self.triggers.relay.kick(sorted(applied.kick))
+        candidates = set(applied.finalize)
+        if self.triggers.policy is not None and candidates:
+            try:
+                candidates.update(await self.triggers.policy.evaluate(candidates))
+            except Exception:  # ruff: ignore[blind-except]  # sweeper повторит оценку политики
+                _log.exception("Оценка политики после flush упала")
         if self.triggers.finalizer is None:
             return
-        for batch_id in sorted(applied.finalize):
+        for batch_id in sorted(candidates):
             try:
                 _ = await self.triggers.finalizer.try_finalize(batch_id)
             except Exception:  # ruff: ignore[blind-except]  # финализацию подхватит sweeper
