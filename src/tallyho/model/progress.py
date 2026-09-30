@@ -136,6 +136,7 @@ class _Tree:
                 self.children[node.parent_id].append(node.id)
         self._expected: dict[UUID, _Expected] = {}
         self._visiting: set[UUID] = set()
+        self._weights: dict[UUID, tuple[float, float] | None] = {}
 
     def expected(self, node_id: UUID) -> _Expected:
         """Ожидаемый итог узла по правилам §9.4.
@@ -200,6 +201,60 @@ class _Tree:
         estimate = (2 * node.total * expected_sources + basis) // (2 * basis)
         return _Expected(max(node.total, estimate), is_estimate=True, basis=basis)
 
+    def _own_weights(self, node: NodeCounters) -> tuple[float, float] | None:
+        """Собственный вклад узла в ``ratio``: ``(w_done, ожидаемый w_total)``.
+
+        Виртуальные Items под-батчей (по одному на ребёнка) из ``found`` и
+        ``expected`` вычитаются: их работа считается в поддереве ребёнка.
+
+        Returns:
+            Пару весов или ``None``, если ожидаемый объём неизвестен.
+        """
+        virtual = len(self.children[node.id])
+        found = max(node.total - virtual, 0)
+        expected = self.expected(node.id).value
+        if expected is None:
+            # Контейнер без собственных Items (корень конвейера) не мешает доле.
+            return (float(node.w_done), float(node.w_total)) if found == 0 else None
+        target = max(expected - virtual, found)
+        if target == 0:
+            return (float(node.w_done), float(node.w_total))
+        mean_weight = node.w_total / found if found else 1.0
+        return (float(node.w_done), mean_weight * target)
+
+    def weights(self, node_id: UUID) -> tuple[float, float] | None:
+        """Веса поддерева: ``(Σ w_done, Σ ожидаемый w_total)`` (§9.4).
+
+        Returns:
+            Пару весов или ``None``, если ожидаемый объём какого-то узла неизвестен.
+        """
+        if node_id in self._weights:
+            return self._weights[node_id]
+        result = self._own_weights(self.nodes[node_id])
+        for child_id in self.children[node_id]:
+            child = self.weights(child_id)
+            result = (
+                None
+                if result is None or child is None
+                else (result[0] + child[0], result[1] + child[1])
+            )
+        self._weights[node_id] = result
+        return result
+
+    def ratio(self, node_id: UUID) -> float | None:
+        """Доля по весам: лист — ``w_done / (w_total / found * expected)``, узел — поддерево.
+
+        Returns:
+            Долю в ``[0, 1]`` или ``None``, если объём неизвестен.
+        """
+        weights = self.weights(node_id)
+        if weights is None:
+            return None
+        done, expected = weights
+        if expected <= 0:
+            return 1.0 if self.nodes[node_id].closed else None
+        return min(max(done / expected, 0.0), 1.0)
+
     def progress(self, node_id: UUID) -> Progress:
         """Собрать :class:`Progress` узла.
 
@@ -223,6 +278,7 @@ class _Tree:
             expected=expected.value,
             expected_is_estimate=expected.is_estimate,
             estimate_basis=expected.basis,
+            ratio=self.ratio(node_id),
         )
 
 
