@@ -168,6 +168,7 @@ CREATE TABLE th_outbox (
 	item_id UUID,
 	task_name TEXT,
 	payload BYTEA,
+	options JSONB,
 	available_at TIMESTAMP WITH TIME ZONE NOT NULL,
 	attempts SMALLINT DEFAULT 0 NOT NULL,
 	PRIMARY KEY (id)
@@ -176,4 +177,13 @@ CREATE TABLE th_outbox (
 
 CREATE INDEX th_outbox_available_idx ON th_outbox (available_at);
 
-CREATE INDEX th_outbox_batch_idx ON th_outbox (batch_id);
+CREATE INDEX th_outbox_batch_idx ON th_outbox (batch_id, available_at);
+
+CREATE TABLE th_window (
+	item_id UUID NOT NULL,
+	batch_id UUID NOT NULL,
+	PRIMARY KEY (item_id)
+)
+ WITH (autovacuum_vacuum_scale_factor = 0, autovacuum_vacuum_threshold = 1000);
+
+CREATE INDEX th_window_batch_idx ON th_window (batch_id);

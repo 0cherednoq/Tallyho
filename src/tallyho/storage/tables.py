@@ -68,6 +68,7 @@ __all__ = [
     "MetricColumns",
     "OutboxColumns",
     "Tables",
+    "WindowColumns",
     "build_metadata",
 ]
 
@@ -200,6 +201,8 @@ class OutboxColumns(TypedColumns):
     item_id = _uuid(nullable=True)
     task_name = _text(nullable=True)
     payload = Column(LargeBinary())
+    options = _jsonb(nullable=True)
+    """Опции постановки колбэка; опции Item хранятся в ``th_item.options`` (D-033)."""
     available_at = _utc()
     attempts = _small(default=0)
 
@@ -294,6 +297,18 @@ class ExpiryColumns(TypedColumns):
 
 
 @final
+class WindowColumns(TypedColumns):
+    """Колонки ``th_window``: отправленные и не завершённые Items батчей с ``max_in_flight``.
+
+    Строку вставляет relay при захвате записи outbox, удаляет завершение Item.
+    Размер таблицы не больше суммы окон активных батчей.
+    """
+
+    item_id = Column(Uuid(), primary_key=True)
+    batch_id = _uuid()
+
+
+@final
 class MetaColumns(TypedColumns):
     """Колонки ``th_meta``: служебные значения установки, в том числе версия схемы."""
 
@@ -316,6 +331,7 @@ class Tables:
     metric: Table[MetricColumns]
     item_mark: Table[ItemMarkColumns]
     expiry: Table[ExpiryColumns]
+    window: Table[WindowColumns]
     meta: Table[MetaColumns]
 
 
@@ -352,6 +368,7 @@ def build_metadata(prefix: str = DEFAULT_PREFIX) -> Tables:
         ),
         item_mark=Table(f"{prefix}item_mark", metadata, ItemMarkColumns),
         expiry=_expiry(metadata, prefix),
+        window=_window(metadata, prefix),
         meta=Table(f"{prefix}meta", metadata, MetaColumns),
     )
 
@@ -422,7 +439,9 @@ def _outbox(metadata: MetaData, prefix: str) -> Table[OutboxColumns]:
     name = f"{prefix}outbox"
     outbox = Table(name, metadata, OutboxColumns, postgresql_with=_AGGRESSIVE_AUTOVACUUM)
     Index(f"{name}_available_idx", outbox.c.available_at)
-    Index(f"{name}_batch_idx", outbox.c.batch_id)
+    # (batch_id, available_at): pause/cancel по батчу и окно max_in_flight —
+    # запаркованные (infinity) и готовые к отправке записи одного батча.
+    Index(f"{name}_batch_idx", outbox.c.batch_id, outbox.c.available_at)
     return outbox
 
 
@@ -454,3 +473,11 @@ def _expiry(metadata: MetaData, prefix: str) -> Table[ExpiryColumns]:
     expiry = Table(name, metadata, ExpiryColumns)
     Index(f"{name}_expires_idx", expiry.c.expires_at)
     return expiry
+
+
+def _window(metadata: MetaData, prefix: str) -> Table[WindowColumns]:
+    # Relay считает занятое окно батча по batch_id.
+    name = f"{prefix}window"
+    window = Table(name, metadata, WindowColumns, postgresql_with=_AGGRESSIVE_AUTOVACUUM)
+    Index(f"{name}_batch_idx", window.c.batch_id)
+    return window
