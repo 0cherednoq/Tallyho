@@ -8,19 +8,40 @@
 
 Здесь описаны значения, которыми обмениваются эти пути:
 :class:`CounterDelta` (приращение) и :class:`CounterTotals` (точная сумма
-слотов и несвёрнутых дельт).
+слотов и несвёрнутых дельт), и запросы к таблицам счётчиков.
+
+Функции принимают ``AsyncConnection`` в открытой транзакции (D-004) и
+:class:`~tallyho.storage.tables.Tables` установки; схему подставляет
+``schema_translate_map`` соединения. Строки ``th_counter`` и ``th_metric``
+блокируются в порядке первичного ключа (ARCHITECTURE §9.2).
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Final
+from typing import TYPE_CHECKING, Final, TypeVar
+
+from sqlalchemy import BigInteger, Uuid, cast, func, literal, literal_column, select, true
+from sqlalchemy.dialects.postgresql import ARRAY, insert
+
+if TYPE_CHECKING:
+    from collections.abc import Iterable, Iterator, Mapping
+    from uuid import UUID
+
+    from sqlalchemy import ColumnElement
+    from sqlalchemy.ext.asyncio import AsyncConnection
+
+    from tallyho.storage.tables import Tables
 
 __all__ = [
     "COUNTER_FIELDS",
     "DELTA_FIELDS",
     "CounterDelta",
     "CounterTotals",
+    "SlotKey",
+    "insert_delta",
+    "read_counters",
+    "upsert_slots",
 ]
 
 COUNTER_FIELDS: Final = (
@@ -197,3 +218,132 @@ class CounterTotals:
             Новые счётчики.
         """
         return CounterTotals(**(self.as_delta() + delta).as_dict())
+
+
+SlotKey = tuple["UUID", int]
+"""Ключ строки ``th_counter``: ``(batch_id, slot)``."""
+
+_CHUNK: Final = 1000
+"""Строк в одном многострочном INSERT: до 13 параметров на строку при лимите 32 767."""
+
+_DELTA_OVERFLOW = "th_counter_delta хранит только поля DELTA_FIELDS: остальные потерялись бы"
+
+_ZERO: Final = literal_column("0", BigInteger())
+
+_Row = TypeVar("_Row")
+
+
+def _chunks(rows: list[_Row]) -> Iterator[list[_Row]]:
+    return (rows[start : start + _CHUNK] for start in range(0, len(rows), _CHUNK))
+
+
+def _sum(column: ColumnElement[int]) -> ColumnElement[int]:
+    # sum(bigint) в PostgreSQL — numeric; возвращаем bigint, пустая сумма — 0.
+    return cast(func.coalesce(func.sum(column), _ZERO), BigInteger)
+
+
+async def read_counters(
+    conn: AsyncConnection, tables: Tables, batch_ids: Iterable[UUID]
+) -> dict[UUID, CounterTotals]:
+    """Точные счётчики батчей: ``sum(th_counter) + sum(th_counter_delta)`` (§9.3).
+
+    Один statement — один снимок: свёртка дельт переносит их в слот атомарно,
+    поэтому сумма не «мигает». Та же формула годится для проверки финализации.
+
+    Args:
+        conn: Соединение (в транзакции или autocommit).
+        tables: Таблицы установки.
+        batch_ids: Батчи; повторы допускаются.
+
+    Returns:
+        Счётчики по каждому запрошенному батчу; у батча без строк — нули.
+    """
+    ids = sorted(set(batch_ids))
+    if not ids:
+        return {}
+    counter = tables.counter
+    delta = tables.counter_delta
+    b = func.unnest(literal(ids, ARRAY(Uuid()))).table_valued("batch_id").render_derived("b")
+    c = (
+        select(*(_sum(counter.c[name]).label(name) for name in COUNTER_FIELDS))
+        .where(counter.c.batch_id == b.c.batch_id)
+        .lateral("c")
+    )
+    d = (
+        select(*(_sum(delta.c[f"d_{name}"]).label(name) for name in DELTA_FIELDS))
+        .where(delta.c.batch_id == b.c.batch_id)
+        .lateral("d")
+    )
+    columns: list[ColumnElement[object]] = [b.c.batch_id]
+    columns.extend(
+        (c.c[name] + d.c[name] if name in DELTA_FIELDS else c.c[name]).label(name)
+        for name in COUNTER_FIELDS
+    )
+    stmt = select(*columns).select_from(b.join(c, true()).join(d, true()))
+    result = await conn.execute(stmt)
+    totals: dict[UUID, CounterTotals] = {}
+    for row in result.mappings():
+        values: dict[str, int] = {name: row[name] for name in COUNTER_FIELDS}
+        totals[row["batch_id"]] = CounterTotals(**values)
+    return totals
+
+
+async def upsert_slots(
+    conn: AsyncConnection, tables: Tables, deltas: Mapping[SlotKey, CounterDelta]
+) -> None:
+    """Прибавить дельты к строкам ``th_counter`` (путь A, §9.2 шаг 8).
+
+    Строка слота создаётся при первом обращении (``INSERT … ON CONFLICT DO
+    UPDATE``). Строки блокируются в порядке ``(batch_id, slot)``: это
+    глобальный порядок блокировок счётчиков. Нулевые дельты пропускаются.
+
+    Args:
+        conn: Соединение в открытой транзакции.
+        tables: Таблицы установки.
+        deltas: Приращения по ключу ``(batch_id, slot)``.
+    """
+    counter = tables.counter
+    rows = [
+        {"batch_id": key[0], "slot": key[1], **deltas[key].as_dict()}
+        for key in sorted(deltas)
+        if not deltas[key].is_zero
+    ]
+    for chunk in _chunks(rows):
+        stmt = insert(counter).values(chunk)
+        stmt = stmt.on_conflict_do_update(
+            index_elements=[counter.c.batch_id, counter.c.slot],
+            set_={name: counter.c[name] + stmt.excluded[name] for name in COUNTER_FIELDS},
+        )
+        _ = await conn.execute(stmt)
+
+
+async def insert_delta(
+    conn: AsyncConnection, tables: Tables, deltas: Mapping[UUID, CounterDelta]
+) -> None:
+    """Записать дельты в ``th_counter_delta`` (путь B, транзакция пользователя).
+
+    Только ``INSERT``: горячие строки ``th_counter`` не блокируются, поэтому
+    транзакция пользователя не ждёт Completer и не ловит ``40001``. Нулевые
+    дельты пропускаются.
+
+    Args:
+        conn: Соединение транзакции пользователя.
+        tables: Таблицы установки.
+        deltas: Приращения по батчам.
+
+    Raises:
+        TypeError: Дельта содержит ненулевое поле вне :data:`DELTA_FIELDS`.
+    """
+    rows: list[dict[str, object]] = []
+    for batch_id in sorted(deltas):
+        value = deltas[batch_id]
+        if not value.fits_delta_table:
+            raise TypeError(_DELTA_OVERFLOW)
+        if value.is_zero:
+            continue
+        values = value.as_dict()
+        row: dict[str, object] = {f"d_{n}": values[n] for n in DELTA_FIELDS}
+        row["batch_id"] = batch_id
+        rows.append(row)
+    for chunk in _chunks(rows):
+        _ = await conn.execute(insert(tables.counter_delta).values(chunk))
