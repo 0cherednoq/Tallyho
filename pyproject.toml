@@ -45,6 +45,7 @@ asyncpg = ["asyncpg>=0.29"]
 psycopg = ["psycopg[binary]>=3.1"]
 flexiq = ["flexiq>=2.0,<3"]
 alembic = ["alembic>=1.13"]
+testing = ["pytest-asyncio>=1.4"]
 
 [project.scripts]
 tallyho = "tallyho.cli:main"
