@@ -1,0 +1,43 @@
+"""Миграции через Alembic ``op`` в offline-режиме (``alembic upgrade --sql``)."""
+
+from __future__ import annotations
+
+import io
+
+import pytest
+from alembic.operations import Operations
+from alembic.runtime.migration import MigrationContext
+
+from tallyho.model.errors import ConfigurationError
+from tallyho.storage.alembic import upgrade
+
+
+def offline_sql(*, version: int = 1, schema: str | None = "app", prefix: str = "th_") -> str:
+    buffer = io.StringIO()
+    context = MigrationContext.configure(
+        dialect_name="postgresql", opts={"as_sql": True, "output_buffer": buffer}
+    )
+    upgrade(Operations(context), version=version, schema=schema, prefix=prefix)
+    return buffer.getvalue()
+
+
+def test_offline_script_contains_whole_migration() -> None:
+    sql = offline_sql()
+    assert sql.startswith("SET LOCAL lock_timeout = '5000ms';")
+    assert "CREATE SCHEMA IF NOT EXISTS app;" in sql
+    assert "CREATE TABLE app.th_batch (" in sql
+    assert "CREATE INDEX th_batch_progress_idx ON app.th_batch (id)" in sql
+    assert "INSERT INTO app.th_meta (key, value) VALUES ('schema_version', '1')" in sql
+    assert "%(" not in sql
+
+
+def test_offline_script_quotes_schema_and_uses_prefix() -> None:
+    sql = offline_sql(schema='we"ird', prefix="acme_")
+    assert 'CREATE SCHEMA IF NOT EXISTS "we""ird";' in sql
+    assert 'CREATE TABLE "we""ird".acme_item (' in sql
+    assert "th_" not in sql
+
+
+def test_unknown_version_rejected() -> None:
+    with pytest.raises(ConfigurationError):
+        offline_sql(version=2)
