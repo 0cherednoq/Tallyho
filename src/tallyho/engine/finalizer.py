@@ -213,7 +213,8 @@ class Finalizer:
         if totals.pending != 0 or not self._closable(target):
             raise _CasLostError
         values = (await self._metrics(conn, [batch_id])).get(batch_id, {})
-        final_state = self._final_state(target, totals, values)
+        child_errors = await self._child_errors(conn, batch_id)
+        final_state = self._final_state(target, totals, values, child_errors=child_errors)
         self.hooks.ensure(target.kind, target.hooks)
         now = await conn.scalar(select(sql_now(self.clock)))
         if now is None:
@@ -256,7 +257,13 @@ class Finalizer:
         return batch.state is BatchState.SEALED or batch.cancel_requested_at is not None
 
     @staticmethod
-    def _final_state(batch: _Batch, totals: CounterTotals, labels: Mapping[str, int]) -> BatchState:
+    def _final_state(
+        batch: _Batch,
+        totals: CounterTotals,
+        labels: Mapping[str, int],
+        *,
+        child_errors: bool = False,
+    ) -> BatchState:
         if batch.cancel_reason is not None:
             return batch.cancel_reason.terminal_state
         if batch.cancel_requested_at is not None:
@@ -270,9 +277,23 @@ class Finalizer:
         verdict = policy.evaluate(totals, labels)
         if verdict.action is PolicyAction.FAIL:
             return BatchState.FAILED
-        if totals.error:
+        if totals.error or child_errors:
             return BatchState.COMPLETED_WITH_ERRORS
         return BatchState.SUCCEEDED
+
+    async def _child_errors(self, conn: AsyncConnection, batch_id: UUID) -> bool:
+        batch = self.tables.batch
+        failed_states = (
+            int(BatchState.COMPLETED_WITH_ERRORS),
+            int(BatchState.FAILED),
+            int(BatchState.CANCELLED),
+        )
+        count = await conn.scalar(
+            select(func.count())
+            .select_from(batch)
+            .where(batch.c.parent_id == batch_id, batch.c.state.in_(failed_states))
+        )
+        return bool(count)
 
     async def _cas(
         self,

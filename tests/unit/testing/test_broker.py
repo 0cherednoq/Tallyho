@@ -101,3 +101,10 @@ async def test_inline_broker_rejects_bad_cursor() -> None:
     broker = InlineBroker()
     with pytest.raises(ConfigurationError, match="курсор"):
         _ = await broker.reconcile_dead("not-an-int")
+
+
+@pytest.mark.parametrize("value", [0, -1, True, 1.5])
+async def test_inline_broker_rejects_bad_drain_concurrency(value: object) -> None:
+    broker = InlineBroker()
+    with pytest.raises(ConfigurationError, match="concurrency"):
+        _ = await broker.drain(concurrency=cast("int", value))

@@ -1,33 +1,14 @@
-"""PostgreSQL для интеграционных тестов.
+"""Маркеры для интеграционных тестов.
 
-Источник БД по приоритету:
-1. ``TALLYHO_TEST_DSN`` (например, в CI с service-контейнером);
-2. testcontainers — поднимает ``postgres`` в Docker на сессию.
-
-При ``pytest -n N`` у каждого xdist-воркера своя сессия, поэтому и свой
-контейнер (поднимается лениво, только если воркеру достались интеграционные
-тесты). С ``TALLYHO_TEST_DSN`` все воркеры делят одну БД. В обоих случаях
-тесты изолирует фикстура ``schema``: уникальная схема на тест.
+Общие PostgreSQL-фикстуры живут в ``tests/conftest.py``, чтобы ими могли
+пользоваться и интеграционные тесты библиотеки, и исполняемые примеры.
 """
 
 from __future__ import annotations
 
-import os
 from pathlib import Path
-from typing import TYPE_CHECKING
 
 import pytest
-from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
-
-from tests.helpers.db import temporary_schema
-
-if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Iterator
-
-    from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
-
-POSTGRES_IMAGE = "postgres:16-alpine"
-
 
 HERE = Path(__file__).parent
 
@@ -37,44 +18,3 @@ def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
     for item in items:
         if item.path.is_relative_to(HERE):
             item.add_marker(pytest.mark.integration)
-
-
-@pytest.fixture(scope="session")
-def postgres_dsn() -> Iterator[str]:
-    if dsn := os.environ.get("TALLYHO_TEST_DSN"):
-        yield dsn
-        return
-    from testcontainers.community.postgres import PostgresContainer  # ruff: ignore[import-outside-top-level]  # тяжёлый импорт только при нужде
-
-    with PostgresContainer(POSTGRES_IMAGE, driver="asyncpg") as pg:
-        yield pg.get_connection_url()
-
-
-@pytest.fixture
-async def engine(postgres_dsn: str) -> AsyncIterator[AsyncEngine]:
-    eng = create_async_engine(postgres_dsn)
-    try:
-        yield eng
-    finally:
-        await eng.dispose()
-
-
-@pytest.fixture
-async def schema(engine: AsyncEngine) -> AsyncIterator[str]:
-    """Пустая схема, уникальная для теста; после теста — ``DROP SCHEMA ... CASCADE``."""
-    async with temporary_schema(engine) as name:
-        yield name
-
-
-@pytest.fixture
-async def connection(engine: AsyncEngine) -> AsyncIterator[AsyncConnection]:
-    """Соединение без открытой транзакции; незакоммиченное откатывается при закрытии."""
-    async with engine.connect() as conn:
-        yield conn
-
-
-@pytest.fixture
-async def session(engine: AsyncEngine) -> AsyncIterator[AsyncSession]:
-    """``AsyncSession`` пользователя — как в приложении, которое вызывает tallyho."""
-    async with AsyncSession(engine, expire_on_commit=False) as sess:
-        yield sess

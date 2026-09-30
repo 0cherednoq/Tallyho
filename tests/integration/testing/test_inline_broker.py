@@ -122,6 +122,33 @@ async def test_step_bounds_work_and_drain_finishes_rest(engine: AsyncEngine, sch
         assert (await batch.handle.view()).progress.final
 
 
+async def test_concurrent_drain_executes_a_worker_pool(engine: AsyncEngine, schema: str) -> None:
+    active = 0
+    maximum = 0
+    release = asyncio.Event()
+    started = asyncio.Event()
+    async with make_client(engine, schema) as (th, broker, _clock):
+
+        async def record() -> None:
+            nonlocal active, maximum
+            active += 1
+            maximum = max(maximum, active)
+            if active == 4:
+                started.set()
+            await release.wait()
+            active -= 1
+
+        async with th.batch("inline-concurrent", key="one") as batch:
+            await batch.add_calls([th.call(record) for _ in range(4)])
+
+        draining = asyncio.create_task(broker.drain(concurrency=4))
+        await started.wait()
+        release.set()
+        assert await draining == 4
+        assert maximum == 4
+        assert (await batch.handle.view()).state is BatchState.SUCCEEDED
+
+
 async def test_kill_leaves_lease_until_maintenance_then_redelivers(
     engine: AsyncEngine, schema: str
 ) -> None:

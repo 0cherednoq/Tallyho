@@ -36,6 +36,7 @@ _NOT_INSTALLED = "InlineBroker сначала нужно передать в Tal
 _UNKNOWN_TASK = "InlineBroker не знает задачу"
 _BAD_RATE = "duplicate_delivery_rate должен быть числом от 0 до 1"
 _BAD_STEP = "число доставок должно быть целым >= 0"
+_BAD_CONCURRENCY = "concurrency должен быть целым >= 1"
 _BAD_RETRIES = "max_retries должен быть целым >= 0"
 
 
@@ -257,17 +258,32 @@ class InlineBroker(Dispatcher, Runtime, PayloadCodec):
             await self._execute(delivery)
         return done
 
-    async def drain(self) -> int:
+    async def drain(self, *, concurrency: int = 1) -> int:
         """Выполнять сообщения до полного простоя очереди и relay.
+
+        ``concurrency=1`` сохраняет полностью последовательную семантику.
+        Большее значение имитирует ограниченный пул воркеров, не меняя
+        детерминированный порядок извлечения сообщений из очереди.
 
         Returns:
             Число доставок в этом проходе.
         """
+        self._check_concurrency(concurrency)
         done = 0
         while True:
-            progressed = await self.step(1)
-            if progressed:
-                done += progressed
+            await self._pump()
+            work: list[Awaitable[None]] = []
+            while self._queue and len(work) < concurrency:
+                delivery = self._queue.popleft()
+                self._deliveries += 1
+                done += 1
+                if self._kill_at == self._deliveries:
+                    self._kill_at = None
+                    work.append(self._crash(delivery))
+                else:
+                    work.append(self._execute(delivery))
+            if work:
+                _ = await asyncio.gather(*work)
                 continue
             await self._pump(scan=True)
             if not self._queue:
@@ -381,6 +397,11 @@ class InlineBroker(Dispatcher, Runtime, PayloadCodec):
         minimum = 1 if positive else 0
         if isinstance(deliveries, bool) or not isinstance(deliveries, int) or deliveries < minimum:
             raise ConfigurationError(_BAD_STEP)
+
+    @staticmethod
+    def _check_concurrency(value: object) -> None:
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            raise ConfigurationError(_BAD_CONCURRENCY)
 
 
 def _rate(value: object) -> float:

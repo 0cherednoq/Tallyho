@@ -265,6 +265,49 @@ async def test_empty_stages_finalize_in_order_and_finish_parent_items(
     assert (counters.total, counters.ok, counters.pending) == (3, 3, 0)
 
 
+async def test_child_errors_propagate_to_parent_state_but_virtual_item_is_ok(
+    env: Env, registry: HookRegistry
+) -> None:
+    async with env.transaction() as conn:
+        root = await env.producer.create_root(conn, RootSpec(kind="tree"))
+        child = await env.producer.create_sub_batch(
+            conn,
+            root.id,
+            SubBatchSpec(key="send"),
+        )
+        inserted = await env.producer.add_items(
+            conn,
+            child.id,
+            [TaskCall(task_name="send", args=(), kwargs={})],
+        )
+        _ = await env.producer.seal(conn, child.id)
+        _ = await env.producer.seal(conn, root.id)
+        assert inserted.found == 1
+        task_id = await conn.scalar(
+            select(env.tables.item.c.id).where(env.tables.item.c.batch_id == child.id)
+        )
+        assert task_id is not None
+        _ = await conn.execute(
+            update(env.tables.item)
+            .where(env.tables.item.c.id == task_id)
+            .values(state=int(ItemState.ERROR), label="rejected", finished_at=NOW)
+        )
+        await upsert_slots(
+            conn,
+            env.tables,
+            {(child.id, 9): CounterDelta(error=1, w_done=1)},
+        )
+
+    assert await finalizer(env, registry).try_finalize(child.id)
+    assert (await env.batch(child.id))["state"] == BatchState.COMPLETED_WITH_ERRORS
+    assert (await env.batch(root.id))["state"] == BatchState.COMPLETED_WITH_ERRORS
+    async with env.connection() as conn:
+        virtual_state = await conn.scalar(
+            select(env.tables.item.c.state).where(env.tables.item.c.child_batch_id == child.id)
+        )
+    assert virtual_state == ItemState.OK
+
+
 async def test_two_sources_racing_always_close_stage(env: Env, registry: HookRegistry) -> None:
     pairs: list[tuple[UUID, UUID, UUID]] = []
     async with env.transaction() as conn:
