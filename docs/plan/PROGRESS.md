@@ -6,8 +6,8 @@
 ## Текущее состояние
 
 * **Ветка:** `impl/v1`
-* **Текущая волна:** T4.5, T4.6, T4.11
-* **Последний зелёный коммит:** d30eef4
+* **Текущая волна:** T4.5, T4.6, T4.11 завершена
+* **Последний зелёный коммит:** acd5006
 
 ## Задачи
 
@@ -31,13 +31,13 @@
 | T4.3b | Completer: finish без spawn | T4.3a, T4.2 | done | 0f4cf16 |
 | T4.3c | Spawn, into=, лимиты, дедуп, sub_batch из задачи | T4.3b | done | 350c711 |
 | T4.4 | Finalizer | T4.3c | done | d30eef4 |
-| T4.5 | Путь B: complete_in и свёртка | T4.4, Fix-1 | in_progress | |
-| T4.6 | Политики ошибок, on_policy_breach | T4.4 | in_progress | |
+| T4.5 | Путь B: complete_in и свёртка | T4.4, Fix-1 | done | acd5006 |
+| T4.6 | Политики ошибок, on_policy_breach | T4.4 | done | ea67545 |
 | T4.7 | Операции над деревом | T4.6 | todo | |
 | T4.8 | Sweeper | T4.7 | todo | |
 | T4.9 | Snapshotter | T4.8 | todo | |
 | T4.10 | Maintenance, лидерство, watch | T4.9 | todo | |
-| T4.11 | Чтение: view, in_flight, items, find | T4.4 | in_progress | |
+| T4.11 | Чтение: view, in_flight, items, find | T4.4 | done | 8b45a88 |
 | T5.1 | Runtime: ItemContext, th.item, tracked | T4.5, T4.7 | todo | |
 | T6.1 | Tallyho, Settings, install, migrate | T5.1, T4.10, T4.11 | todo | |
 | T6.2 | th.batch → BatchBuilder, BatchHandle | T6.1 | todo | |
@@ -72,6 +72,14 @@
 - Отклонения от плана/доков: … (или «нет»)
 - Узнали / на что обратить внимание дальше: …
 -->
+
+### 2026-09-30 · волна 7 влита · T4.5, T4.6, T4.11
+- **T4.5 · done (`acd5006`).** `complete_in` делает точечный HOT CAS без предварительного `FOR UPDATE`, сохраняет spawn/marks/metrics и append-only counter delta в пользовательской транзакции; after-commit сворачивает точные delta-id и запускает policy/finalize. REPEATABLE READ/SERIALIZABLE стресс зелёный, открытая user tx не держит lock на `th_counter`.
+- **T4.6 · done (`ea67545`).** `PolicyEnforcer` после flush атомарно применяет threshold/fail-fast: pause всего дерева или запрос отмены, `on_policy_breach` с fallback на hook корня и CAS-однократностью; падение hook откатывает и домен, и действие политики.
+- **T4.11 · done (`8b45a88`).** Один запрос строит дерево `BatchSummary`/`BatchView` со счётчиками, метриками, feeds и leases; добавлены `in_flight`, keyset `items(label)`, `find`, `child`, одностейтментный `BatchPurged`.
+- **Общий прогон после вливания:** `poe check` зелёный; 18/18 объединённых целевых тестов; `poe test-all` — 841 passed, покрытие 96,16%; `pre-commit run --all-files` зелёный.
+- Отклонения/риски: в текущей архитектуре нет append-only `th_metric_delta`, поэтому путь B обновляет `th_metric` напрямую; это не блокирует `th_counter` и проходит DoD, но одинаковые metric keys могут ждать друг друга. Полное устранение требует предварительного изменения ARCHITECTURE. `InFlightItem.age` после heartbeat отражает возраст с последнего продления lease, потому что схема не хранит `acquired_at`.
+- Дальше: T4.7 доступна; T5.1 теперь ждёт только T4.7.
 
 ### 2026-09-30 · волна 7 запущена · T4.5, T4.6, T4.11
 - Три независимые задачи выполняются параллельно в изолированных worktree от зелёного `e33ab7e`; общий merge и гейты выполнит оркестратор.
