@@ -25,6 +25,14 @@ from tallyho.model.policy import (
     PolicyKind,
     PolicyVerdict,
 )
+from tallyho.model.progress import (
+    NodeCounters,
+    ProgressSettings,
+    compute_progress,
+    ema_rate,
+    estimate_eta,
+    estimate_threshold,
+)
 from tallyho.model.states import (
     BatchState,
     CancelReason,
@@ -57,6 +65,7 @@ __all__ = [
     "InvalidStateError",
     "ItemState",
     "ItemView",
+    "NodeCounters",
     "NotFoundError",
     "OnFeederFailed",
     "OutboxKind",
@@ -66,10 +75,15 @@ __all__ = [
     "PolicyKind",
     "PolicyVerdict",
     "Progress",
+    "ProgressSettings",
     "ResultClass",
     "SealError",
     "SpawnTargetError",
     "TallyhoError",
     "TaskCall",
     "UnsupportedOption",
+    "compute_progress",
+    "ema_rate",
+    "estimate_eta",
+    "estimate_threshold",
 ]
