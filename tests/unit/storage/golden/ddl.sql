@@ -70,7 +70,12 @@ CREATE TABLE th_counter_delta (
 	d_skip BIGINT DEFAULT 0 NOT NULL,
 	d_error BIGINT DEFAULT 0 NOT NULL,
 	d_cancelled BIGINT DEFAULT 0 NOT NULL,
+	d_dispatched BIGINT DEFAULT 0 NOT NULL,
+	d_w_total BIGINT DEFAULT 0 NOT NULL,
 	d_w_done BIGINT DEFAULT 0 NOT NULL,
+	d_duplicates BIGINT DEFAULT 0 NOT NULL,
+	d_skipped_by_limit BIGINT DEFAULT 0 NOT NULL,
+	d_tree_total BIGINT DEFAULT 0 NOT NULL,
 	PRIMARY KEY (id)
 )
  WITH (autovacuum_vacuum_scale_factor = 0, autovacuum_vacuum_threshold = 1000);
