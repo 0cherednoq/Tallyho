@@ -9,6 +9,7 @@ from tallyho.hooks.registry import (
     PolicyBreachHook,
     ProgressHook,
     ProgressRegistration,
+    import_hook_modules,
 )
 
 __all__ = [
@@ -18,4 +19,5 @@ __all__ = [
     "PolicyBreachHook",
     "ProgressHook",
     "ProgressRegistration",
+    "import_hook_modules",
 ]

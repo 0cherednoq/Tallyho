@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import importlib
 from dataclasses import dataclass
 from datetime import timedelta
 from enum import StrEnum
@@ -32,6 +33,7 @@ __all__ = [
     "PolicyBreachHook",
     "ProgressHook",
     "ProgressRegistration",
+    "import_hook_modules",
 ]
 
 
@@ -223,3 +225,20 @@ class HookRegistry:
         if registered:
             message = f"{_DUPLICATE}: {name.decorator} для kind={kind!r}"
             raise ConfigurationError(message)
+
+
+def import_hook_modules(modules: Iterable[str]) -> None:
+    """Импортировать ``hook_modules``: их декораторы регистрируют хуки (§7.5).
+
+    Повторный импорт берётся из ``sys.modules`` и хуки не дублирует.
+
+    Raises:
+        ConfigurationError: модуль или его зависимость не импортируется
+            (``ImportError``); прочие исключения модуля пробрасываются как есть.
+    """
+    for name in modules:
+        try:
+            importlib.import_module(name)
+        except ImportError as exc:
+            message = f"не удалось импортировать hook_modules {name!r}: {exc}"
+            raise ConfigurationError(message) from exc
