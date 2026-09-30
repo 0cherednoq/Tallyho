@@ -245,7 +245,10 @@ class CounterColumns(TypedColumns):
 
 @final
 class CounterDeltaColumns(TypedColumns):
-    """Колонки ``th_counter_delta``: дельты из транзакций пользователя (путь B)."""
+    """Колонки ``th_counter_delta``: дельты из транзакций пользователя (путь B).
+
+    На каждый счётчик ``th_counter`` — колонка ``d_<имя>`` в том же порядке.
+    """
 
     id = Column(BigInteger(), Identity(always=True), primary_key=True)
     batch_id = _uuid()
@@ -254,7 +257,12 @@ class CounterDeltaColumns(TypedColumns):
     d_skip = _big(default=0)
     d_error = _big(default=0)
     d_cancelled = _big(default=0)
+    d_dispatched = _big(default=0)
+    d_w_total = _big(default=0)
     d_w_done = _big(default=0)
+    d_duplicates = _big(default=0)
+    d_skipped_by_limit = _big(default=0)
+    d_tree_total = _big(default=0)
 
 
 @final

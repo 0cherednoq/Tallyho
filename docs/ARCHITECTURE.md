@@ -461,7 +461,12 @@ erDiagram
         bigint d_skip
         bigint d_error
         bigint d_cancelled
+        bigint d_dispatched
+        bigint d_w_total
         bigint d_w_done
+        bigint d_duplicates
+        bigint d_skipped_by_limit
+        bigint d_tree_total
     }
     TH_METRIC {
         uuid batch_id PK

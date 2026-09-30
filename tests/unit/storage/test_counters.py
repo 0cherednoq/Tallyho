@@ -45,10 +45,9 @@ def test_is_zero() -> None:
     assert not CounterDelta(cancelled=-1).is_zero
 
 
-def test_fits_delta_table() -> None:
-    assert CounterDelta(total=1, ok=1, skip=1, error=1, cancelled=1, w_done=1).fits_delta_table
-    for name in set(COUNTER_FIELDS) - set(DELTA_FIELDS):
-        assert not CounterDelta(**{name: 1}).fits_delta_table
+def test_every_counter_has_delta_column() -> None:
+    # Путь B записывает любое поле (D-029).
+    assert DELTA_FIELDS == COUNTER_FIELDS
 
 
 def test_totals_done_and_pending() -> None:

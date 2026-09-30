@@ -78,16 +78,16 @@ COUNTER_FIELDS: Final = (
 )
 """Счётчики строки ``th_counter`` в порядке колонок (ARCHITECTURE §5.1)."""
 
-DELTA_FIELDS: Final = ("total", "ok", "skip", "error", "cancelled", "w_done")
-"""Счётчики, у которых есть колонка ``d_<имя>`` в ``th_counter_delta``."""
+DELTA_FIELDS: Final = COUNTER_FIELDS
+"""Счётчики с колонкой ``d_<имя>`` в ``th_counter_delta``: все (D-029)."""
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class CounterDelta:
     """Приращение счётчиков одного батча.
 
-    Поля совпадают с колонками ``th_counter``. Путь B (``th_counter_delta``)
-    хранит только поля из :data:`DELTA_FIELDS`.
+    Поля совпадают с колонками ``th_counter`` и ``d_*``-колонками
+    ``th_counter_delta``: оба пути записывают любое поле.
     """
 
     total: int = 0
@@ -126,12 +126,6 @@ class CounterDelta:
     def is_zero(self) -> bool:
         """Все поля равны нулю: записывать нечего."""
         return not any(self.as_dict().values())
-
-    @property
-    def fits_delta_table(self) -> bool:
-        """Дельту можно записать в ``th_counter_delta`` без потерь."""
-        values = self.as_dict()
-        return not any(values[name] for name in COUNTER_FIELDS if name not in DELTA_FIELDS)
 
     def __add__(self, other: CounterDelta) -> CounterDelta:
         """Сумма двух приращений.
@@ -248,8 +242,6 @@ MetricKey = tuple["UUID", str, int]
 _CHUNK: Final = 1000
 """Строк в одном многострочном INSERT: до 13 параметров на строку при лимите 32 767."""
 
-_DELTA_OVERFLOW = "th_counter_delta хранит только поля DELTA_FIELDS: остальные потерялись бы"
-
 _ZERO: Final = literal_column("0", BigInteger())
 
 _DERIVED_FIELDS: Final = ("total", "ok", "skip", "error", "cancelled", "w_total", "w_done")
@@ -309,10 +301,7 @@ def _totals_select(tables: Tables, ids: list[UUID]) -> Select[*tuple[object, ...
         .lateral("d")
     )
     columns: list[ColumnElement[object]] = [b.c.batch_id]
-    columns.extend(
-        (c.c[name] + d.c[name] if name in DELTA_FIELDS else c.c[name]).label(name)
-        for name in COUNTER_FIELDS
-    )
+    columns.extend((c.c[name] + d.c[name]).label(name) for name in COUNTER_FIELDS)
     return select(*columns).select_from(b.join(c, true()).join(d, true()))
 
 
@@ -364,15 +353,10 @@ async def insert_delta(
         conn: Соединение транзакции пользователя.
         tables: Таблицы установки.
         deltas: Приращения по батчам.
-
-    Raises:
-        TypeError: Дельта содержит ненулевое поле вне :data:`DELTA_FIELDS`.
     """
     rows: list[dict[str, object]] = []
     for batch_id in sorted(deltas):
         value = deltas[batch_id]
-        if not value.fits_delta_table:
-            raise TypeError(_DELTA_OVERFLOW)
         if value.is_zero:
             continue
         values = value.as_dict()
@@ -439,18 +423,12 @@ async def fold_deltas(
     if not ids:
         return {}
     delta = tables.counter_delta
+    returned: list[ColumnElement[UUID] | ColumnElement[int]] = [delta.c.batch_id]
+    returned.extend(delta.c[f"d_{name}"] for name in DELTA_FIELDS)
     gone = (
         delete(delta)
         .where(delta.c.batch_id == any_(literal(ids, ARRAY(Uuid()))))
-        .returning(
-            delta.c.batch_id,
-            delta.c.d_total,
-            delta.c.d_ok,
-            delta.c.d_skip,
-            delta.c.d_error,
-            delta.c.d_cancelled,
-            delta.c.d_w_done,
-        )
+        .returning(*returned)
         .cte("gone")
     )
     sums = [_sum(gone.c[f"d_{name}"]).label(name) for name in DELTA_FIELDS]
