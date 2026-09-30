@@ -44,6 +44,47 @@ CREATE INDEX th_batch_retention_idx ON th_batch (finished_at) WHERE id = root_id
 
 CREATE UNIQUE INDEX th_batch_root_key_uq ON th_batch (root_id, key) WHERE parent_id IS NOT NULL;
 
+CREATE TABLE th_counter (
+	batch_id UUID NOT NULL,
+	slot SMALLINT NOT NULL,
+	total BIGINT DEFAULT 0 NOT NULL,
+	ok BIGINT DEFAULT 0 NOT NULL,
+	skip BIGINT DEFAULT 0 NOT NULL,
+	error BIGINT DEFAULT 0 NOT NULL,
+	cancelled BIGINT DEFAULT 0 NOT NULL,
+	dispatched BIGINT DEFAULT 0 NOT NULL,
+	w_total BIGINT DEFAULT 0 NOT NULL,
+	w_done BIGINT DEFAULT 0 NOT NULL,
+	duplicates BIGINT DEFAULT 0 NOT NULL,
+	skipped_by_limit BIGINT DEFAULT 0 NOT NULL,
+	tree_total BIGINT DEFAULT 0 NOT NULL,
+	PRIMARY KEY (batch_id, slot)
+)
+ WITH (fillfactor = 50, autovacuum_vacuum_scale_factor = 0, autovacuum_vacuum_threshold = 1000);
+
+CREATE TABLE th_counter_delta (
+	id BIGINT GENERATED ALWAYS AS IDENTITY,
+	batch_id UUID NOT NULL,
+	d_total BIGINT DEFAULT 0 NOT NULL,
+	d_ok BIGINT DEFAULT 0 NOT NULL,
+	d_skip BIGINT DEFAULT 0 NOT NULL,
+	d_error BIGINT DEFAULT 0 NOT NULL,
+	d_cancelled BIGINT DEFAULT 0 NOT NULL,
+	d_w_done BIGINT DEFAULT 0 NOT NULL,
+	PRIMARY KEY (id)
+)
+ WITH (autovacuum_vacuum_scale_factor = 0, autovacuum_vacuum_threshold = 1000);
+
+CREATE INDEX th_counter_delta_batch_idx ON th_counter_delta (batch_id);
+
+CREATE TABLE th_expiry (
+	item_id UUID NOT NULL,
+	expires_at TIMESTAMP WITH TIME ZONE NOT NULL,
+	PRIMARY KEY (item_id)
+);
+
+CREATE INDEX th_expiry_expires_idx ON th_expiry (expires_at);
+
 CREATE TABLE th_feed (
 	feeder_id UUID NOT NULL,
 	fed_id UUID NOT NULL,
@@ -76,6 +117,13 @@ CREATE INDEX th_item_batch_idx ON th_item (batch_id, id);
 
 CREATE UNIQUE INDEX th_item_batch_key_uq ON th_item (batch_id, key) WHERE key IS NOT NULL;
 
+CREATE TABLE th_item_mark (
+	batch_id UUID NOT NULL,
+	label TEXT NOT NULL,
+	item_id UUID NOT NULL,
+	PRIMARY KEY (batch_id, label, item_id)
+);
+
 CREATE TABLE th_lease (
 	item_id UUID NOT NULL,
 	batch_id UUID NOT NULL,
@@ -91,6 +139,21 @@ CREATE TABLE th_lease (
 CREATE INDEX th_lease_batch_idx ON th_lease (batch_id);
 
 CREATE INDEX th_lease_until_idx ON th_lease (lease_until);
+
+CREATE TABLE th_meta (
+	key TEXT NOT NULL,
+	value TEXT NOT NULL,
+	PRIMARY KEY (key)
+);
+
+CREATE TABLE th_metric (
+	batch_id UUID NOT NULL,
+	name TEXT NOT NULL,
+	slot SMALLINT NOT NULL,
+	value BIGINT DEFAULT 0 NOT NULL,
+	PRIMARY KEY (batch_id, name, slot)
+)
+ WITH (fillfactor = 50, autovacuum_vacuum_scale_factor = 0, autovacuum_vacuum_threshold = 1000);
 
 CREATE TABLE th_outbox (
 	id UUID NOT NULL,

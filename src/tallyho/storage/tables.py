@@ -28,6 +28,7 @@ from sqlalchemy import (
     Boolean,
     Column,
     DateTime,
+    Identity,
     Index,
     Integer,
     Interval,
@@ -56,9 +57,15 @@ __all__ = [
     "DEFAULT_PREFIX",
     "PROGRESS_HOOK",
     "BatchColumns",
+    "CounterColumns",
+    "CounterDeltaColumns",
+    "ExpiryColumns",
     "FeedColumns",
     "ItemColumns",
+    "ItemMarkColumns",
     "LeaseColumns",
+    "MetaColumns",
+    "MetricColumns",
     "OutboxColumns",
     "Tables",
     "build_metadata",
@@ -71,6 +78,7 @@ PROGRESS_HOOK: Final = "progress"
 """Имя хука в ``th_batch.hooks``, по которому Snapshotter выбирает батчи."""
 
 _ITEM_FILLFACTOR: Final = 85
+_HOT_FILLFACTOR: Final = 50
 
 # Агрессивный autovacuum для churn-таблиц (COUNTERS §3.6): порог по числу
 # мёртвых строк, а не по доле от размера таблицы.
@@ -216,6 +224,74 @@ class FeedColumns(TypedColumns):
     fed_id = Column(Uuid(), primary_key=True)
 
 
+@final
+class CounterColumns(TypedColumns):
+    """Колонки ``th_counter``: слот счётчиков батча (слот = процесс, COUNTERS §3.3)."""
+
+    batch_id = Column(Uuid(), primary_key=True)
+    slot = Column(SmallInteger(), primary_key=True, autoincrement=False)
+    total = _big(default=0)
+    ok = _big(default=0)
+    skip = _big(default=0)
+    error = _big(default=0)
+    cancelled = _big(default=0)
+    dispatched = _big(default=0)
+    w_total = _big(default=0)
+    w_done = _big(default=0)
+    duplicates = _big(default=0)
+    skipped_by_limit = _big(default=0)
+    tree_total = _big(default=0)
+
+
+@final
+class CounterDeltaColumns(TypedColumns):
+    """Колонки ``th_counter_delta``: дельты из транзакций пользователя (путь B)."""
+
+    id = Column(BigInteger(), Identity(always=True), primary_key=True)
+    batch_id = _uuid()
+    d_total = _big(default=0)
+    d_ok = _big(default=0)
+    d_skip = _big(default=0)
+    d_error = _big(default=0)
+    d_cancelled = _big(default=0)
+    d_w_done = _big(default=0)
+
+
+@final
+class MetricColumns(TypedColumns):
+    """Колонки ``th_metric``: labels и пользовательские метрики по слотам."""
+
+    batch_id = Column(Uuid(), primary_key=True)
+    name = Column(Text(), primary_key=True)
+    slot = Column(SmallInteger(), primary_key=True, autoincrement=False)
+    value = _big(default=0)
+
+
+@final
+class ItemMarkColumns(TypedColumns):
+    """Колонки ``th_item_mark``: только помеченные Items."""
+
+    batch_id = Column(Uuid(), primary_key=True)
+    label = Column(Text(), primary_key=True)
+    item_id = Column(Uuid(), primary_key=True)
+
+
+@final
+class ExpiryColumns(TypedColumns):
+    """Колонки ``th_expiry``: срок Items с flexiq-опцией ``expires`` (ARCHITECTURE §11.4)."""
+
+    item_id = Column(Uuid(), primary_key=True)
+    expires_at = _utc()
+
+
+@final
+class MetaColumns(TypedColumns):
+    """Колонки ``th_meta``: служебные значения установки, в том числе версия схемы."""
+
+    key = Column(Text(), primary_key=True)
+    value = _text()
+
+
 @dataclass(frozen=True, slots=True, kw_only=True)
 class Tables:
     """Все таблицы одной установки tallyho и их общий ``MetaData``."""
@@ -226,6 +302,12 @@ class Tables:
     outbox: Table[OutboxColumns]
     lease: Table[LeaseColumns]
     feed: Table[FeedColumns]
+    counter: Table[CounterColumns]
+    counter_delta: Table[CounterDeltaColumns]
+    metric: Table[MetricColumns]
+    item_mark: Table[ItemMarkColumns]
+    expiry: Table[ExpiryColumns]
+    meta: Table[MetaColumns]
 
 
 def build_metadata(prefix: str = DEFAULT_PREFIX) -> Tables:
@@ -246,6 +328,22 @@ def build_metadata(prefix: str = DEFAULT_PREFIX) -> Tables:
         outbox=_outbox(metadata, prefix),
         lease=_lease(metadata, prefix),
         feed=_feed(metadata, prefix),
+        counter=Table(
+            f"{prefix}counter",
+            metadata,
+            CounterColumns,
+            postgresql_with={"fillfactor": _HOT_FILLFACTOR, **_AGGRESSIVE_AUTOVACUUM},
+        ),
+        counter_delta=_counter_delta(metadata, prefix),
+        metric=Table(
+            f"{prefix}metric",
+            metadata,
+            MetricColumns,
+            postgresql_with={"fillfactor": _HOT_FILLFACTOR, **_AGGRESSIVE_AUTOVACUUM},
+        ),
+        item_mark=Table(f"{prefix}item_mark", metadata, ItemMarkColumns),
+        expiry=_expiry(metadata, prefix),
+        meta=Table(f"{prefix}meta", metadata, MetaColumns),
     )
 
 
@@ -332,3 +430,18 @@ def _feed(metadata: MetaData, prefix: str) -> Table[FeedColumns]:
     feed = Table(name, metadata, FeedColumns)
     Index(f"{name}_fed_idx", feed.c.fed_id)
     return feed
+
+
+def _counter_delta(metadata: MetaData, prefix: str) -> Table[CounterDeltaColumns]:
+    name = f"{prefix}counter_delta"
+    delta = Table(name, metadata, CounterDeltaColumns, postgresql_with=_AGGRESSIVE_AUTOVACUUM)
+    Index(f"{name}_batch_idx", delta.c.batch_id)
+    return delta
+
+
+def _expiry(metadata: MetaData, prefix: str) -> Table[ExpiryColumns]:
+    # Sweeper ищет не захваченные вовремя Items по сроку.
+    name = f"{prefix}expiry"
+    expiry = Table(name, metadata, ExpiryColumns)
+    Index(f"{name}_expires_idx", expiry.c.expires_at)
+    return expiry

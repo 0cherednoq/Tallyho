@@ -27,12 +27,19 @@ TABLE_SUFFIXES = (
     "outbox",
     "lease",
     "feed",
+    "counter",
+    "counter_delta",
+    "metric",
+    "item_mark",
+    "expiry",
+    "meta",
 )
 
 # Колонки th_item, которые меняет finish: индекс по ним ломает HOT update.
 ITEM_MUTABLE_COLUMNS = frozenset({"state", "label", "result", "error", "finished_at"})
 
 AGGRESSIVE_AUTOVACUUM = {"autovacuum_vacuum_scale_factor": 0, "autovacuum_vacuum_threshold": 1000}
+HOT_TABLE = {"fillfactor": 50, **AGGRESSIVE_AUTOVACUUM}
 
 
 def render_ddl(tables: Tables) -> str:
@@ -120,6 +127,9 @@ def test_mutable_index_rule_catches_violations() -> None:
         ("item", {"fillfactor": 85}),
         ("lease", AGGRESSIVE_AUTOVACUUM),
         ("outbox", AGGRESSIVE_AUTOVACUUM),
+        ("counter_delta", AGGRESSIVE_AUTOVACUUM),
+        ("counter", HOT_TABLE),
+        ("metric", HOT_TABLE),
     ],
 )
 def test_storage_parameters(tables: Tables, suffix: str, options: dict[str, int]) -> None:
