@@ -1383,7 +1383,7 @@ th.install(fq)                              # системная задача ta
 @fq.task(max_retries=4)                     # = queue.task(...)(th.tracked(fn)), см. §11.3
 async def my_task(x: int) -> None: ...
 
-await th.migrate()                          # или в Alembic: tallyho.alembic.upgrade(op, version=1, schema="app")
+await th.migrate()                          # или в Alembic: tallyho.storage.alembic.upgrade(op, version=1, schema="app")
 ```
 
 ### 11.2 Сводка
