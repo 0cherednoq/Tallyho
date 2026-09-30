@@ -8,6 +8,7 @@ from uuid import uuid4
 
 import pytest
 from flexiq import EventType
+from flexiq.exceptions import TaskCancelledError
 
 import tallyho.adapters.flexiq.adapter as adapter_module
 from tallyho.adapters.flexiq import FlexiqAdapter
@@ -566,6 +567,17 @@ async def test_dispatch_validates_option_types(options: Mapping[str, object]) ->
     with pytest.raises(ConfigurationError):
         await adapter.dispatch([_message(adapter, name, options=options)])
     await adapter.close()
+
+
+def test_producer_validation_enforces_flexiq_notes_limits_and_cancellation_type() -> None:
+    adapter, _queue = _adapter()
+    adapter.validate_options({"notes": {"trace": "ok"}, "priority": 1})
+    with pytest.raises(ConfigurationError):
+        adapter.validate_options({"notes": {str(index): index for index in range(16)}})
+    with pytest.raises(ConfigurationError):
+        adapter.validate_options({"notes": {"large": "x" * 4097}})
+    assert adapter.is_cancelled(TaskCancelledError("cancelled"))
+    assert not adapter.is_cancelled(RuntimeError("ordinary"))
 
 
 @pytest.mark.parametrize(

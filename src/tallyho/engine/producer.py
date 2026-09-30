@@ -63,6 +63,7 @@ if TYPE_CHECKING:
     from tallyho.hooks.registry import HookRegistry
     from tallyho.model.calls import TaskCall
     from tallyho.model.policy import FailurePolicy
+    from tallyho.protocols.broker import CallOptionsValidator
     from tallyho.protocols.clock import Clock
     from tallyho.protocols.ids import IdFactory
     from tallyho.protocols.serialization import PayloadCodec
@@ -350,6 +351,7 @@ class Producer:
     hooks: HookRegistry
     slot: int = 0
     max_payload_bytes: int = MAX_PAYLOAD_BYTES
+    option_validator: CallOptionsValidator | None = None
 
     # --- корень ------------------------------------------------------------
 
@@ -687,6 +689,9 @@ class Producer:
             raise ConfigurationError(message)
         if not calls:
             return InsertResult(found=0, weight=0)
+        if self.option_validator is not None:
+            for call in calls:
+                self.option_validator.validate_options(_call_option_values(call))
         ids = [self.ids.new_id() for _ in calls]
         payloads = [self._encode(call) for call in calls]
         options = [_call_options(call) for call in calls]
@@ -927,6 +932,8 @@ class Producer:
         return options
 
     def _callback(self, call: TaskCall) -> StoredCallback:
+        if self.option_validator is not None:
+            self.option_validator.validate_options(_call_option_values(call))
         return StoredCallback(
             task_name=call.task_name,
             payload=self._encode(call),
@@ -963,6 +970,13 @@ def _call_options(call: TaskCall) -> str | None:
         return json.dumps(options)
     except (TypeError, ValueError) as exc:
         raise ConfigurationError(_CALL_OPTIONS_NOT_JSON) from exc
+
+
+def _call_option_values(call: TaskCall) -> dict[str, object]:
+    options = dict(call.options)
+    if call.queue is not None:
+        options["queue"] = call.queue
+    return options
 
 
 def _chunked(calls: Iterable[TaskCall], size: int) -> Iterator[list[TaskCall]]:

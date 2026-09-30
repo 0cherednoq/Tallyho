@@ -71,12 +71,38 @@ jobs:
           enable-cache: true
           python-version: ${{ matrix.python }}
       - run: uv sync --all-extras
-      - run: uv run pytest -n auto --cov-report=xml
+      - run: uv run pytest -m "not flexiq" -n auto --cov-report=xml
       - uses: actions/upload-artifact@v4
         if: matrix.python == '3.11' && matrix.postgres == '16'
         with:
           name: coverage
           path: coverage.xml
+
+  flexiq-contract:
+    name: Flexiq 2.0.x contracts (py3.11, pg16)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: tallyho
+          POSTGRES_PASSWORD: tallyho
+          POSTGRES_DB: tallyho
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U tallyho"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      TALLYHO_TEST_DSN: postgresql+asyncpg://tallyho:tallyho@localhost:5432/tallyho
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          python-version: "3.11"
+      - run: uv sync --all-extras
+      - run: uv run pytest tests/contract/flexiq/test_contract.py -m flexiq -n 0 --no-cov
 
   build:
     name: Build distribution

@@ -22,6 +22,8 @@ if TYPE_CHECKING:
     from tallyho.model.states import OutboxKind
 
 __all__ = [
+    "CallOptionsValidator",
+    "CancellationClassifier",
     "DeadLetters",
     "Dispatcher",
     "Message",
@@ -112,6 +114,24 @@ class Dispatcher(Protocol):
         Args:
             messages: пачка сообщений одного прохода relay.
         """
+        ...
+
+
+@runtime_checkable
+class CallOptionsValidator(Protocol):
+    """Optional producer-side validation of broker-specific call options."""
+
+    def validate_options(self, options: Mapping[str, object]) -> None:
+        """Reject invalid options before an Item and its outbox row are written."""
+        ...
+
+
+@runtime_checkable
+class CancellationClassifier(Protocol):
+    """Optional adapter hook for broker-native cooperative cancellation signals."""
+
+    def is_cancelled(self, exc: BaseException) -> bool:
+        """Return whether ``exc`` means that the running broker job was cancelled."""
         ...
 
 

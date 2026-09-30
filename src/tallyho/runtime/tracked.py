@@ -17,7 +17,7 @@ from tallyho.engine.completer import FinishResult, ItemRef
 from tallyho.model.calls import TaskCall
 from tallyho.model.errors import ConfigurationError
 from tallyho.model.states import ResultClass
-from tallyho.protocols.broker import Verdict
+from tallyho.protocols.broker import CancellationClassifier, Verdict
 from tallyho.runtime.context import (
     CallbackContext,
     ItemContext,
@@ -180,7 +180,15 @@ class TaskRuntime:
             _ = await self.completer.release(context.ref)
             raise
         except BaseException as exc:
-            if self.broker.retry_verdict(exc) is Verdict.RETRY:
+            if isinstance(self.broker, CancellationClassifier) and self.broker.is_cancelled(exc):
+                value = FinishResult(
+                    result_class=ResultClass.CANCELLED,
+                    label="cancelled",
+                    error={"type": type(exc).__name__, "message": str(exc)},
+                    metrics=context.metrics,
+                )
+                _ = await self.completer.finish(context.ref, value)
+            elif self.broker.retry_verdict(exc) is Verdict.RETRY:
                 _ = await self.completer.release(context.ref)
             else:
                 value = FinishResult(

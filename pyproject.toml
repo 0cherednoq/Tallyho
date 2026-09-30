@@ -74,6 +74,7 @@ test = [
   "pytest-randomly>=3.16",
   "pytest-xdist>=3.6",
   "hypothesis>=6.120",
+  "pydantic>=2.12",
   "testcontainers[postgres]>=4.9",
   "asyncpg>=0.29",
 ]
@@ -115,6 +116,7 @@ imports = { cmd = "lint-imports", help = "Architecture contracts (import-linter)
 deps = { cmd = "deptry src", help = "Declared vs used dependencies" }
 test = { cmd = "pytest -m 'not integration' --cov-fail-under=0", help = "Unit + architecture tests (coverage gate is enforced on test-all / CI)" }
 test-all = { cmd = "pytest", help = "All tests incl. PostgreSQL integration (needs Docker or TALLYHO_TEST_DSN)" }
+test-flexiq = { cmd = "pytest tests/contract/flexiq/test_contract.py -m flexiq -n 0 --no-cov", help = "A-FQ contracts with PostgreSQL and subprocess workers" }
 check = { sequence = ["lint", "types", "imports", "deps", "test"], help = "Everything CI runs, except integration" }
 check-all = { sequence = ["lint", "types", "imports", "deps", "test-all"], help = "Всё, включая PostgreSQL и покрытие ≥ 95%" }
 
@@ -392,6 +394,7 @@ asyncio_default_test_loop_scope = "function"
 timeout = 60
 filterwarnings = ["error"]
 markers = [
+  "flexiq: contract tests with a live Flexiq worker in a separate process",
   "integration: требует PostgreSQL (Docker/testcontainers или TALLYHO_TEST_DSN)",
   "slow: долгие тесты (хаос, нагрузка)",
 ]

@@ -29,7 +29,7 @@ from tallyho.engine.spawn import TreeCache
 from tallyho.engine.sweeper import Sweeper, SweeperSettings
 from tallyho.model.errors import ConfigurationError
 from tallyho.model.progress import ProgressSettings
-from tallyho.protocols.broker import Runtime, RuntimeInstaller
+from tallyho.protocols.broker import CallOptionsValidator, Runtime, RuntimeInstaller
 from tallyho.protocols.serialization import PayloadCodec, SerializerCodec
 from tallyho.storage.tx import after_commit, resolve_connection
 
@@ -202,6 +202,7 @@ class _Facade:
             codec=codec,
             hooks=self.hooks,
             slot=slot,
+            option_validator=adapter if isinstance(adapter, CallOptionsValidator) else None,
         )
         self._producer = producer
         tree_cache = TreeCache()

@@ -16,11 +16,15 @@ from typing import TYPE_CHECKING, ParamSpec, Protocol, TypeVar, cast, final, run
 from uuid import UUID
 
 from flexiq import EventType, current_job
+from flexiq.exceptions import TaskCancelledError
+from flexiq.notes import validate_and_encode_notes
 from typing_extensions import override
 
 from tallyho.model.errors import ConfigurationError, TallyhoError, UnsupportedOption
 from tallyho.model.states import OutboxKind
 from tallyho.protocols.broker import (
+    CallOptionsValidator,
+    CancellationClassifier,
     DeadLetters,
     Dispatcher,
     Runtime,
@@ -218,7 +222,9 @@ class _Prepared:
 
 
 @final
-class FlexiqAdapter(Dispatcher, Runtime, PayloadCodec):
+class FlexiqAdapter(
+    Dispatcher, Runtime, PayloadCodec, CallOptionsValidator, CancellationClassifier
+):
     """Двусторонний адаптер одной пользовательской ``flexiq.Queue``."""
 
     def __init__(self, queue: Queue, *, pool: str = "thread") -> None:
@@ -306,6 +312,30 @@ class FlexiqAdapter(Dispatcher, Runtime, PayloadCodec):
                 pending.append(loop.run_in_executor(self._executor, self._send_chunk, chunk))
         if pending:
             _ = await asyncio.gather(*pending)
+
+    @override
+    def validate_options(self, options: Mapping[str, object]) -> None:
+        """Validate call options synchronously at the producer boundary.
+
+        Raises:
+            ConfigurationError: an option has an invalid value or structured notes exceed limits.
+
+        """
+        self._validate_call_options(options)
+        notes = _notes(options.get("notes"))
+        try:
+            _ = validate_and_encode_notes(notes)
+        except Exception as exc:
+            raise ConfigurationError(_BAD_OPTIONS) from exc
+
+    @override
+    def is_cancelled(self, exc: BaseException) -> bool:
+        """Recognize Flexiq's cooperative cancellation signal.
+
+        Returns:
+            Whether this is Flexiq's task-cancelled exception.
+        """
+        return isinstance(exc, TaskCancelledError)
 
     @override
     def wrap(self, fn: Callable[P, Awaitable[R]]) -> Callable[P, Awaitable[R]]:
