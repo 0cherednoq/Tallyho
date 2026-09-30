@@ -6,8 +6,8 @@
 ## Текущее состояние
 
 * **Ветка:** `impl/v1`
-* **Текущая волна:** 2 — T1.2, T1.4, T2.1
-* **Последний зелёный коммит:** 2a781c2
+* **Текущая волна:** 3 — T1.3, T2.2, T2.3, T3.1
+* **Последний зелёный коммит:** 40241bb
 
 ## Задачи
 
@@ -16,14 +16,14 @@
 | T0.1 | Репозиторий собирается, гейты зелёные на скелете | — | done | d287135, 97cc124, 6ea6779, 4a713d4 |
 | T0.2 | Инфраструктура тестов (схема на тест, xdist) | T0.1 | done | 25fcbe6..81c68c3 (5), merge 69a40fa |
 | T1.1 | Перечисления состояний и иерархия ошибок | T0.1 | done | 7c5a33d..345efab (3), merge 0de5f86 |
-| T1.2 | Value-объекты, FailurePolicy, TaskCall | T1.1 | in_progress | |
-| T1.3 | Математика прогресса | T1.2 | todo | |
-| T1.4 | Протоколы и базовые реализации (Clock, UUIDv7, Serializer, Observer) | T1.1 | in_progress | |
-| T2.1 | Таблицы и индексы | T1.1 | in_progress | |
-| T2.2 | Миграции, установка в схему, alembic | T2.1, T0.2 | todo | |
-| T2.3 | Транзакции: сессия пользователя, ретраи, after_commit, HookSession | T2.1, T1.4 | todo | |
+| T1.2 | Value-объекты, FailurePolicy, TaskCall | T1.1 | done | a76f6ac..b7abd3d (3), merge 13c1b02 |
+| T1.3 | Математика прогресса | T1.2 | in_progress | |
+| T1.4 | Протоколы и базовые реализации (Clock, UUIDv7, Serializer, Observer) | T1.1 | done | c4943ae..e7334f8 (5), merge 721a192, cbd8059, 40241bb |
+| T2.1 | Таблицы и индексы | T1.1 | done | 91aa770..42f6ef3 (5), merge 1f7278a |
+| T2.2 | Миграции, установка в схему, alembic | T2.1, T0.2 | in_progress | |
+| T2.3 | Транзакции: сессия пользователя, ретраи, after_commit, HookSession | T2.1, T1.4 | in_progress | |
 | T2.4 | Запросы счётчиков, дельты, свёртка, reconcile | T2.2, T2.3 | todo | |
-| T3.1 | Реестр tx-хуков | T1.2 | todo | |
+| T3.1 | Реестр tx-хуков | T1.2 | in_progress | |
 | T4.1 | Продюсер: батчи, под-батчи, th_feed, add, seal, expect | T2.4, T3.1 | todo | |
 | T4.2 | Relay | T4.1 | todo | |
 | T4.3a | Completer: буфер, claim/heartbeat/release | T4.2 | todo | |
@@ -71,6 +71,25 @@
 - Отклонения от плана/доков: … (или «нет»)
 - Узнали / на что обратить внимание дальше: …
 -->
+
+### 2026-09-30 · волна 3 запущена · T1.3, T2.2, T2.3, T3.1
+
+### 2026-09-30 · волна 2 влита · T1.2, T1.4, T2.1
+- **T1.2 · done.** `model/views.py` (Progress, BatchSummary, BatchView, ItemView, InFlightItem), `model/policy.py` (FailurePolicy, PolicyVerdict, PolicyBreach, JSON для options), `model/calls.py` (TaskCall). D-018.
+- **T1.4 · done.** `protocols/`: Clock/SystemClock, IdFactory/UuidV7Factory, Serializer/JsonSerializer/PayloadCodec/SerializerCodec, Message/Verdict/Dispatcher/Runtime/DeadLetters, Observer/NullObserver. D-002 закрыт, D-016, D-017. ARCHITECTURE §3.4/§4.2 обновлены (40241bb); `typing-extensions` убран из DEP002 (cbd8059).
+- **T2.1 · done.** `storage/tables.py`: `build_metadata(prefix)`, 11 таблиц на `TypedColumns`, все индексы §5.2 + `th_expiry(expires_at)`, storage-параметры, golden-DDL. Интеграционный `create_all`. SQLAlchemy ≥ 2.1 (D-019), литералы в предикатах (D-020).
+- **Вливание:** без конфликтов, гейты после каждого вливания зелёные, 318 тестов, покрытие 99,5%.
+- **Для следующих задач:**
+  - «Сейчас» в SQL — только через хелпер `sql_now(clock)` (сделать в T2.3).
+  - В запросах горячего пути условие по `state` писать литералом (D-020).
+  - `create_all` в схеме теста: `conn.execution_options(schema_translate_map={None: schema})`, затем `run_sync(metadata.create_all, checkfirst=False)`.
+  - Новые колонки заводить через хелперы `_uuid/_text/_utc/...` в `tables.py`.
+  - DDL в юнит-тестах: `create_mock_engine("postgresql+asyncpg://", executor=print).dialect`.
+  - Реализации протоколов наследуют протокол явно и помечают методы `@override`. Исключения Observer engine глотает с логом.
+  - `Message(id, batch_id, kind, task_name, payload, options)`; для CALLBACK `id` — это `callback_id`. Исключение в `dispatch` → relay повторяет всю пачку.
+  - Для basedpyright результат `json.loads` оборачивать в `cast("object", ...)`.
+  - `BatchSummary`, `BatchView`, `TaskCall` нехешируемы.
+  - `fail_fast` / `PolicyAction.FAIL`: `verdict.reason` → `cancel_reason`.
 
 ### 2026-09-30 · волна 2 запущена · T1.2, T1.4, T2.1
 

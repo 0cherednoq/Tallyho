@@ -6,9 +6,10 @@
 ## D-001 · Иерархия документов · ACCEPTED
 При расхождениях прав `ARCHITECTURE.md` v2.1. `ACCEPTANCE.md` задаёт критерии тестов. `DESIGN.md`, `API.md`, `COUNTERS.md` — исторический ресёрч: брать из них только то, что не противоречит ARCHITECTURE (в частности, **нет** SQLite, Flow/Run, бизнес-статусов, `bw_status_history`).
 
-## D-002 · Время · ACCEPTED (уточнить в T1.4)
+## D-002 · Время · ACCEPTED (окончательно в T1.4)
 Все сроки (`lease_until`, `available_at`, `start_at`, `deadline_at`, retention, backoff хуков) считаются по времени БД (ARCHITECTURE §10, ACCEPTANCE A-CH-09). В движке нет `datetime.now()`.
 Для тестов `FakeClock` должен подменять «сейчас» в SQL. Предлагаемая механика: `Clock.now() -> datetime | None`; `None` → storage использует `now()` БД, значение → storage биндит его параметром. `protocols` не импортирует SQLAlchemy (import-linter). Интервалы в процессе (тик Completer, heartbeat) — `asyncio` loop time.
+Итог T1.4: `Clock.now() -> datetime | None`. `SystemClock.now()` всегда `None` → storage подставляет `now()` БД (время начала транзакции); aware `datetime` (FakeClock) storage биндит как `DateTime(timezone=True)`. Хелпер storage `sql_now(clock)` — единственный способ получить «сейчас» в SQL. `Clock.monotonic()` — только для длительностей в событиях Observer.
 
 ## D-003 · Покрытие и гейты · ACCEPTED
 `fail_under = 95` в `pyproject.toml` нельзя выполнить юнит-тестами: код storage/engine покрывается интеграционными тестами с PostgreSQL. Поэтому `poe test` (unit, быстрый гейт pre-push) идёт без покрытия, а `poe test-all` (unit + integration) — с покрытием 95%. Порог не снижается.
@@ -57,3 +58,20 @@ JSON не подходит: он теряет bytes, datetime и Decimal, пре
 * Prefork выполняет async-задачу через `asyncio.run` в новом loop, на Windows — `NotImplementedError`: `install()` даёт явную ошибку.
 * `_th` видят чужие предикаты, `on_enqueue` и `before_task` (задокументировать в A-FQ-13).
 Документы исправлены отдельным коммитом (AGENTS.md: «сначала обнови документ»).
+
+## D-016 · PayloadCodec — кодек payload адаптера · ACCEPTED (автономно, пересмотреть) (T1.4)
+Протокол `PayloadCodec.encode(task_name, args, kwargs) -> bytes` / `decode(task_name, data) -> (args, kwargs)`. `FlexiqAdapter` реализует его через `_encode_payload`/`_deserialize_payload` (D-006); для остальных адаптеров есть `SerializerCodec(Serializer)` (по умолчанию JSON, `{"args": [...], "kwargs": {...}}`). Api выбирает кодек так: адаптер, если `isinstance(adapter, PayloadCodec)`, иначе `SerializerCodec()`.
+
+## D-017 · `Runtime.reconcile_dead(cursor) -> DeadLetters` · ACCEPTED (автономно, пересмотреть) (T1.4)
+Сверка DLQ идёт по непрозрачному курсору (`dead_letters_after(after=...)`, D-014), курсор хранит engine. ARCHITECTURE §3.4 и §4.2 обновлены (40241bb). `Dispatcher.task_name(fn: Callable[P, object])`: `Callable[..., object]` mypy считает явным Any.
+
+## D-018 · Политики ошибок: `PolicyVerdict` и семантика порога · ACCEPTED (автономно, пересмотреть) (T1.2)
+* `FailurePolicy.evaluate` возвращает `PolicyVerdict(action, ratio, processed, failed, reason)`. Имя `Verdict` занято протоколом ретраев (`RETRY/FINAL`). При `action=FAIL` в `reason` лежит `CancelReason.FAIL_FAST` или `CancelReason.POLICY`.
+* `threshold`: обработанные — `ok + skip + error`, отменённые не учитываются. Числитель — `error` или, если задан фильтр, сумма меток из `labels`. Срабатывает при `processed ≥ min_processed` и доле **строго больше** `ratio`. По умолчанию `min_processed=0`, `action="fail"`. `fail_fast` срабатывает на первой ошибке без учёта `min_processed`.
+* `PolicyBreach.labels: list[str]`: пример в §12.4 ждёт `['hard_bounce']` в f-строке. Из-за этого объект нехешируемый.
+
+## D-019 · SQLAlchemy ≥ 2.1 · ACCEPTED (автономно, пересмотреть) (T2.1)
+`Table(..., postgresql_with=...)` (fillfactor, per-table autovacuum) в 2.0.x даёт `ArgumentError`. Кроме того, `TypedColumns` из 2.1 дают типизированные `table.c.*`: голый `Table` раскрывается в `Column[Any]`, а это ломает `disallow_any_explicit`. ARCHITECTURE §1/§4.1 и `pyproject.toml` обновлены.
+
+## D-020 · Предикаты partial-индексов — литералы · ACCEPTED (T2.1)
+Индекс sweeper'а по `th_batch.updated_at` построен с условием `state < 10` (активные). Индексы дедлайнов и снимков — `state IN (0, 1)`. **В запросах горячего пути условие по `state` пишется литералом, а не bind-параметром.** Иначе после пяти выполнений asyncpg переходит на generic plan и перестаёт брать partial-индекс. Условие запроса должно логически следовать из предиката индекса. Добавлен индекс `th_expiry(expires_at)`, которого нет в §5.2.
