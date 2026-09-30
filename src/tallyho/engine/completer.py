@@ -48,6 +48,7 @@ from enum import StrEnum
 from typing import TYPE_CHECKING, Final, Protocol, TypeVar, final
 
 from sqlalchemy import (
+    BigInteger,
     DateTime,
     Interval,
     SmallInteger,
@@ -55,6 +56,7 @@ from sqlalchemy import (
     Uuid,
     any_,
     delete,
+    func,
     literal,
     literal_column,
     select,
@@ -71,6 +73,7 @@ from tallyho.storage.tx import RetryPolicy, TxSettings, run_transaction
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Sequence
+    from datetime import datetime
     from uuid import UUID
 
     from sqlalchemy import ColumnElement
@@ -222,7 +225,24 @@ class _Claim:
     future: asyncio.Future[ClaimResult]
 
 
-_Op = _Claim
+_Progress = tuple[int | None, int | None]
+"""``(progress_done, progress_total)`` из ``th.item.progress``; ``None`` — не менять."""
+
+
+@dataclass(eq=False, slots=True)
+class _Heartbeat:
+    item: ItemRef
+    progress: _Progress
+    future: asyncio.Future[bool]
+
+
+@dataclass(eq=False, slots=True)
+class _Release:
+    item: ItemRef
+    future: asyncio.Future[bool]
+
+
+_Op = _Claim | _Heartbeat | _Release
 
 
 def _pending(ops: Sequence[_Op]) -> list[_Op]:
@@ -259,6 +279,9 @@ class _Applied:
     """Результат транзакции: что вернуть в futures и что сделать после commit."""
 
     claims: dict[UUID, ClaimResult] = field(default_factory=dict["UUID", ClaimResult])
+    beating: set[UUID] = field(default_factory=set["UUID"])
+    """Items, чей lease продлён heartbeat'ом: lease всё ещё у этого процесса."""
+    released: set[UUID] = field(default_factory=set["UUID"])
     finalize: set[UUID] = field(default_factory=set["UUID"])
     cancelled: list[tuple[UUID, UUID, int]] = field(
         default_factory=list[tuple["UUID", "UUID", int]]
@@ -462,11 +485,10 @@ class _Tx:
             return
         item = self.tables.item
         lease = self.tables.lease
-        until = self.now + literal(self.c.settings.lease_ttl, Interval())
         source = select(
             item.c.id,
             item.c.batch_id,
-            until,
+            self._lease_until(),
             literal(self.c.settings.worker_id, Text()),
             item.c.attempt,
         ).where(item.c.id == any_(_uuids(sorted(item_ids))))
@@ -522,6 +544,58 @@ class _Tx:
         _ = await self.conn.execute(
             delete(expiry).where(expiry.c.item_id == any_(_uuids(sorted(item_ids))))
         )
+
+    # --- release и heartbeat -------------------------------------------------------
+
+    def _owned(self, item_ids: Iterable[UUID]) -> list[UUID]:
+        worker = self.c.settings.worker_id
+        return sorted(
+            item_id
+            for item_id in item_ids
+            if (lease := self.leases.get(item_id)) is not None and lease.worker_id == worker
+        )
+
+    async def release(self, item_ids: Iterable[UUID]) -> None:
+        # UC-04, вердикт RETRY: брокер повторит задачу, lease отпускаем, attempt += 1.
+        own = self._owned(item_ids)
+        active = [
+            item_id
+            for item_id in own
+            if (row := self.items.get(item_id)) is not None and not row.state.is_terminal
+        ]
+        await self._bump_attempts(active)
+        await self._delete_leases(own)
+        self.applied.released.update(own)
+
+    async def heartbeat(self, beats: dict[UUID, _Progress]) -> None:
+        own = self._owned(beats)
+        if not own:
+            return
+        lease = self.tables.lease
+        rows = (
+            func.unnest(
+                _uuids(own),
+                literal([beats[item_id][0] for item_id in own], ARRAY(BigInteger())),
+                literal([beats[item_id][1] for item_id in own], ARRAY(BigInteger())),
+            )
+            .table_valued("item_id", "done", "total")
+            .render_derived("u")
+        )
+        done: ColumnElement[int] = rows.c.done
+        total: ColumnElement[int] = rows.c.total
+        _ = await self.conn.execute(
+            update(lease)
+            .where(lease.c.item_id == rows.c.item_id)
+            .values(
+                lease_until=self._lease_until(),
+                progress_done=func.coalesce(done, lease.c.progress_done),
+                progress_total=func.coalesce(total, lease.c.progress_total),
+            )
+        )
+        self.applied.beating.update(own)
+
+    def _lease_until(self) -> ColumnElement[datetime]:
+        return self.now + literal(self.c.settings.lease_ttl, Interval())
 
     # --- счётчики ------------------------------------------------------------------
 
@@ -623,6 +697,45 @@ class Completer:
         future = self._new_future(ClaimResult)
         return await self._submit(_Claim(item, future), future)
 
+    async def heartbeat(
+        self,
+        item: ItemRef,
+        *,
+        progress_done: int | None = None,
+        progress_total: int | None = None,
+    ) -> bool:
+        """Продлить lease на ``lease_ttl`` и записать прогресс задачи (§9.4).
+
+        Прогресс ``th.item.progress(done, total)`` пишется в ``th_lease`` вместе
+        с продлением — отдельных транзакций нет. ``None`` оставляет прежнее
+        значение.
+
+        Args:
+            item: Item, захваченный этим процессом.
+            progress_done: Сколько сделано внутри задачи.
+            progress_total: Сколько всего внутри задачи.
+
+        Returns:
+            ``False``, если lease уже не у этого процесса (истёк и перехвачен,
+            отпущен или удалён sweeper'ом): результат задачи всё равно
+            запишет finish, CAS сделает его идемпотентным.
+        """
+        future = self._new_future(bool)
+        op = _Heartbeat(item, (progress_done, progress_total), future)
+        return await self._submit(op, future)
+
+    async def release(self, item: ItemRef) -> bool:
+        """Отпустить lease перед ретраем брокера: ``attempt += 1`` (UC-04, вердикт RETRY).
+
+        Args:
+            item: Item, захваченный этим процессом.
+
+        Returns:
+            ``True``, если lease был у этого процесса и удалён.
+        """
+        future = self._new_future(bool)
+        return await self._submit(_Release(item, future), future)
+
     async def close(self) -> None:
         """Мягкая остановка: дослать буфер и остановить задачу сброса.
 
@@ -709,29 +822,60 @@ class Completer:
     async def _apply(self, conn: AsyncConnection, ops: Sequence[_Op]) -> _Applied:
         tx = _Tx(self, conn)
         claims: dict[UUID, ItemRef] = {}
+        beats: dict[UUID, _Progress] = {}
+        releases: set[UUID] = set()
         for op in ops:
-            _ = claims.setdefault(op.item.id, op.item)
+            if isinstance(op, _Claim):
+                _ = claims.setdefault(op.item.id, op.item)
+            elif isinstance(op, _Heartbeat):
+                done, total = beats.get(op.item.id, (None, None))
+                new_done, new_total = op.progress
+                beats[op.item.id] = (
+                    done if new_done is None else new_done,
+                    total if new_total is None else new_total,
+                )
+            else:
+                releases.add(op.item.id)
+        # Все блокировки строк — в начале и по порядку: batch → item → lease.
         await tx.lock_batches(ref.batch_id for ref in claims.values())
-        await tx.lock_items(claims)
-        await tx.lock_leases(claims)
+        await tx.lock_items([*releases, *claims])
+        await tx.lock_leases([*releases, *claims, *beats])
+        # release раньше claim: ретрай брокера мог прийти в ту же пачку.
+        await tx.release(releases)
         await tx.claim(claims)
+        await tx.heartbeat(beats)
         await tx.write_counters()
         return tx.applied
 
     def _resolve(self, ops: Sequence[_Op], applied: _Applied) -> None:
         seen: set[UUID] = set()
+        released: set[UUID] = set()
         for op in ops:
-            result = applied.claims[op.item.id]
-            if op.item.id in seen and result.run:
-                # Второй claim того же Item в одной транзакции — дубль доставки.
-                result = ClaimResult(
-                    outcome=ClaimOutcome.DUPLICATE, attempt=result.attempt, depth=result.depth
-                )
-            elif result.run:
-                self._held.add(op.item.id)
-            seen.add(op.item.id)
+            if isinstance(op, _Claim):
+                self._resolve_claim(op, applied.claims[op.item.id], again=op.item.id in seen)
+                seen.add(op.item.id)
+                continue
+            if isinstance(op, _Heartbeat):
+                value = op.item.id in applied.beating
+            else:
+                # Повторный release того же Item в пачке уже ничего не отпускает.
+                value = op.item.id in applied.released and op.item.id not in released
+                released.add(op.item.id)
+            if not value or isinstance(op, _Release):
+                self._held.discard(op.item.id)
             if not op.future.done():
-                op.future.set_result(result)
+                op.future.set_result(value)
+
+    def _resolve_claim(self, op: _Claim, result: ClaimResult, *, again: bool) -> None:
+        if again and result.run:
+            # Второй claim того же Item в одной транзакции — дубль доставки.
+            result = ClaimResult(
+                outcome=ClaimOutcome.DUPLICATE, attempt=result.attempt, depth=result.depth
+            )
+        elif result.run:
+            self._held.add(op.item.id)
+        if not op.future.done():
+            op.future.set_result(result)
 
     def _notify(self, items: int, duration: float, applied: _Applied) -> None:
         # Исключение наблюдателя не должно ломать учёт: только лог.
