@@ -77,6 +77,18 @@ async def test_view_uses_one_statement_independent_of_tree_size(env: Env, childr
     assert len(statements) == 1
 
 
+async def test_summaries_read_multiple_trees_in_one_statement(env: Env) -> None:
+    first, _ = await tree(env, children=1)
+    second, _ = await tree(env, children=2)
+
+    with statements_of(env) as statements:
+        summaries = await reader(env).summaries([first, second], next_seq=True)
+
+    assert set(summaries) == {first, second}
+    assert {summary.seq for summary in summaries.values()} == {1}
+    assert len(statements) == 1
+
+
 async def test_view_aggregates_counters_metrics_feeds_and_leases(env: Env) -> None:
     async with env.transaction() as conn:
         root = await env.producer.create_root(conn, RootSpec(kind="pipeline", key="p:1"))

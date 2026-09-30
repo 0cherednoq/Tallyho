@@ -18,7 +18,7 @@ from tallyho.model.views import BatchSummary, BatchView, InFlightItem, ItemView
 from tallyho.storage.now import sql_now
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Mapping
+    from collections.abc import AsyncIterator, Iterable, Mapping
 
     from sqlalchemy import RowMapping
     from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
@@ -157,13 +157,43 @@ class Reads:
 
         Returns:
             The requested summary and its descendants.
+
+        Raises:
+            BatchPurged: The batch is no longer present.
         """
+        summaries = await self.summaries([batch_id])
+        try:
+            return summaries[batch_id]
+        except KeyError as exc:
+            raise BatchPurged(batch_id) from exc
+
+    async def summaries(
+        self,
+        batch_ids: Iterable[UUID],
+        *,
+        rates: Mapping[UUID, float] | None = None,
+        next_seq: bool = False,
+    ) -> dict[UUID, BatchSummary]:
+        """Read hook-shaped summaries for several batch subtrees in one statement.
+
+        Missing or concurrently purged ids are omitted. ``next_seq`` prepares
+        the target summaries for a Snapshotter CAS; descendant seq values stay
+        at their committed values.
+
+        Returns:
+            Summaries keyed by requested batch id.
+        """
+        ids = sorted(set(batch_ids))
+        if not ids:
+            return {}
         async with self.engine.connect() as conn:
-            nodes = await self._tree(conn, batch_id)
-        progress = compute_progress((node.counters for node in nodes), settings=self.progress)
+            nodes = await self._forest(conn, ids)
+        progress = compute_progress(
+            (node.counters for node in nodes), settings=self.progress, rates=rates
+        )
         children = _children(nodes)
 
-        def build(node: _Node) -> BatchSummary:
+        def build(node: _Node, *, target_id: UUID) -> BatchSummary:
             return BatchSummary(
                 id=node.id,
                 kind=node.kind,
@@ -173,14 +203,20 @@ class Reads:
                 labels=node.values,
                 metrics=node.values,
                 children={
-                    child.key or str(child.id): build(child) for child in children.get(node.id, ())
+                    child.key or str(child.id): build(child, target_id=target_id)
+                    for child in children.get(node.id, ())
                 },
-                seq=node.snap_seq,
+                seq=node.snap_seq + int(next_seq and node.id == target_id),
                 reason=node.reason,
                 finished_at=node.finished_at,
             )
 
-        return build(_target(nodes, batch_id))
+        by_id = {node.id: node for node in nodes}
+        return {
+            batch_id: build(by_id[batch_id], target_id=batch_id)
+            for batch_id in ids
+            if batch_id in by_id
+        }
 
     async def in_flight(self, batch_id: UUID, *, limit: int = 100) -> list[InFlightItem]:
         """Return at most ``limit`` current leases ordered by Item id.
@@ -362,19 +398,28 @@ class Reads:
         return child_id
 
     async def _tree(self, conn: AsyncConnection, batch_id: UUID) -> list[_Node]:
-        rows = (await conn.execute(self._tree_statement(batch_id))).mappings().all()
-        if not rows:
+        nodes = await self._forest(conn, [batch_id])
+        if not nodes:
             raise BatchPurged(batch_id)
+        return nodes
+
+    async def _forest(self, conn: AsyncConnection, batch_ids: Iterable[UUID]) -> list[_Node]:
+        ids = sorted(set(batch_ids))
+        if not ids:
+            return []
+        rows = (await conn.execute(self._forest_statement(ids))).mappings().all()
+        if not rows:
+            return []
         return [_node(row) for row in rows]
 
-    def _tree_statement(self, batch_id: UUID) -> Select[tuple[object]]:
+    def _forest_statement(self, batch_ids: list[UUID]) -> Select[tuple[object]]:
         batch = self.tables.batch
         counter = self.tables.counter
         delta = self.tables.counter_delta
         metric = self.tables.metric
         feed = self.tables.feed
         lease = self.tables.lease
-        root_id = select(batch.c.root_id).where(batch.c.id == batch_id).scalar_subquery()
+        root_ids = select(batch.c.root_id).where(batch.c.id.in_(batch_ids))
 
         def counter_sum(column: ColumnElement[int]) -> ColumnElement[int]:
             return (
@@ -428,7 +473,7 @@ class Reads:
                 values.label("values"),
                 feeds.label("fed_by"),
             )
-            .where(batch.c.root_id == root_id)
+            .where(batch.c.root_id.in_(root_ids))
             .order_by(batch.c.id)
         )
         return cast("Select[tuple[object]]", statement)
