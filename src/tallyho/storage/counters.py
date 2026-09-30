@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING, Final, TypeVar
 
 from sqlalchemy import (
     BigInteger,
+    SmallInteger,
     Uuid,
     any_,
     cast,
@@ -32,14 +33,17 @@ from sqlalchemy import (
     literal_column,
     select,
     true,
+    update,
 )
 from sqlalchemy.dialects.postgresql import ARRAY, insert
+
+from tallyho.model.states import TERMINAL_THRESHOLD, ItemState
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Iterator, Mapping
     from uuid import UUID
 
-    from sqlalchemy import ColumnElement
+    from sqlalchemy import ColumnElement, Select
     from sqlalchemy.ext.asyncio import AsyncConnection
 
     from tallyho.storage.tables import Tables
@@ -53,6 +57,7 @@ __all__ = [
     "fold_deltas",
     "insert_delta",
     "read_counters",
+    "reconcile",
     "upsert_slots",
 ]
 
@@ -242,6 +247,9 @@ _DELTA_OVERFLOW = "th_counter_delta хранит только поля DELTA_FIE
 
 _ZERO: Final = literal_column("0", BigInteger())
 
+_DERIVED_FIELDS: Final = ("total", "ok", "skip", "error", "cancelled", "w_total", "w_done")
+"""Счётчики, которые :func:`reconcile` выводит из строк ``th_item``."""
+
 _Row = TypeVar("_Row")
 
 
@@ -273,6 +281,15 @@ async def read_counters(
     ids = sorted(set(batch_ids))
     if not ids:
         return {}
+    result = await conn.execute(_totals_select(tables, ids))
+    totals: dict[UUID, CounterTotals] = {}
+    for row in result.mappings():
+        values: dict[str, int] = {name: row[name] for name in COUNTER_FIELDS}
+        totals[row["batch_id"]] = CounterTotals(**values)
+    return totals
+
+
+def _totals_select(tables: Tables, ids: list[UUID]) -> Select[*tuple[object, ...]]:
     counter = tables.counter
     delta = tables.counter_delta
     b = func.unnest(literal(ids, ARRAY(Uuid()))).table_valued("batch_id").render_derived("b")
@@ -291,13 +308,7 @@ async def read_counters(
         (c.c[name] + d.c[name] if name in DELTA_FIELDS else c.c[name]).label(name)
         for name in COUNTER_FIELDS
     )
-    stmt = select(*columns).select_from(b.join(c, true()).join(d, true()))
-    result = await conn.execute(stmt)
-    totals: dict[UUID, CounterTotals] = {}
-    for row in result.mappings():
-        values: dict[str, int] = {name: row[name] for name in COUNTER_FIELDS}
-        totals[row["batch_id"]] = CounterTotals(**values)
-    return totals
+    return select(*columns).select_from(b.join(c, true()).join(d, true()))
 
 
 async def upsert_slots(
@@ -314,19 +325,25 @@ async def upsert_slots(
         tables: Таблицы установки.
         deltas: Приращения по ключу ``(batch_id, slot)``.
     """
-    counter = tables.counter
-    rows = [
+    rows: list[dict[str, object]] = [
         {"batch_id": key[0], "slot": key[1], **deltas[key].as_dict()}
         for key in sorted(deltas)
         if not deltas[key].is_zero
     ]
     for chunk in _chunks(rows):
-        stmt = insert(counter).values(chunk)
-        stmt = stmt.on_conflict_do_update(
-            index_elements=[counter.c.batch_id, counter.c.slot],
-            set_={name: counter.c[name] + stmt.excluded[name] for name in COUNTER_FIELDS},
-        )
-        _ = await conn.execute(stmt)
+        await _upsert_rows(conn, tables, chunk)
+
+
+async def _upsert_rows(
+    conn: AsyncConnection, tables: Tables, rows: list[dict[str, object]]
+) -> None:
+    counter = tables.counter
+    stmt = insert(counter).values(rows)
+    stmt = stmt.on_conflict_do_update(
+        index_elements=[counter.c.batch_id, counter.c.slot],
+        set_={name: counter.c[name] + stmt.excluded[name] for name in COUNTER_FIELDS},
+    )
+    _ = await conn.execute(stmt)
 
 
 async def insert_delta(
@@ -410,3 +427,98 @@ async def fold_deltas(
         values: dict[str, int] = {name: row[name] for name in DELTA_FIELDS}
         folded[row["batch_id"]] = CounterDelta(**values)
     return folded
+
+
+def _state_is(value: int) -> ColumnElement[int]:
+    # Литерал, а не bind-параметр (D-020).
+    return literal_column(str(value), SmallInteger())
+
+
+async def reconcile(conn: AsyncConnection, tables: Tables, batch_id: UUID) -> CounterDelta | None:
+    """Исправить дрейф счётчиков батча по фактическим строкам ``th_item`` (COUNTERS §3.4).
+
+    Под ``FOR UPDATE`` строки батча одним запросом (один снимок) считаются
+    ``count(*)``/``sum(weight)`` Items по состояниям и текущая сумма
+    ``th_counter + th_counter_delta``. Любая наша транзакция меняет Items и
+    счётчики атомарно, поэтому в одном снимке они согласованы, а разница —
+    это дрейф. Он прибавляется к слоту 0, затем остальные слоты переносятся в
+    слот 0 и обнуляются. Всё делается приращениями: параллельные завершения не
+    теряются, а несвёрнутые дельты остаются в ``th_counter_delta``.
+
+    Исправляются ``total, ok, skip, error, cancelled, w_total, w_done``;
+    остальные счётчики из Items не выводятся и только переносятся в слот 0.
+
+    Args:
+        conn: Соединение в открытой транзакции.
+        tables: Таблицы установки.
+        batch_id: Батч.
+
+    Returns:
+        Найденный дрейф (факт минус счётчики) или ``None``, если батча нет.
+    """
+    batch = tables.batch
+    found = await conn.scalar(select(batch.c.id).where(batch.c.id == batch_id).with_for_update())
+    if found is None:
+        return None
+    drift = await _drift(conn, tables, batch_id)
+    await _upsert_rows(conn, tables, [{"batch_id": batch_id, "slot": 0, **drift.as_dict()}])
+    await _collapse_into_slot_zero(conn, tables, batch_id)
+    return drift
+
+
+async def _drift(conn: AsyncConnection, tables: Tables, batch_id: UUID) -> CounterDelta:
+    item = tables.item
+    state = item.c.state
+    done_weight = func.sum(item.c.weight).filter(state >= _state_is(TERMINAL_THRESHOLD))
+    truth = (
+        select(
+            func.count().label("t_total"),
+            func.count().filter(state == _state_is(ItemState.OK)).label("t_ok"),
+            func.count().filter(state == _state_is(ItemState.SKIP)).label("t_skip"),
+            func.count().filter(state == _state_is(ItemState.ERROR)).label("t_error"),
+            func.count().filter(state == _state_is(ItemState.CANCELLED)).label("t_cancelled"),
+            _sum(item.c.weight).label("t_w_total"),
+            cast(func.coalesce(done_weight, _ZERO), BigInteger).label("t_w_done"),
+        )
+        .where(item.c.batch_id == batch_id)
+        .subquery("t")
+    )
+    observed = _totals_select(tables, [batch_id]).subquery("o")
+    stmt = select(truth, observed).select_from(truth.join(observed, true()))
+    row = (await conn.execute(stmt)).mappings().one()
+    fact: dict[str, int] = {name: row[f"t_{name}"] for name in _DERIVED_FIELDS}
+    seen: dict[str, int] = {name: row[name] for name in _DERIVED_FIELDS}
+    return CounterDelta(**{name: fact[name] - seen[name] for name in _DERIVED_FIELDS})
+
+
+async def _collapse_into_slot_zero(conn: AsyncConnection, tables: Tables, batch_id: UUID) -> None:
+    # Слот 0 уже заблокирован upsert'ом; остальные — по возрастанию slot.
+    counter = tables.counter
+    others = (
+        await conn.execute(
+            select(counter)
+            .where(counter.c.batch_id == batch_id, counter.c.slot != 0)
+            .order_by(counter.c.slot)
+            .with_for_update()
+        )
+    ).mappings()
+    moved = CounterDelta()
+    slots: list[int] = []
+    for row in others:
+        values: dict[str, int] = {name: row[name] for name in ("slot", *COUNTER_FIELDS)}
+        slots.append(values.pop("slot"))
+        moved += CounterDelta(**values)
+    if not slots:
+        return
+    zeroed = dict.fromkeys(COUNTER_FIELDS, 0)
+    _ = await conn.execute(
+        update(counter)
+        .where(counter.c.batch_id == batch_id, counter.c.slot.in_(slots))
+        .values(zeroed)
+    )
+    amounts = moved.as_dict()
+    _ = await conn.execute(
+        update(counter)
+        .where(counter.c.batch_id == batch_id, counter.c.slot == 0)
+        .values({name: counter.c[name] + amounts[name] for name in COUNTER_FIELDS})
+    )
