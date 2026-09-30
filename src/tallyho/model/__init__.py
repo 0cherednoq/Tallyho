@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from tallyho.model.calls import TaskCall
 from tallyho.model.errors import (
     BatchPurged,
     ConcurrentModification,
@@ -16,6 +17,14 @@ from tallyho.model.errors import (
     TallyhoError,
     UnsupportedOption,
 )
+from tallyho.model.policy import (
+    FailurePolicy,
+    OutcomeCounts,
+    PolicyAction,
+    PolicyBreach,
+    PolicyKind,
+    PolicyVerdict,
+)
 from tallyho.model.states import (
     BatchState,
     CancelReason,
@@ -24,24 +33,43 @@ from tallyho.model.states import (
     OutboxKind,
     ResultClass,
 )
+from tallyho.model.views import (
+    BatchSummary,
+    BatchView,
+    InFlightItem,
+    ItemView,
+    Progress,
+)
 
 __all__ = [
     "BatchPurged",
     "BatchState",
+    "BatchSummary",
+    "BatchView",
     "CancelReason",
     "ConcurrentModification",
     "ConfigurationError",
     "DownstreamFinalized",
+    "FailurePolicy",
     "HookMissingError",
     "HookTransactionError",
+    "InFlightItem",
     "InvalidStateError",
     "ItemState",
+    "ItemView",
     "NotFoundError",
     "OnFeederFailed",
     "OutboxKind",
+    "OutcomeCounts",
+    "PolicyAction",
+    "PolicyBreach",
+    "PolicyKind",
+    "PolicyVerdict",
+    "Progress",
     "ResultClass",
     "SealError",
     "SpawnTargetError",
     "TallyhoError",
+    "TaskCall",
     "UnsupportedOption",
 ]
