@@ -17,7 +17,13 @@ from tallyho.hooks.registry import HookRegistry
 from tallyho.model.calls import TaskCall
 from tallyho.model.errors import ConfigurationError
 from tallyho.model.policy import FailurePolicy
-from tallyho.model.states import BatchState, CancelReason, ItemState, OutboxKind
+from tallyho.model.states import (
+    BatchState,
+    CancelReason,
+    ItemState,
+    OnFeederFailed,
+    OutboxKind,
+)
 from tallyho.protocols.clock import SystemClock
 from tallyho.protocols.observer import NullObserver
 from tallyho.storage.counters import CounterDelta, upsert_slots
@@ -306,6 +312,68 @@ async def test_child_errors_propagate_to_parent_state_but_virtual_item_is_ok(
             select(env.tables.item.c.state).where(env.tables.item.c.child_batch_id == child.id)
         )
     assert virtual_state == ItemState.OK
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        pytest.param(
+            (OnFeederFailed.SEAL, BatchState.SUCCEEDED),
+            id="seal",
+        ),
+        pytest.param(
+            (OnFeederFailed.CANCEL, BatchState.CANCELLED),
+            id="cancel",
+        ),
+    ],
+)
+async def test_completed_with_errors_feeder_honors_failure_behavior(
+    env: Env,
+    registry: HookRegistry,
+    case: tuple[OnFeederFailed, BatchState],
+) -> None:
+    behavior, expected = case
+    async with env.transaction() as conn:
+        root = await env.producer.create_root(conn, RootSpec(kind="pipeline"))
+        source = await env.producer.create_sub_batch(
+            conn,
+            root.id,
+            SubBatchSpec(key="source"),
+        )
+        downstream = await env.producer.create_sub_batch(
+            conn,
+            root.id,
+            SubBatchSpec(
+                key="downstream",
+                fed_by=(source.id,),
+                on_feeder_failed=behavior,
+            ),
+        )
+        inserted = await env.producer.add_items(
+            conn,
+            source.id,
+            [TaskCall(task_name="source", args=(), kwargs={})],
+        )
+        _ = await env.producer.seal(conn, source.id)
+        assert inserted.found == 1
+        task_id = await conn.scalar(
+            select(env.tables.item.c.id).where(env.tables.item.c.batch_id == source.id)
+        )
+        assert task_id is not None
+        _ = await conn.execute(
+            update(env.tables.item)
+            .where(env.tables.item.c.id == task_id)
+            .values(state=int(ItemState.ERROR), label="rejected", finished_at=NOW)
+        )
+        await upsert_slots(
+            conn,
+            env.tables,
+            {(source.id, 9): CounterDelta(error=1, w_done=1)},
+        )
+
+    assert await finalizer(env, registry).try_finalize(source.id)
+    assert (await env.batch(source.id))["state"] == BatchState.COMPLETED_WITH_ERRORS
+    assert (await env.batch(downstream.id))["state"] == expected
 
 
 async def test_two_sources_racing_always_close_stage(env: Env, registry: HookRegistry) -> None:

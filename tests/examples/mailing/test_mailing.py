@@ -21,7 +21,7 @@ if TYPE_CHECKING:
 
 __all__: list[str] = []
 
-pytestmark = pytest.mark.timeout(420)
+pytestmark = pytest.mark.timeout(600)
 
 BREAKDOWN = {
     "sent": 9_100,

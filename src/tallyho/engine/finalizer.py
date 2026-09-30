@@ -435,7 +435,15 @@ class Finalizer:
                 select(
                     func.count().filter(batch.c.state < TERMINAL_THRESHOLD).label("active"),
                     func.count()
-                    .filter(batch.c.state.in_((int(BatchState.FAILED), int(BatchState.CANCELLED))))
+                    .filter(
+                        batch.c.state.in_(
+                            (
+                                int(BatchState.COMPLETED_WITH_ERRORS),
+                                int(BatchState.FAILED),
+                                int(BatchState.CANCELLED),
+                            )
+                        )
+                    )
                     .label("failed"),
                 )
                 .select_from(feed.join(batch, batch.c.id == feed.c.feeder_id))
