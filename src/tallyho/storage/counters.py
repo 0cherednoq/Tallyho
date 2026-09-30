@@ -53,11 +53,13 @@ __all__ = [
     "DELTA_FIELDS",
     "CounterDelta",
     "CounterTotals",
+    "MetricKey",
     "SlotKey",
     "fold_deltas",
     "insert_delta",
     "read_counters",
     "reconcile",
+    "upsert_metrics",
     "upsert_slots",
 ]
 
@@ -240,6 +242,9 @@ class CounterTotals:
 SlotKey = tuple["UUID", int]
 """Ключ строки ``th_counter``: ``(batch_id, slot)``."""
 
+MetricKey = tuple["UUID", str, int]
+"""Ключ строки ``th_metric``: ``(batch_id, name, slot)``."""
+
 _CHUNK: Final = 1000
 """Строк в одном многострочном INSERT: до 13 параметров на строку при лимите 32 767."""
 
@@ -376,6 +381,35 @@ async def insert_delta(
         rows.append(row)
     for chunk in _chunks(rows):
         _ = await conn.execute(insert(tables.counter_delta).values(chunk))
+
+
+async def upsert_metrics(
+    conn: AsyncConnection, tables: Tables, increments: Mapping[MetricKey, int]
+) -> None:
+    """Прибавить значения к строкам ``th_metric`` (labels и метрики, §9.2 шаг 9).
+
+    Как и :func:`upsert_slots`: строка создаётся при первом обращении, строки
+    блокируются в порядке ``(batch_id, name, slot)`` — после ``th_counter``
+    в порядке блокировок транзакции. Нулевые приращения пропускаются.
+
+    Args:
+        conn: Соединение в открытой транзакции.
+        tables: Таблицы установки.
+        increments: Приращения по ключу ``(batch_id, name, slot)``.
+    """
+    metric = tables.metric
+    rows: list[dict[str, object]] = [
+        {"batch_id": key[0], "name": key[1], "slot": key[2], "value": increments[key]}
+        for key in sorted(increments)
+        if increments[key]
+    ]
+    for chunk in _chunks(rows):
+        stmt = insert(metric).values(chunk)
+        stmt = stmt.on_conflict_do_update(
+            index_elements=[metric.c.batch_id, metric.c.name, metric.c.slot],
+            set_={"value": metric.c.value + stmt.excluded.value},
+        )
+        _ = await conn.execute(stmt)
 
 
 async def fold_deltas(
