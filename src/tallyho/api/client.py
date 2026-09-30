@@ -6,12 +6,15 @@ from dataclasses import dataclass, replace
 from datetime import timedelta
 from typing import TYPE_CHECKING, final
 
+from tallyho.api.batch import BatchBuilder, BatchHandle
 from tallyho.engine.public import (
+    BatchDefinition,
     EngineSettings,
     create_engine_facade,
 )
 from tallyho.hooks.registry import HookRegistry, import_hook_modules
 from tallyho.model.errors import ConfigurationError
+from tallyho.model.policy import FailurePolicy as FailurePolicyModel
 from tallyho.model.progress import ProgressSettings
 from tallyho.protocols.clock import SystemClock
 from tallyho.protocols.ids import UuidV7Factory
@@ -19,11 +22,14 @@ from tallyho.protocols.observer import NullObserver
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable
+    from datetime import datetime
+    from uuid import UUID
 
-    from sqlalchemy.ext.asyncio import AsyncEngine
+    from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, AsyncSession
 
     from tallyho.engine.public import EngineFacade, MaintenanceRunner
     from tallyho.hooks.registry import FinalizedT, PolicyBreachT, ProgressT
+    from tallyho.model.calls import TaskCall
     from tallyho.protocols.broker import Dispatcher
     from tallyho.protocols.clock import Clock
     from tallyho.protocols.ids import IdFactory
@@ -34,6 +40,13 @@ __all__ = ["Settings", "Tallyho"]
 
 _ALREADY_INSTALLED = "broker adapter уже установлен"
 _NOT_INSTALLED = "сначала вызовите Tallyho.install(adapter)"
+
+
+class _Default:
+    pass
+
+
+_DEFAULT = _Default()
 
 
 def _positive(name: str, value: object) -> None:
@@ -176,6 +189,8 @@ class Settings:
 class Tallyho:
     """Одна установка tallyho поверх пользовательского ``AsyncEngine``."""
 
+    FailurePolicy = FailurePolicyModel
+
     def __init__(  # ruff: ignore[too-many-arguments]  # публичный конструктор задан PLAN T6.1
         self,
         engine: AsyncEngine,
@@ -255,6 +270,89 @@ class Tallyho:
         """
         _ = self.maintenance()
         return await self._engine.run_maintenance_once()
+
+    def batch(  # ruff: ignore[too-many-arguments]  # публичный API задан ARCHITECTURE §11.2
+        self,
+        kind: str,
+        *,
+        key: str | None = None,
+        start_at: datetime | None = None,
+        on_succeeded: TaskCall | None = None,
+        on_completed_with_errors: TaskCall | None = None,
+        on_failed: TaskCall | None = None,
+        on_cancelled: TaskCall | None = None,
+        on_finalized_task: TaskCall | None = None,
+        failure_policy: FailurePolicyModel | None = None,
+        max_in_flight: int | None = None,
+        expected_total: int | None = None,
+        max_items: int | _Default | None = _DEFAULT,
+        deadline: datetime | timedelta | None = None,
+        retention: timedelta | _Default | None = _DEFAULT,
+        release_required: bool = False,
+        session: AsyncSession | AsyncConnection | None = None,
+    ) -> BatchBuilder:
+        """Создать транзакционный builder корневого батча.
+
+        Returns:
+            Builder, который нужно использовать как ``async with``.
+
+        Raises:
+            ConfigurationError: broker adapter ещё не установлен.
+        """
+        adapter = self._adapter
+        if adapter is None:
+            raise ConfigurationError(_NOT_INSTALLED)
+        callbacks = {
+            name: call
+            for name, call in {
+                "on_succeeded": on_succeeded,
+                "on_completed_with_errors": on_completed_with_errors,
+                "on_failed": on_failed,
+                "on_cancelled": on_cancelled,
+                "on_finalized_task": on_finalized_task,
+            }.items()
+            if call is not None
+        }
+        effective_max_items = (
+            self.settings.max_items if isinstance(max_items, _Default) else max_items
+        )
+        effective_retention = (
+            self.settings.retention if isinstance(retention, _Default) else retention
+        )
+        return BatchBuilder(
+            self._engine,
+            adapter,
+            BatchDefinition(
+                kind=kind,
+                key=key,
+                start_at=start_at,
+                deadline=deadline,
+                callbacks=callbacks,
+                failure_policy=failure_policy,
+                max_in_flight=max_in_flight,
+                expected_total=expected_total,
+                max_items=effective_max_items,
+                retention=effective_retention,
+                release_required=release_required,
+            ),
+            _target=session,
+        )
+
+    def handle(self, batch_id: UUID) -> BatchHandle:
+        """Создать handle по известному идентификатору.
+
+        Returns:
+            Лёгкая ссылка без обращения к БД.
+        """
+        return BatchHandle(self._engine, batch_id)
+
+    async def find(self, kind: str, key: str) -> BatchHandle:
+        """Найти корневой батч по идемпотентному ключу.
+
+        Returns:
+            Handle найденного корня.
+        """
+        return self.handle(await self._engine.find(kind, key))
 
     def on_finalized(self, kind: str) -> Callable[[FinalizedT], FinalizedT]:
         """Зарегистрировать хук финализации.

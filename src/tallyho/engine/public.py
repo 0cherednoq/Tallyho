@@ -3,15 +3,23 @@
 from __future__ import annotations
 
 import importlib
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Protocol, cast
 
-if TYPE_CHECKING:
-    from datetime import timedelta
+from tallyho.model.states import OnFeederFailed
 
-    from sqlalchemy.ext.asyncio import AsyncEngine
+if TYPE_CHECKING:
+    from collections.abc import AsyncIterator, Mapping, Sequence
+    from contextlib import AbstractAsyncContextManager
+    from datetime import datetime, timedelta
+    from uuid import UUID
+
+    from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, AsyncSession
 
     from tallyho.hooks.registry import HookRegistry
+    from tallyho.model.calls import TaskCall
+    from tallyho.model.policy import FailurePolicy
+    from tallyho.model.views import BatchView, InFlightItem, ItemView
     from tallyho.protocols.broker import Dispatcher
     from tallyho.protocols.clock import Clock
     from tallyho.protocols.ids import IdFactory
@@ -19,11 +27,67 @@ if TYPE_CHECKING:
     from tallyho.protocols.serialization import Serializer
 
 __all__ = [
+    "BatchDefinition",
+    "BatchReference",
+    "BatchWriter",
     "EngineFacade",
     "EngineSettings",
     "MaintenanceRunner",
     "create_engine_facade",
 ]
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class BatchDefinition:
+    """Чистый DTO корня или под-батча для API → engine."""
+
+    kind: str | None = None
+    key: str | None = None
+    start_at: datetime | None = None
+    deadline: datetime | timedelta | None = None
+    callbacks: Mapping[str, TaskCall] = field(default_factory=dict[str, "TaskCall"])
+    failure_policy: FailurePolicy | None = None
+    max_in_flight: int | None = None
+    expected_total: int | None = None
+    max_items: int | None = None
+    retention: timedelta | None = None
+    release_required: bool = False
+    fed_by: Sequence[UUID] = ()
+    on_feeder_failed: OnFeederFailed = OnFeederFailed.SEAL
+    max_depth: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class BatchReference:
+    """Идентификаторы созданного батча."""
+
+    id: UUID
+    root_id: UUID
+    created: bool
+
+
+class BatchWriter(Protocol):
+    """Транзакционный writer, которым пользуется BatchBuilder."""
+
+    async def create_root(self, spec: BatchDefinition) -> BatchReference:
+        """Создать или найти корневой батч."""
+        ...
+
+    async def create_child(self, parent_id: UUID, spec: BatchDefinition) -> BatchReference:
+        """Создать или найти дочерний батч."""
+        ...
+
+    async def add(self, batch_id: UUID, calls: Sequence[TaskCall]) -> None:
+        """Добавить подготовленные вызовы."""
+        ...
+
+    async def expect(self, batch_id: UUID, total: int) -> None:
+        """Повысить ожидаемое число Items."""
+        ...
+
+    async def seal(self, batch_id: UUID) -> None:
+        """Закрыть батч."""
+        ...
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -83,6 +147,76 @@ class EngineFacade(Protocol):
 
     async def run_maintenance_once(self) -> object:
         """Выполнить один проход maintenance."""
+        ...
+
+    def writer(
+        self, target: AsyncSession | AsyncConnection | None
+    ) -> AbstractAsyncContextManager[BatchWriter]:
+        """Открыть writer в своей или пользовательской транзакции."""
+        ...
+
+    async def view(self, batch_id: UUID) -> BatchView:
+        """Прочитать снимок дерева."""
+        ...
+
+    async def in_flight(self, batch_id: UUID, limit: int) -> list[InFlightItem]:
+        """Прочитать выполняющиеся Items."""
+        ...
+
+    def items(self, batch_id: UUID, label: str) -> AsyncIterator[ItemView]:
+        """Поток отмеченных Items."""
+        ...
+
+    async def find(self, kind: str, key: str) -> UUID:
+        """Найти корень по ключу."""
+        ...
+
+    async def child(self, batch_id: UUID, key: str) -> UUID:
+        """Найти прямого потомка."""
+        ...
+
+    def watch(self, batch_id: UUID) -> AsyncIterator[BatchView]:
+        """Следить за снимками батча."""
+        ...
+
+    async def pause(self, target: AsyncSession | AsyncConnection | None, batch_id: UUID) -> None:
+        """Поставить дерево на паузу."""
+        ...
+
+    async def resume(self, target: AsyncSession | AsyncConnection | None, batch_id: UUID) -> None:
+        """Снять паузу."""
+        ...
+
+    async def cancel(self, target: AsyncSession | AsyncConnection | None, batch_id: UUID) -> None:
+        """Запросить отмену."""
+        ...
+
+    async def reschedule(
+        self,
+        target: AsyncSession | AsyncConnection | None,
+        batch_id: UUID,
+        start_at: datetime,
+    ) -> int:
+        """Перенести ожидающие Items."""
+        ...
+
+    async def retry_failed(
+        self,
+        target: AsyncSession | AsyncConnection | None,
+        batch_id: UUID,
+        labels: Sequence[str] | None,
+    ) -> int:
+        """Повторить ошибочные Items."""
+        ...
+
+    async def retry_finalize(
+        self, target: AsyncSession | AsyncConnection | None, batch_id: UUID
+    ) -> None:
+        """Повторить финализацию."""
+        ...
+
+    async def release(self, target: AsyncSession | AsyncConnection | None, batch_id: UUID) -> None:
+        """Разрешить очистку дерева."""
         ...
 
 
