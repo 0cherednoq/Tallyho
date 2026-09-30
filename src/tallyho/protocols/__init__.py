@@ -5,6 +5,7 @@ from __future__ import annotations
 from tallyho.protocols.broker import DeadLetters, Dispatcher, Message, Runtime, Verdict
 from tallyho.protocols.clock import Clock, SystemClock
 from tallyho.protocols.ids import IdFactory, UuidV7Factory
+from tallyho.protocols.observer import NullObserver, Observer
 from tallyho.protocols.serialization import (
     CallArgs,
     JsonSerializer,
@@ -22,6 +23,8 @@ __all__ = [
     "IdFactory",
     "JsonSerializer",
     "Message",
+    "NullObserver",
+    "Observer",
     "PayloadCodec",
     "Runtime",
     "SerializationError",
