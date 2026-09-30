@@ -6,7 +6,7 @@
 ## Текущее состояние
 
 * **Ветка:** `impl/v1`
-* **Текущая волна:** T4.7
+* **Текущая волна:** T4.8
 * **Последний зелёный коммит:** 5ae8fc1
 
 ## Задачи
@@ -34,7 +34,7 @@
 | T4.5 | Путь B: complete_in и свёртка | T4.4, Fix-1 | done | acd5006 |
 | T4.6 | Политики ошибок, on_policy_breach | T4.4 | done | ea67545 |
 | T4.7 | Операции над деревом | T4.6 | done | 5ae8fc1 |
-| T4.8 | Sweeper | T4.7 | todo | |
+| T4.8 | Sweeper | T4.7 | in_progress | |
 | T4.9 | Snapshotter | T4.8 | todo | |
 | T4.10 | Maintenance, лидерство, watch | T4.9 | todo | |
 | T4.11 | Чтение: view, in_flight, items, find | T4.4 | done | 8b45a88 |
@@ -72,6 +72,9 @@
 - Отклонения от плана/доков: … (или «нет»)
 - Узнали / на что обратить внимание дальше: …
 -->
+
+### 2026-09-30 · T4.8 · in_progress · —
+- Начата реализация коротких восстановительных проходов Sweeper после зелёной T4.7.
 
 ### 2026-09-30 · T4.7 · done · 5ae8fc1
 - Сделано: `engine.operations` выполняет `pause`, `resume`, `reschedule`, `cancel`, `retry_failed`, `retry_finalize` и `release` в транзакции пользователя; каскад блокируется по id, outbox обрабатывается чанками, post-commit только подталкивает relay/finalizer.
