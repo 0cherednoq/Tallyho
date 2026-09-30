@@ -10,6 +10,9 @@ dist/
 .mypy_cache/
 .ruff_cache/
 .pytest_cache/
+.work-tmp/
+.test-elevated-*/
+.gate-tmp-*/
 .hypothesis/
 .import_linter_cache/
 .coverage
