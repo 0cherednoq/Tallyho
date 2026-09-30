@@ -32,6 +32,7 @@ TABLE_SUFFIXES = (
     "metric",
     "item_mark",
     "expiry",
+    "window",
     "meta",
 )
 
@@ -127,6 +128,7 @@ def test_mutable_index_rule_catches_violations() -> None:
         ("item", {"fillfactor": 85}),
         ("lease", AGGRESSIVE_AUTOVACUUM),
         ("outbox", AGGRESSIVE_AUTOVACUUM),
+        ("window", AGGRESSIVE_AUTOVACUUM),
         ("counter_delta", AGGRESSIVE_AUTOVACUUM),
         ("counter", HOT_TABLE),
         ("metric", HOT_TABLE),

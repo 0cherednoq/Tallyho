@@ -138,6 +138,7 @@ def _installation(schema: str | None, prefix: str) -> _Installation:
         source.metric,
         source.item_mark,
         source.expiry,
+        source.window,
     ]
     if schema is not None:
         target = MetaData()
