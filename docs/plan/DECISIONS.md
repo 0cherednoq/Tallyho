@@ -75,3 +75,21 @@ JSON не подходит: он теряет bytes, datetime и Decimal, пре
 
 ## D-020 · Предикаты partial-индексов — литералы · ACCEPTED (T2.1)
 Индекс sweeper'а по `th_batch.updated_at` построен с условием `state < 10` (активные). Индексы дедлайнов и снимков — `state IN (0, 1)`. **В запросах горячего пути условие по `state` пишется литералом, а не bind-параметром.** Иначе после пяти выполнений asyncpg переходит на generic plan и перестаёт брать partial-индекс. Условие запроса должно логически следовать из предиката индекса. Добавлен индекс `th_expiry(expires_at)`, которого нет в §5.2.
+
+## D-021 · `sql_now(clock)` принимает структурный `NowSource` · ACCEPTED (автономно, пересмотреть) (T2.3)
+storage не импортирует `tallyho.protocols`, поэтому в `storage/now.py` объявлен минимальный Protocol с методом `now() -> datetime | None`, и `Clock` ему структурно соответствует. Модуль назван `now.py`, а не `time.py`: ruff A005 запрещает затенять stdlib.
+
+## D-022 · `after_commit` на AsyncConnection срабатывает перед COMMIT · ACCEPTED (автономно, пересмотреть) (T2.3)
+У SQLAlchemy нет события «после COMMIT» для соединения. Для AsyncSession колбэк вызывается после реального COMMIT корневой транзакции, для AsyncConnection — перед DBAPI-коммитом (возможен ложный вызов). Колбэки — только подсказки (kick relay или fold): потребитель перечитывает БД, а страховку дают relay scan и sweeper. Колбэк синхронный и быстрый (`Event.set`, `put_nowait`). Откат savepoint отбрасывает колбэки, зарегистрированные внутри него.
+
+## D-023 · Повтор своих транзакций · ACCEPTED (автономно, пересмотреть) (T2.3)
+`run_transaction(engine, work)`: `RetryPolicy` — 5 попыток, base 50 мс, cap 2 с, equal jitter; повтор на `40001/40P01/55P03`. Когда попытки кончились, бросается `ConcurrentModification from exc`. `statement_timeout` по умолчанию 30 с (в §15 не задан), `lock_timeout` 5 с. `work` вызывается заново на каждой попытке, поэтому побочные эффекты вне БД в нём запрещены. `own_transaction` делает одну попытку.
+
+## D-024 · Математика прогресса: вход, виртуальные Items, ETA · ACCEPTED (автономно, пересмотреть) (T1.3)
+Вход `compute_progress` — плоский список `NodeCounters`, связи через `parent_id` и `fed_by`. Узел закрыт для правила `expected`, если состояние не `open`. `Progress.final` = терминальное состояние. Оценка Кнута округляется целочисленно. **Виртуальный Item под-батча вставляется с `weight=0`**, и из `found`/`expected` родителя вычитается по одному виртуальному Item на ребёнка. ETA = `(expected − done) / EMA`, вес `1 − exp(−Δt / eta_window)`; состояние EMA хранит вызывающий (Snapshotter, `watch`). ETA узла с детьми — максимум по поддереву.
+
+## D-025 · Установка схемы: операции без bind-параметров, advisory lock по схеме · ACCEPTED (автономно, пересмотреть) (T2.2)
+`migration_statements()` — единый источник операций для `migrate()` и `tallyho.storage.alembic.upgrade(op, version=...)`. В операциях нет bind-параметров, иначе не работает offline Alembic (`--sql`). Advisory lock берётся по схеме (blake2b), а не по префиксу, и до `SET LOCAL lock_timeout`. `migrate` сам создаёт схему и принимает `schema=None` (search_path). **Схема v1 строится из текущего `build_metadata`: при первом изменении `tables.py` заморозить операции v1 и добавить версию 2.** Модуль Alembic — `tallyho.storage.alembic` (ARCHITECTURE §11.1 исправлен, 8d43fd4).
+
+## D-026 · Имена хуков в `th_batch.hooks` · ACCEPTED (автономно, пересмотреть) (T3.1)
+В `th_batch.hooks` пишутся `finalized`, `progress`, `policy_breach` (`HookName`). Значение `progress` совпадает с `storage.tables.PROGRESS_HOOK`, это закреплено тестом. Наличие хука в процессе проверяет `HookRegistry.ensure(kind, row.hooks)` → `HookMissingError("on_<name>")`. У реестра нет глобального состояния: `Tallyho` держит свой экземпляр.

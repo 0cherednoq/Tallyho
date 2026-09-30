@@ -6,8 +6,8 @@
 ## Текущее состояние
 
 * **Ветка:** `impl/v1`
-* **Текущая волна:** 3 — T1.3, T2.2, T2.3, T3.1
-* **Последний зелёный коммит:** 40241bb
+* **Текущая волна:** 4 — T2.4 (единственная доступная: T4.1 ждёт её)
+* **Последний зелёный коммит:** 8d43fd4
 
 ## Задачи
 
@@ -17,13 +17,13 @@
 | T0.2 | Инфраструктура тестов (схема на тест, xdist) | T0.1 | done | 25fcbe6..81c68c3 (5), merge 69a40fa |
 | T1.1 | Перечисления состояний и иерархия ошибок | T0.1 | done | 7c5a33d..345efab (3), merge 0de5f86 |
 | T1.2 | Value-объекты, FailurePolicy, TaskCall | T1.1 | done | a76f6ac..b7abd3d (3), merge 13c1b02 |
-| T1.3 | Математика прогресса | T1.2 | in_progress | |
+| T1.3 | Математика прогресса | T1.2 | done | f208279..f414ece (3), merge 23f7699 |
 | T1.4 | Протоколы и базовые реализации (Clock, UUIDv7, Serializer, Observer) | T1.1 | done | c4943ae..e7334f8 (5), merge 721a192, cbd8059, 40241bb |
 | T2.1 | Таблицы и индексы | T1.1 | done | 91aa770..42f6ef3 (5), merge 1f7278a |
-| T2.2 | Миграции, установка в схему, alembic | T2.1, T0.2 | in_progress | |
-| T2.3 | Транзакции: сессия пользователя, ретраи, after_commit, HookSession | T2.1, T1.4 | in_progress | |
-| T2.4 | Запросы счётчиков, дельты, свёртка, reconcile | T2.2, T2.3 | todo | |
-| T3.1 | Реестр tx-хуков | T1.2 | in_progress | |
+| T2.2 | Миграции, установка в схему, alembic | T2.1, T0.2 | done | be7c687..09b272b (3), merge 416dc02 |
+| T2.3 | Транзакции: сессия пользователя, ретраи, after_commit, HookSession | T2.1, T1.4 | done | 171307e..f665530 (4), merge 2adeed6 |
+| T2.4 | Запросы счётчиков, дельты, свёртка, reconcile | T2.2, T2.3 | in_progress | |
+| T3.1 | Реестр tx-хуков | T1.2 | done | 27b762a..880903c (2), merge 4521aa4 |
 | T4.1 | Продюсер: батчи, под-батчи, th_feed, add, seal, expect | T2.4, T3.1 | todo | |
 | T4.2 | Relay | T4.1 | todo | |
 | T4.3a | Completer: буфер, claim/heartbeat/release | T4.2 | todo | |
@@ -71,6 +71,25 @@
 - Отклонения от плана/доков: … (или «нет»)
 - Узнали / на что обратить внимание дальше: …
 -->
+
+### 2026-09-30 · волна 4 запущена · T2.4
+- Доступна только T2.4, на ней держится вся Ф4. Волна из одного сабагента.
+
+### 2026-09-30 · волна 3 влита · T1.3, T2.2, T2.3, T3.1
+- **T1.3 · done.** `model/progress.py`: `NodeCounters`, `ProgressSettings`, `compute_progress`, `ema_rate`, `estimate_eta`. Таблица §13.3 t1–t5 воспроизведена. D-024.
+- **T2.2 · done.** `storage/migrations.py`: `migrate()` под advisory lock, `validate_prefix` и `validate_schema`; `storage/alembic.py`: `upgrade(op, version=...)`. Каталог после `migrate` совпадает с `create_all`. D-025, ARCHITECTURE §11.1 (8d43fd4).
+- **T2.3 · done.** `storage/now.py`: `sql_now`; `storage/tx.py`: `resolve_connection`, `own_transaction`, `run_transaction` с повтором, `after_commit`, `HookSession`/`hook_session`. Хелпер `tests/helpers/probe.py`. D-021…D-023.
+- **T3.1 · done.** `hooks/registry.py`: `HookRegistry`, `import_hook_modules`, `HookName`, `ensure`. D-026.
+- **Вливание:** без конфликтов, гейты после каждого вливания зелёные, 562 теста, покрытие 99,74%.
+- **Для следующих задач:**
+  - Виртуальный Item под-батча — `weight=0` (D-024, карточка T4.1 обновлена).
+  - Finalizer: `async with own_transaction(engine, TxSettings(statement_timeout=hook_timeout)) as conn, hook_session(conn) as s: await hook(s, summary)`, затем CAS в той же транзакции.
+  - `run_transaction(work)` повторяет `work` целиком, поэтому в нём нельзя делать побочные эффекты вне БД.
+  - Колбэк `after_commit` синхронный, без аргументов и быстрый. Своим транзакциям он не нужен.
+  - Snapshotter и reads строят `NodeCounters` → `compute_progress(..., settings, rates)`.
+  - Finalizer и Snapshotter перед хуком вызывают `registry.ensure(kind, batch.hooks)` → `HookMissingError` (лог + `th_hook_missing`, батч не финализировать).
+  - В сообщениях коммитов и коде не использовать `×` (RUF003). Сообщения коммитов передавать через `-m`: scratchpad общий у всех агентов.
+  - Изменение `tables.py` = новая версия миграции (D-025).
 
 ### 2026-09-30 · волна 3 запущена · T1.3, T2.2, T2.3, T3.1
 
