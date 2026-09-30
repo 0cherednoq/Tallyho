@@ -65,6 +65,12 @@ async def _state(env: Env, item_id: UUID) -> ItemState:
     return ItemState(value)
 
 
+async def spawned_task(value: int) -> None:
+    """Дочерняя async-задача для типизированного spawn."""
+    _ = value
+    await asyncio.sleep(0)
+
+
 async def test_success_hides_marker_sets_context_and_duplicate_is_noop(env: Env) -> None:
     seeded = await seed(env, 1)
     ref = seeded.refs[0]
@@ -84,7 +90,7 @@ async def test_success_hides_marker_sets_context_and_duplicate_is_noop(env: Env)
             await asyncio.sleep(0)
             calls.append((item.id(), kwargs.get("_th")))
             item.incr("rows", 2)
-            item.spawn(object(), 9)
+            item.spawn(spawned_task, 9)
             item.ok("sent", result={"value": value})
             return value + 1
 

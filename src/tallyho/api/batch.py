@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass, field, replace
 from datetime import timedelta
-from typing import TYPE_CHECKING, Self, cast
+from typing import TYPE_CHECKING, ParamSpec, Self, TypeVar, cast
 
 from tallyho.engine.public import BatchDefinition
 from tallyho.model.calls import TaskCall
@@ -15,6 +15,7 @@ from tallyho.model.states import OnFeederFailed
 if TYPE_CHECKING:
     from collections.abc import (
         AsyncIterator,
+        Awaitable,
         Callable,
         Iterable,
         Mapping,
@@ -33,6 +34,10 @@ if TYPE_CHECKING:
     from tallyho.protocols.broker import Dispatcher
 
 __all__ = ["BatchBuilder", "BatchHandle"]
+
+P = ParamSpec("P")
+R = TypeVar("R")
+T = TypeVar("T")
 
 _NOT_ENTERED = "BatchBuilder ещё не вошёл в async with"
 _CLOSED = "BatchBuilder уже закрыт"
@@ -140,11 +145,16 @@ class BatchBuilder:
             self._writer = None
         return bool(await context.__aexit__(exc_type, exc, traceback))
 
-    async def add(self, fn: object, *args: object, **kwargs: object) -> None:
+    async def add(
+        self,
+        fn: Callable[P, Awaitable[R]],
+        *args: P.args,
+        **kwargs: P.kwargs,
+    ) -> None:
         """Добавить один вызов задачи."""
         await self.add_calls([self._make_call(fn, args, kwargs)])
 
-    async def map(self, fn: object, values: Iterable[object]) -> None:
+    async def map(self, fn: Callable[[T], Awaitable[R]], values: Iterable[T]) -> None:
         """Добавить ``fn(value)`` для каждого элемента."""
         await self.add_calls(self._make_call(fn, (value,), {}) for value in values)
 

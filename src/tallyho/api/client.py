@@ -4,9 +4,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from datetime import timedelta
-from typing import TYPE_CHECKING, final
+from typing import TYPE_CHECKING, ParamSpec, TypeVar, final
 
 from tallyho.api.batch import BatchBuilder, BatchHandle
+from tallyho.api.calls import Call
 from tallyho.engine.public import (
     BatchDefinition,
     EngineSettings,
@@ -21,7 +22,7 @@ from tallyho.protocols.ids import UuidV7Factory
 from tallyho.protocols.observer import NullObserver
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterable
+    from collections.abc import Awaitable, Callable, Iterable
     from datetime import datetime
     from uuid import UUID
 
@@ -40,6 +41,8 @@ __all__ = ["Settings", "Tallyho"]
 
 _ALREADY_INSTALLED = "broker adapter уже установлен"
 _NOT_INSTALLED = "сначала вызовите Tallyho.install(adapter)"
+P = ParamSpec("P")
+R = TypeVar("R")
 
 
 class _Default:
@@ -353,6 +356,25 @@ class Tallyho:
             Handle найденного корня.
         """
         return self.handle(await self._engine.find(kind, key))
+
+    def call(
+        self,
+        fn: Callable[P, Awaitable[R]],
+        *args: P.args,
+        **kwargs: P.kwargs,
+    ) -> Call[P, R]:
+        """Подготовить типизированный вызов задачи.
+
+        Returns:
+            Вызов с сохранёнными аргументами и возможностью задать ``opts``.
+
+        Raises:
+            ConfigurationError: broker adapter ещё не установлен.
+        """
+        adapter = self._adapter
+        if adapter is None:
+            raise ConfigurationError(_NOT_INSTALLED)
+        return Call(task_name=adapter.task_name(fn), args=args, kwargs=kwargs)
 
     def on_finalized(self, kind: str) -> Callable[[FinalizedT], FinalizedT]:
         """Зарегистрировать хук финализации.

@@ -7,13 +7,14 @@ from __future__ import annotations
 
 from importlib.metadata import version as _version
 
-from tallyho.api import BatchBuilder, BatchHandle, Settings, Tallyho
+from tallyho.api import BatchBuilder, BatchHandle, Call, Settings, Tallyho
 from tallyho.model.errors import TallyhoError
 from tallyho.runtime import callback, item, tracked
 
 __all__ = [
     "BatchBuilder",
     "BatchHandle",
+    "Call",
     "Settings",
     "Tallyho",
     "TallyhoError",

@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, ParamSpec, Self, cast
 
 import pytest
 
-from tallyho import Settings, Tallyho
+from tallyho import Call, Settings, Tallyho
 from tallyho.engine import RuntimeServices
 from tallyho.model.errors import ConfigurationError
 
@@ -119,6 +119,30 @@ def test_install_assembles_services_once_and_requires_it_for_maintenance() -> No
     assert client.maintenance() is client.maintenance()
     with pytest.raises(ConfigurationError, match="уже установлен"):
         client.install(adapter)
+
+
+async def sample_task(value: int, *, mode: str) -> str:
+    """Сигнатура задачи для runtime-проверки ``Tallyho.call``."""
+    await asyncio.sleep(0)
+    return f"{value}:{mode}"
+
+
+def test_call_resolves_task_and_preserves_typed_subclass_through_opts() -> None:
+    client = _client()
+    with pytest.raises(ConfigurationError, match="install"):
+        _ = client.call(sample_task, 1, mode="strict")
+    client.install(Adapter())
+
+    value = client.call(sample_task, 1, mode="strict").opts(
+        key="one", weight=2, queue="priority", priority=9
+    )
+
+    assert isinstance(value, Call)
+    assert value.task_name == "sample_task"
+    assert value.args == (1,)
+    assert value.kwargs == {"mode": "strict"}
+    assert (value.key, value.weight, value.queue) == ("one", 2, "priority")
+    assert value.options == {"priority": 9}
 
 
 def test_hook_decorators_register_on_client_registry() -> None:

@@ -74,6 +74,17 @@ def _context() -> tuple[ItemContext, FakeCompleter]:
     return context, completer
 
 
+async def no_op() -> None:
+    """Тестовая async-задача без аргументов."""
+    await asyncio.sleep(0)
+
+
+async def with_value(value: int) -> None:
+    """Тестовая async-задача с одним аргументом."""
+    _ = value
+    await asyncio.sleep(0)
+
+
 def test_facades_are_safe_outside_task() -> None:
     assert item.current() is None
     assert item.id() is None
@@ -85,7 +96,7 @@ def test_facades_are_safe_outside_task() -> None:
     item.skip("ignored")
     item.error("ignored")
     item.expect(10)
-    item.spawn(lambda: None)
+    item.spawn(no_op)
 
 
 def test_sub_batch_outside_task_is_explicit_error() -> None:
@@ -103,7 +114,7 @@ def test_tracked_rejects_sync_function() -> None:
 
 def test_item_context_buffers_all_finish_data() -> None:
     context, _ = _context()
-    context.spawn(object(), 1, key="child", name="x")
+    context.spawn(with_value, 1, key="child")
     context.expect(7)
     context.progress(2, 5)
     context.incr("rows", 2)
@@ -150,9 +161,9 @@ async def test_runtime_sub_batch_buffers_only_successful_context_manager() -> No
     builder = context.sub_batch("parts", expected_total=2)
     async with builder as entered:
         assert entered is builder
-        builder.add(object(), 1)
+        builder.add(with_value, 1)
         builder.add_calls([TaskCall(task_name="other")])
-        builder.map(object(), [2, 3])
+        builder.map(with_value, [2, 3])
         builder.expect(4)
     assert len(context.sub_batches) == 1
     assert context.sub_batches[0].spec.expected_total == 4
@@ -176,7 +187,7 @@ def test_facades_delegate_inside_scoped_context() -> None:
         assert item.id() == context.id
         item.progress(1)
         item.incr("n")
-        item.spawn(object())
+        item.spawn(no_op)
         item.spawn_call(TaskCall(task_name="prepared"))
         item.expect(3)
         item.skip("nope", mark=True)

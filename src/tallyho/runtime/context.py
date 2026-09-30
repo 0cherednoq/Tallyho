@@ -5,7 +5,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
-from typing import TYPE_CHECKING, Protocol, Self
+from typing import TYPE_CHECKING, ParamSpec, Protocol, Self, TypeVar, cast, overload
 
 from tallyho.engine.completer import ExpectRequest, FinishResult, SpawnRequest, SubBatchRequest
 from tallyho.engine.producer import SubBatchSpec
@@ -15,7 +15,7 @@ from tallyho.model.states import OnFeederFailed, ResultClass
 from tallyho.storage.tx import after_commit
 
 if TYPE_CHECKING:
-    from collections.abc import Generator, Iterable, Mapping
+    from collections.abc import Awaitable, Callable, Generator, Iterable, Mapping
     from datetime import datetime, timedelta
     from uuid import UUID
 
@@ -38,6 +38,12 @@ __all__ = [
     "callback",
     "item",
 ]
+
+P = ParamSpec("P")
+R = TypeVar("R")
+T = TypeVar("T")
+U = TypeVar("U")
+V = TypeVar("V")
 
 _NO_CONTEXT = "операция th.item доступна только внутри отслеживаемой задачи"
 
@@ -88,7 +94,12 @@ class RuntimeSubBatch:
         if exc_type is None:
             self.seal()
 
-    def add(self, fn: object, *args: object, **kwargs: object) -> None:
+    def add(
+        self,
+        fn: Callable[P, Awaitable[R]],
+        *args: P.args,
+        **kwargs: P.kwargs,
+    ) -> None:
         """Добавить задачу в под-батч."""
         self.add_call(self.context.make_call(fn, args, kwargs))
 
@@ -108,7 +119,7 @@ class RuntimeSubBatch:
         for call in calls:
             self.add_call(call)
 
-    def map(self, fn: object, values: Iterable[object]) -> None:
+    def map(self, fn: Callable[[T], Awaitable[R]], values: Iterable[T]) -> None:
         """Добавить ``fn(value)`` для каждого значения."""
         for value in values:
             self.add(fn, value)
@@ -158,15 +169,65 @@ class ItemContext:
         """Идентификатор батча текущего Item."""
         return self.ref.batch_id
 
+    @overload
+    def spawn(
+        self,
+        fn: Callable[P, Awaitable[R]],
+        *args: P.args,
+        **kwargs: P.kwargs,
+    ) -> None: ...
+
+    @overload
+    def spawn(
+        self,
+        fn: Callable[[], Awaitable[R]],
+        *,
+        into: str | UUID | None = None,
+        key: str | None = None,
+    ) -> None: ...
+
+    @overload
+    def spawn(
+        self,
+        fn: Callable[[T], Awaitable[R]],
+        arg: T,
+        *,
+        into: str | UUID | None = None,
+        key: str | None = None,
+    ) -> None: ...
+
+    @overload
+    def spawn(
+        self,
+        fn: Callable[[T, U], Awaitable[R]],
+        arg1: T,
+        arg2: U,
+        *,
+        into: str | UUID | None = None,
+        key: str | None = None,
+    ) -> None: ...
+
+    @overload
+    def spawn(
+        self,
+        fn: Callable[[T, U, V], Awaitable[R]],
+        arg1: T,
+        arg2: U,
+        arg3: V,
+        *,
+        into: str | UUID | None = None,
+        key: str | None = None,
+    ) -> None: ...
+
     def spawn(
         self,
         fn: object,
         *args: object,
-        into: str | UUID | None = None,
-        key: str | None = None,
         **kwargs: object,
     ) -> None:
         """Добавить дочерний вызов в атомарный буфер finish."""
+        into = cast("str | UUID | None", kwargs.pop("into", None))
+        key = cast("str | None", kwargs.pop("key", None))
         call = self.make_call(fn, args, kwargs)
         self.spawn_call(call if key is None else call.opts(key=key), into=into)
 
@@ -340,17 +401,68 @@ class ItemFacade:
         context = self.current()
         return context.id if context is not None else None
 
+    @overload
+    def spawn(
+        self,
+        fn: Callable[P, Awaitable[R]],
+        *args: P.args,
+        **kwargs: P.kwargs,
+    ) -> None: ...
+
+    @overload
+    def spawn(
+        self,
+        fn: Callable[[], Awaitable[R]],
+        *,
+        into: str | UUID | None = None,
+        key: str | None = None,
+    ) -> None: ...
+
+    @overload
+    def spawn(
+        self,
+        fn: Callable[[T], Awaitable[R]],
+        arg: T,
+        *,
+        into: str | UUID | None = None,
+        key: str | None = None,
+    ) -> None: ...
+
+    @overload
+    def spawn(
+        self,
+        fn: Callable[[T, U], Awaitable[R]],
+        arg1: T,
+        arg2: U,
+        *,
+        into: str | UUID | None = None,
+        key: str | None = None,
+    ) -> None: ...
+
+    @overload
+    def spawn(
+        self,
+        fn: Callable[[T, U, V], Awaitable[R]],
+        arg1: T,
+        arg2: U,
+        arg3: V,
+        *,
+        into: str | UUID | None = None,
+        key: str | None = None,
+    ) -> None: ...
+
     def spawn(
         self,
         fn: object,
         *args: object,
-        into: str | UUID | None = None,
-        key: str | None = None,
         **kwargs: object,
     ) -> None:
         """Делегировать ``spawn``; вне задачи — no-op."""
         if (context := self.current()) is not None:
-            context.spawn(fn, *args, into=into, key=key, **kwargs)
+            into = cast("str | UUID | None", kwargs.pop("into", None))
+            key = cast("str | None", kwargs.pop("key", None))
+            call = context.make_call(fn, args, kwargs)
+            context.spawn_call(call if key is None else call.opts(key=key), into=into)
 
     def spawn_call(self, call: TaskCall, *, into: str | UUID | None = None) -> None:
         """Делегировать ``spawn_call``; вне задачи — no-op."""
