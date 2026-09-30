@@ -6,7 +6,7 @@
 ## Текущее состояние
 
 * **Ветка:** `impl/v1`
-* **Текущая волна:** — (цикл остановлен по просьбе пользователя после волны 6)
+* **Текущая волна:** T4.3c
 * **Последний зелёный коммит:** 0f4cf16
 
 ## Задачи
@@ -29,7 +29,7 @@
 | T4.2 | Relay | T4.1 | done | 1fc674d..7dc194e (6), merge 41ede95 |
 | T4.3a | Completer: буфер, claim/heartbeat/release | T4.1 | done | 1e029d8..03ce255 (4), merge c364a2d |
 | T4.3b | Completer: finish без spawn | T4.3a, T4.2 | done | 0f4cf16 |
-| T4.3c | Spawn, into=, лимиты, дедуп, sub_batch из задачи | T4.3b | todo | |
+| T4.3c | Spawn, into=, лимиты, дедуп, sub_batch из задачи | T4.3b | in_progress | |
 | T4.4 | Finalizer | T4.3c | todo | |
 | T4.5 | Путь B: complete_in и свёртка | T4.4, Fix-1 | todo | |
 | T4.6 | Политики ошибок, on_policy_breach | T4.4 | todo | |
@@ -72,6 +72,9 @@
 - Отклонения от плана/доков: … (или «нет»)
 - Узнали / на что обратить внимание дальше: …
 -->
+
+### 2026-09-30 · T4.3c · in_progress · —
+- Начата следующая доступная задача после зелёной T4.3b.
 
 ### 2026-09-30 · T4.3b · done · 0f4cf16
 - Сделано: пакетный CAS `finish` в Completer (до 500 Items одним UPDATE), JSON result/error, labels и пользовательские метрики, `th_item_mark`, счётчики и удаление lease/expiry. Повторный finish и неверный `batch_id` — no-op.
