@@ -718,11 +718,15 @@ COMMIT
 ### 7.5 Регистрация хуков
 
 ```python
-th = Tallyho(engine, schema="app", hook_modules=["app.mailing.hooks"])   # импортируются при инициализации в КАЖДОМ процессе
+th = Tallyho(
+    engine, schema="app", hook_modules=["app.mailing.hooks"]
+)  # импортируются при инициализации в КАЖДОМ процессе
+
 
 # app/mailing/hooks.py
 @th.on_finalized("campaign_deliveries")
 async def save_result(session: AsyncSession, s: BatchSummary) -> None: ...
+
 
 @th.on_progress("campaign_deliveries", every=timedelta(seconds=2))
 async def save_progress(session: AsyncSession, s: BatchSummary) -> None: ...
@@ -1393,13 +1397,15 @@ from tallyho import Tallyho
 from tallyho.adapters.flexiq import FlexiqAdapter
 
 th = Tallyho(engine, schema="app", hook_modules=["app.mailing.hooks"])
-fq = FlexiqAdapter(queue)                   # flexiq.Queue пользователя
-th.install(fq)                              # системная задача tallyho.system и DLQ-хук
+fq = FlexiqAdapter(queue)  # flexiq.Queue пользователя
+th.install(fq)  # системная задача tallyho.system и DLQ-хук
 
-@fq.task(max_retries=4)                     # = queue.task(...)(th.tracked(fn)), см. §11.3
+
+@fq.task(max_retries=4)  # = queue.task(...)(th.tracked(fn)), см. §11.3
 async def my_task(x: int) -> None: ...
 
-await th.migrate()                          # или ревизии Alembic: upgrade(..., version=1), затем version=2
+
+await th.migrate()  # или ревизии Alembic: upgrade(..., version=1), затем version=2
 ```
 
 ### 11.2 Сводка
@@ -1607,7 +1613,8 @@ class Campaign(Base):
     progress_seq: Mapped[int] = mapped_column(default=0)
     finished_at: Mapped[datetime | None]
 
-class Contact(Base):          # keyset-пагинация по (audience_id, id)
+
+class Contact(Base):  # keyset-пагинация по (audience_id, id)
     __tablename__ = "contacts"
     id: Mapped[int] = mapped_column(primary_key=True)
     audience_id: Mapped[int]
@@ -1615,6 +1622,7 @@ class Contact(Base):          # keyset-пагинация по (audience_id, id)
     unsubscribed_at: Mapped[datetime | None]
     deleted_at: Mapped[datetime | None]
     __table_args__ = (Index("ix_contacts_audience_id_id", "audience_id", "id"),)
+
 
 class Suppression(Base):
     __tablename__ = "suppressions"
@@ -1628,6 +1636,7 @@ class Suppression(Base):
 KIND = "campaign_deliveries"
 ACTIVE = ("scheduled", "running", "paused")
 
+
 async def schedule(session: AsyncSession, campaign_id: int, at: datetime) -> None:
     c = await session.get(Campaign, campaign_id, with_for_update=True)
     if c.status != "draft":
@@ -1638,10 +1647,13 @@ async def schedule(session: AsyncSession, campaign_id: int, at: datetime) -> Non
         send = root.sub_batch(
             "send",
             fed_by=[expand],
-            expected_total=size,                 # прогресс виден сразу, до конца разворачивания
+            expected_total=size,  # прогресс виден сразу, до конца разворачивания
             max_in_flight=500,
             failure_policy=th.FailurePolicy.threshold(
-                ratio=0.05, min_processed=500, labels=["hard_bounce"], action="pause",
+                ratio=0.05,
+                min_processed=500,
+                labels=["hard_bounce"],
+                action="pause",
             ),
         )
         await expand.add(expand_audience, c.id, after_id=0)
@@ -1649,19 +1661,22 @@ async def schedule(session: AsyncSession, campaign_id: int, at: datetime) -> Non
     c.status, c.scheduled_at, c.batch_id, c.audience_size = "scheduled", at, root.handle.id, size
     # commit делает вызывающий: доменная запись и дерево — атомарно
 
+
 async def reschedule(session, campaign_id: int, at: datetime) -> None:
     c = await session.get(Campaign, campaign_id, with_for_update=True)
     if c.status != "scheduled":
         raise Conflict(c.status)
-    await th.handle(c.batch_id).reschedule(at, session=session)      # на всё дерево
+    await th.handle(c.batch_id).reschedule(at, session=session)  # на всё дерево
     c.scheduled_at = at
 
+
 async def pause(session, campaign_id: int) -> None:
-    c = await session.get(Campaign, campaign_id, with_for_update=True)   # домен → tallyho
+    c = await session.get(Campaign, campaign_id, with_for_update=True)  # домен → tallyho
     if c.status != "running":
         raise Conflict(c.status)
-    await th.handle(c.batch_id).pause(session=session)                # каскадом на expand и send
+    await th.handle(c.batch_id).pause(session=session)  # каскадом на expand и send
     c.status, c.pause_reason = "paused", "manual"
+
 
 async def resume(session, campaign_id: int) -> None:
     c = await session.get(Campaign, campaign_id, with_for_update=True)
@@ -1670,12 +1685,13 @@ async def resume(session, campaign_id: int) -> None:
     await th.handle(c.batch_id).resume(session=session)
     c.status, c.pause_reason = "running", None
 
+
 async def cancel(session, campaign_id: int) -> None:
     c = await session.get(Campaign, campaign_id, with_for_update=True)
     if c.status not in (*ACTIVE, "draft"):
         raise Conflict(c.status)
     if c.batch_id:
-        await th.handle(c.batch_id).cancel(session=session)   # итог придёт в on_finalized(cancelled)
+        await th.handle(c.batch_id).cancel(session=session)  # итог придёт в on_finalized(cancelled)
     else:
         c.status = "cancelled"
 ```
@@ -1694,6 +1710,7 @@ FINAL = {
     BatchState.CANCELLED: "cancelled",
 }
 
+
 def _figures(s: BatchSummary) -> dict:
     send = s.children["send"]
     return {
@@ -1706,6 +1723,7 @@ def _figures(s: BatchSummary) -> dict:
         "progress_seq": s.seq,
     }
 
+
 @th.on_finalized(KIND)
 async def save_result(session: AsyncSession, s: BatchSummary) -> None:
     await session.execute(
@@ -1715,14 +1733,18 @@ async def save_result(session: AsyncSession, s: BatchSummary) -> None:
     )
     # «установить итог», а не «прибавить»: после retry_failed хук вызовется снова
 
+
 @th.on_progress(KIND, every=timedelta(seconds=2))
 async def save_progress(session: AsyncSession, s: BatchSummary) -> None:
     f = _figures(s)
     await session.execute(
         update(Campaign)
-        .where(Campaign.batch_id == s.id, Campaign.progress_seq < s.seq)   # монотонность снимков
-        .values(**f, progress=func.greatest(Campaign.progress, f["progress"]))   # полоска не едет назад
+        .where(Campaign.batch_id == s.id, Campaign.progress_seq < s.seq)  # монотонность снимков
+        .values(
+            **f, progress=func.greatest(Campaign.progress, f["progress"])
+        )  # полоска не едет назад
     )
+
 
 @th.on_policy_breach(KIND)
 async def auto_pause(session: AsyncSession, s: BatchSummary, breach: PolicyBreach) -> None:
@@ -1740,27 +1762,39 @@ async def auto_pause(session: AsyncSession, s: BatchSummary, breach: PolicyBreac
 ```python
 PAGE = 1000
 
+
 @fq.task(max_retries=5)
 async def expand_audience(campaign_id: int, after_id: int) -> None:
     """Этап expand: одна страница аудитории. Число страниц заранее неизвестно."""
     async with db.begin() as s:
         c = await s.get(Campaign, campaign_id)
-        if after_id == 0:   # первая страница = фактический старт кампании, доменный переход
-            await s.execute(update(Campaign)
-                            .where(Campaign.id == campaign_id, Campaign.status == "scheduled")
-                            .values(status="running"))
-        contacts = (await s.scalars(
-            select(Contact)
-            .where(Contact.audience_id == c.audience_id, Contact.id > after_id)
-            .order_by(Contact.id).limit(PAGE)
-        )).all()
+        if after_id == 0:  # первая страница = фактический старт кампании, доменный переход
+            await s.execute(
+                update(Campaign)
+                .where(Campaign.id == campaign_id, Campaign.status == "scheduled")
+                .values(status="running")
+            )
+        contacts = (
+            await s.scalars(
+                select(Contact)
+                .where(Contact.audience_id == c.audience_id, Contact.id > after_id)
+                .order_by(Contact.id)
+                .limit(PAGE)
+            )
+        ).all()
 
     boxes = c.mailbox_ids
     for ct in contacts:
-        th.item.spawn(send_email, campaign_id, ct.id, mailbox_id=boxes[ct.id % len(boxes)],
-                      into="send", key=normalize_email(ct.email))        # дедуп адресов
+        th.item.spawn(
+            send_email,
+            campaign_id,
+            ct.id,
+            mailbox_id=boxes[ct.id % len(boxes)],
+            into="send",
+            key=normalize_email(ct.email),
+        )  # дедуп адресов
     if len(contacts) == PAGE:
-        th.item.spawn(expand_audience, campaign_id, after_id=contacts[-1].id)   # в свой этап
+        th.item.spawn(expand_audience, campaign_id, after_id=contacts[-1].id)  # в свой этап
     # всё записывается атомарно с завершением этой задачи
 
 
@@ -1789,7 +1823,7 @@ async def send_email(campaign_id: int, contact_id: int, mailbox_id: int) -> None
             headers={"X-Campaign": str(campaign_id)},
         )
     except HardBounce as e:
-        async with db.begin() as s:                       # suppression и итог Item — одной транзакцией
+        async with db.begin() as s:  # suppression и итог Item — одной транзакцией
             s.add(Suppression(email=normalize_email(contact.email), reason="hard_bounce"))
             th.item.error("hard_bounce", detail=str(e))
             await th.item.complete_in(s)
@@ -1808,8 +1842,15 @@ UI читает **только доменную таблицу**. Живой п�
 @router.get("/campaigns/{id}")
 async def get_campaign(id: int, session=Depends(db)):
     c = await session.get(Campaign, id)
-    return {"status": c.status, "progress": c.progress, "sent": c.sent, "skipped": c.skipped,
-            "failed": c.failed, "duplicates": c.duplicates, "breakdown": c.breakdown}
+    return {
+        "status": c.status,
+        "progress": c.progress,
+        "sent": c.sent,
+        "skipped": c.skipped,
+        "failed": c.failed,
+        "duplicates": c.duplicates,
+        "breakdown": c.breakdown,
+    }
 ```
 
 ### 12.5 Сквозная последовательность
@@ -1863,11 +1904,17 @@ sequenceDiagram
 
 ```python
 class TemporaryMailError(Exception): ...
+
+
 class HardBounce(Exception): ...
+
+
 class Rejected(Exception): ...
+
 
 class FakeMailProvider:
     """Поведение детерминировано доменом адреса."""
+
     def __init__(self) -> None:
         self.sent: list[dict] = []
         self.attempts: Counter[str] = Counter()
@@ -1932,7 +1979,7 @@ PostgreSQL поднимается через testcontainers.
 async def env(pg_url):
     engine = create_async_engine(pg_url)
     clock = FakeClock(datetime(2026, 10, 1, 9, 0, tzinfo=UTC))
-    broker = InlineBroker(duplicate_delivery_rate=0.05, seed=42)   # 5% дублей доставки
+    broker = InlineBroker(duplicate_delivery_rate=0.05, seed=42)  # 5% дублей доставки
     th = Tallyho(engine, schema="app", clock=clock, hook_modules=["app.mailing.hooks"])
     th.install(broker.adapter)
     await th.migrate()
@@ -1945,36 +1992,48 @@ async def env(pg_url):
 async def test_scheduled_campaign_completes_with_errors(env):
     cid = await create_campaign(env)
     async with env.session() as s:
-        await schedule(s, cid, at=env.clock.now() + timedelta(hours=1)); await s.commit()
+        await schedule(s, cid, at=env.clock.now() + timedelta(hours=1))
+        await s.commit()
     await env.drain()
     assert (await get(env, cid)).status == "scheduled" and env.mail.sent == []
 
     env.clock.advance(hours=1)
-    await env.drain()                       # expand → send → финализация этапов → корня → on_finalized
+    await env.drain()  # expand → send → финализация этапов → корня → on_finalized
 
     c = await get(env, cid)
     assert c.status == "completed_with_errors"
     assert (c.sent, c.skipped, c.failed, c.duplicates) == (9100, 600, 300, 40)
-    assert c.breakdown == {"sent": 9100, "recipient_not_found": 300, "unsubscribed": 200,
-                           "suppressed": 100, "invalid_address": 50, "hard_bounce": 150,
-                           "rejected": 50, "exhausted": 50}
-    assert len(env.mail.sent) == 9100       # никто не получил письмо дважды
+    assert c.breakdown == {
+        "sent": 9100,
+        "recipient_not_found": 300,
+        "unsubscribed": 200,
+        "suppressed": 100,
+        "invalid_address": 50,
+        "hard_bounce": 150,
+        "rejected": 50,
+        "exhausted": 50,
+    }
+    assert len(env.mail.sent) == 9100  # никто не получил письмо дважды
 
 
 async def test_send_starts_before_expand_finishes(env):
     cid = await start_now(env)
-    await env.broker.step(3)                # 1-я страница expand + 2 письма
+    await env.broker.step(3)  # 1-я страница expand + 2 письма
     v = await env.th.handle((await get(env, cid)).batch_id).view()
     assert v.children["expand"].progress.final is False
     assert v.children["send"].progress.done > 0
-    assert v.children["send"].progress.expected == 10_000 and v.children["send"].progress.expected_is_estimate
+    assert (
+        v.children["send"].progress.expected == 10_000
+        and v.children["send"].progress.expected_is_estimate
+    )
 
 
 async def test_empty_audience_completes_immediately(env):
     cid = await create_campaign(env, audience=[])
     async with env.session() as s:
-        await schedule(s, cid, at=env.clock.now()); await s.commit()
-    await env.drain()                       # expand: 1 пустая страница → send sealed при found 0 → финализирован
+        await schedule(s, cid, at=env.clock.now())
+        await s.commit()
+    await env.drain()  # expand: 1 пустая страница → send sealed при found 0 → финализирован
     c = await get(env, cid)
     assert c.status == "completed" and c.sent == 0
 
@@ -1984,29 +2043,33 @@ async def test_progress_snapshots_are_monotonic(env):
     seen = []
     for _ in range(10):
         await env.broker.step(1_000)
-        env.clock.advance(seconds=2); await env.th.run_maintenance_once()
+        env.clock.advance(seconds=2)
+        await env.th.run_maintenance_once()
         seen.append((await get(env, cid)).progress)
     assert seen == sorted(seen)
 
 
 async def test_result_survives_retention(env):
-    cid = await start_now(env); await env.drain()
-    env.clock.advance(days=15); await env.th.run_maintenance_once()
+    cid = await start_now(env)
+    await env.drain()
+    env.clock.advance(days=15)
+    await env.th.run_maintenance_once()
     c = await get(env, cid)
     with pytest.raises(BatchPurged):
         await env.th.handle(c.batch_id).view()
-    assert c.status == "completed_with_errors" and c.sent == 9100   # домен не пострадал
+    assert c.status == "completed_with_errors" and c.sent == 9100  # домен не пострадал
 
 
 async def test_failing_hook_blocks_finalization_then_recovers(env, monkeypatch):
     cid = await start_now(env)
-    monkeypatch.setattr(hooks, "FINAL", {})            # хук падает с KeyError
+    monkeypatch.setattr(hooks, "FINAL", {})  # хук падает с KeyError
     await env.drain()
     c = await get(env, cid)
-    assert c.status == "running"                       # домен не ушёл вперёд без итога
+    assert c.status == "running"  # домен не ушёл вперёд без итога
     assert (await env.th.handle(c.batch_id).view()).state == BatchState.SEALED
     monkeypatch.undo()
-    env.clock.advance(minutes=5); await env.th.run_maintenance_once()
+    env.clock.advance(minutes=5)
+    await env.th.run_maintenance_once()
     assert (await get(env, cid)).status == "completed_with_errors"
 
 
@@ -2014,28 +2077,33 @@ async def test_pause_stops_sending_and_resume_finishes(env):
     cid = await start_now(env)
     await env.broker.step(3_000)
     async with env.session() as s:
-        await pause(s, cid); await s.commit()
+        await pause(s, cid)
+        await s.commit()
     sent_at_pause = len(env.mail.sent)
     await env.drain()
-    assert len(env.mail.sent) == sent_at_pause         # сообщения из брокера паркуются
+    assert len(env.mail.sent) == sent_at_pause  # сообщения из брокера паркуются
     async with env.session() as s:
-        await resume(s, cid); await s.commit()
+        await resume(s, cid)
+        await s.commit()
     await env.drain()
     assert (await get(env, cid)).status == "completed_with_errors"
 
 
 async def test_auto_pause_on_bounce_rate(env):
     await seed(env.engine, bounce_heavy_dataset(bounce_ratio=0.08))
-    cid = await start_now(env); await env.drain()
+    cid = await start_now(env)
+    await env.drain()
     c = await get(env, cid)
     assert c.status == "paused" and c.pause_reason.startswith("['hard_bounce'] rate")
 
 
 async def test_worker_crash_mid_flight_recovers(env):
     cid = await start_now(env)
-    env.broker.kill_worker_after(500)                  # эмуляция kill -9
+    env.broker.kill_worker_after(500)  # эмуляция kill -9
     await env.drain()
-    env.clock.advance(seconds=61); await env.th.run_maintenance_once(); await env.drain()
+    env.clock.advance(seconds=61)
+    await env.th.run_maintenance_once()
+    await env.drain()
     assert (await get(env, cid)).status == "completed_with_errors"
 ```
 
@@ -2070,6 +2138,32 @@ gantt
     хранение до retention  :b4, 2026-10-01 10:24, 14d
 ```
 
+### 12.8 Исполняемая проверка
+
+Полная реализация раздела находится в `tests/examples/mailing/`. Этот smoke-блок извлекается
+из документа и буквально выполняется в CI через `InlineBroker`.
+
+<!-- tallyho-example: architecture-mailing -->
+```python
+from tallyho.model.states import BatchState
+from tests.examples.mailing.app import MailingApp
+from tests.examples.mailing.dataset import compact_dataset
+
+app = await MailingApp.create(engine, schema)
+try:
+    campaign_id = await app.create_campaign(compact_dataset(12))
+    batch_id = await app.start_now(campaign_id)
+    await app.drain()
+
+    campaign = await app.get(campaign_id)
+    view = await app.th.handle(batch_id).view()
+    assert campaign.status == "completed"
+    assert campaign.sent == 12
+    assert view.state is BatchState.SUCCEEDED
+finally:
+    await app.close()
+```
+
 ---
 
 ## 13. Второй пример: конвейер парсинга
@@ -2099,53 +2193,74 @@ flowchart LR
 ```python
 async def start_import(session: AsyncSession, catalog_id: int, url: str) -> None:
     imp = CatalogImport(catalog_id=catalog_id, status="running")
-    session.add(imp); await session.flush()
-    async with th.batch(kind="catalog_parse", key=f"catalog:{imp.id}", max_items=200_000,
-                        session=session) as root:
-        pages = root.sub_batch("pages", max_depth=1)             # страница 1 порождает остальные, глубже нельзя
+    session.add(imp)
+    await session.flush()
+    async with th.batch(
+        kind="catalog_parse", key=f"catalog:{imp.id}", max_items=200_000, session=session
+    ) as root:
+        pages = root.sub_batch(
+            "pages", max_depth=1
+        )  # страница 1 порождает остальные, глубже нельзя
         cards = root.sub_batch("cards", fed_by=[pages], max_in_flight=100)
         pdfs = root.sub_batch("pdfs", fed_by=[cards], max_in_flight=50)
         await pages.add(parse_page, url, page=1)
     imp.batch_id = root.handle.id
+
 
 @fq.task(max_retries=3)
 async def parse_page(url: str, page: int) -> None:
     html = await fetch(url, page)
     if page == 1:
         n = total_pages(html)
-        th.item.expect(n)                                        # у pages будет n
+        th.item.expect(n)  # у pages будет n
         for p in range(2, n + 1):
             th.item.spawn(parse_page, url, p)
     for card in cards_of(html):
         th.item.spawn(parse_card, card.url, into="cards", key=normalize_url(card.url))
+
 
 @fq.task(max_retries=3, weight=2)
 async def parse_card(url: str) -> None:
     for pdf in pdf_links(await fetch(url)):
         th.item.spawn(download_pdf, pdf, into="pdfs", key=normalize_url(pdf))
 
+
 @fq.task(max_retries=5, weight=4)
 async def download_pdf(url: str) -> None:
     async for done, total in stream_download(url):
-        th.item.progress(done, total)                            # видно в handle.in_flight()
+        th.item.progress(done, total)  # видно в handle.in_flight()
     th.item.ok("downloaded")
+
 
 @th.on_progress("catalog_parse", every=timedelta(seconds=2))
 async def save_progress(session: AsyncSession, s: BatchSummary) -> None:
-    stages = {k: {"done": c.progress.done, "found": c.progress.found, "expected": c.progress.expected,
-                  "estimate": c.progress.expected_is_estimate, "final": c.progress.final,
-                  "duplicates": c.progress.duplicates, "eta_s": c.progress.eta and c.progress.eta.seconds}
-              for k, c in s.children.items()}
+    stages = {
+        k: {
+            "done": c.progress.done,
+            "found": c.progress.found,
+            "expected": c.progress.expected,
+            "estimate": c.progress.expected_is_estimate,
+            "final": c.progress.final,
+            "duplicates": c.progress.duplicates,
+            "eta_s": c.progress.eta and c.progress.eta.seconds,
+        }
+        for k, c in s.children.items()
+    }
     await session.execute(
         update(CatalogImport)
         .where(CatalogImport.batch_id == s.id, CatalogImport.progress_seq < s.seq)
-        .values(stages=stages, progress_seq=s.seq,
-                progress=func.greatest(CatalogImport.progress, s.progress.ratio or 0.0))
+        .values(
+            stages=stages,
+            progress_seq=s.seq,
+            progress=func.greatest(CatalogImport.progress, s.progress.ratio or 0.0),
+        )
     )
 
+
 @th.on_finalized("catalog_parse")
-async def save_result(session: AsyncSession, s: BatchSummary) -> None:
-    ...   # статус импорта + итоговые stages, как в on_progress
+async def save_result(
+    session: AsyncSession, s: BatchSummary
+) -> None: ...  # статус импорта + итоговые stages, как в on_progress
 ```
 
 ### 13.3 Как меняется прогресс
@@ -2172,6 +2287,32 @@ async def save_result(session: AsyncSession, s: BatchSummary) -> None:
   pages  24 / 24                ✓
   cards  600 / 712              ✓ · в работе 40/100 · дублей 18
   pdfs   1 300 / 1 540 найдено  · ≈1 827 ожидается (по 600 карточкам) · в работе 50/50 · ETA 5 мин
+```
+
+### 13.4 Исполняемая проверка
+
+Полное приложение и детерминированный генератор находятся в `tests/examples/catalog/`.
+Маркированный блок запускается в CI на настоящем PostgreSQL и `InlineBroker`.
+
+<!-- tallyho-example: architecture-catalog -->
+```python
+from tallyho.model.states import BatchState
+from tests.examples.catalog.app import CatalogApp
+from tests.examples.catalog.generator import CatalogSite
+
+app = await CatalogApp.create(engine, schema)
+try:
+    batch_id = await app.start_import(CatalogSite.small())
+    await app.drain()
+
+    result = await app.get()
+    view = await app.th.handle(batch_id).view()
+    assert result.status == "completed"
+    assert view.state is BatchState.SUCCEEDED
+    assert view.children["cards"].progress.found == 8
+    assert view.children["pdfs"].progress.found == 8
+finally:
+    await app.close()
 ```
 
 ---
