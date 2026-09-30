@@ -193,6 +193,56 @@ async def test_paused_batch_is_parked(rel: RelayEnv) -> None:
         ]
 
 
+async def test_expires_writes_th_expiry(rel: RelayEnv) -> None:
+    calls = [
+        call(1).opts(expires=60),
+        call(2),
+        call(3).opts(expires=1.5),
+        call(4).opts(expires=True),
+    ]
+    _ = await add_batch(rel, calls)
+    rel.clock.advance(GRACE)
+    assert await rel.relay.scan_once() == 4
+    ids = rel.dispatcher.ids
+    expiry = rel.tables.expiry
+    async with rel.env.connection() as conn:
+        result = await conn.execute(select(expiry.c.item_id, expiry.c.expires_at))
+        rows = {row.item_id: row.expires_at for row in result}
+    sent_at = rel.clock.current
+    assert rows == {
+        ids[0]: sent_at + timedelta(seconds=60),
+        ids[2]: sent_at + timedelta(seconds=1.5),
+    }
+
+
+async def test_redispatch_moves_expiry(rel: RelayEnv) -> None:
+    _ = await add_batch(rel, [call(1).opts(expires=10)])
+    rel.clock.advance(GRACE)
+    assert await rel.relay.scan_once() == 1
+    item_id = rel.dispatcher.ids[0]
+    outbox = rel.tables.outbox
+    item = rel.tables.item
+    # Sweeper вернул Item в outbox (lease истёк) — срок считается от новой отправки.
+    async with rel.env.transaction() as conn:
+        batch_id = await conn.scalar(select(item.c.batch_id).where(item.c.id == item_id))
+        _ = await conn.execute(
+            insert(outbox).values(
+                id=item_id,
+                kind=int(OutboxKind.ITEM),
+                batch_id=batch_id,
+                item_id=item_id,
+                task_name="render",
+                available_at=rel.clock.current,
+            )
+        )
+    rel.clock.advance(timedelta(minutes=1))
+    assert await rel.relay.scan_once() == 1
+    expiry = rel.tables.expiry
+    async with rel.env.connection() as conn:
+        expires_at = await conn.scalar(select(expiry.c.expires_at))
+    assert expires_at == rel.clock.current + timedelta(seconds=10)
+
+
 async def test_callback_record_uses_own_payload_and_options(rel: RelayEnv) -> None:
     batch_id = await add_batch(rel, [])
     callback_id = rel.producer.ids.new_id()

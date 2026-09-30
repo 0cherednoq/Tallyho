@@ -10,7 +10,8 @@ Relay не зависит от адаптера: он говорит тольк�
 2. вне транзакции: сборка :class:`~tallyho.protocols.broker.Message`
    (payload и опции Item — из ``th_item``, колбэка — из самой записи) и
    ``dispatch`` группами по ``task_name``;
-3. своя транзакция: ``DELETE th_outbox`` отправленного, ``dispatched += n``.
+3. своя транзакция: ``DELETE th_outbox`` отправленного, ``dispatched += n``,
+   ``th_expiry`` для Items с опцией ``expires`` (§11.4).
 
 Падение между 1 и 3 оставляет записи захваченными до ``claim_ttl``: потом их
 заберёт следующий проход, брокер получит дубль, его отсечёт claim (§6.3).
@@ -43,7 +44,7 @@ from sqlalchemy import (
     select,
     update,
 )
-from sqlalchemy.dialects.postgresql import ARRAY
+from sqlalchemy.dialects.postgresql import ARRAY, insert
 
 from tallyho.model.errors import ConfigurationError
 from tallyho.model.states import TERMINAL_THRESHOLD, OutboxKind
@@ -54,7 +55,7 @@ from tallyho.storage.now import sql_now
 from tallyho.storage.tx import run_transaction
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Sequence
+    from collections.abc import Iterable, Mapping, Sequence
     from datetime import datetime
 
     from sqlalchemy import ColumnElement
@@ -165,6 +166,13 @@ def _uuids(ids: Iterable[UUID]) -> ColumnElement[Sequence[UUID]]:
 def _infinity() -> ColumnElement[datetime]:
     # Запись запаркована: relay её не видит до resume.
     return literal_column("'infinity'::timestamptz", DateTime(timezone=True))
+
+
+def _expires(options: Mapping[str, object]) -> float | None:
+    value = options.get("expires")
+    if isinstance(value, bool) or not isinstance(value, int | float):
+        return None
+    return float(value)
 
 
 @dataclass(eq=False, kw_only=True)
@@ -387,15 +395,23 @@ class Relay:
 
     async def _confirm(self, conn: AsyncConnection, sent: Sequence[Message]) -> None:
         outbox = self.tables.outbox
+        by_id = {message.id: message for message in sent}
         deleted = await conn.execute(
             delete(outbox)
-            .where(self._outbox_in(sorted(message.id for message in sent)))
-            .returning(outbox.c.batch_id, outbox.c.kind)
+            .where(self._outbox_in(sorted(by_id)))
+            .returning(outbox.c.id, outbox.c.batch_id, outbox.c.kind)
         )
         dispatched: Counter[UUID] = Counter()
-        for batch_id, kind in deleted:
-            if kind == OutboxKind.ITEM:
-                dispatched[batch_id] += 1
+        expiring: list[tuple[UUID, float]] = []
+        for row_id, batch_id, kind in deleted:
+            if kind != OutboxKind.ITEM:
+                continue
+            dispatched[batch_id] += 1
+            expires = _expires(by_id[row_id].options)
+            if expires is not None:
+                expiring.append((row_id, expires))
+        if expiring:
+            await self._write_expiry(conn, expiring)
         if dispatched:
             slot = self.settings.slot
             await upsert_slots(
@@ -406,3 +422,26 @@ class Relay:
                     for batch_id, n in dispatched.items()
                 },
             )
+
+    async def _write_expiry(
+        self, conn: AsyncConnection, expiring: list[tuple[UUID, float]]
+    ) -> None:
+        # Срок считается от отправки: flexiq не выполнит джобу позже, sweeper
+        # завершит не захваченный вовремя Item как error("expired") (§11.4).
+        expiry = self.tables.expiry
+        now = sql_now(self.clock)
+        stmt = insert(expiry).values(
+            [
+                {
+                    "item_id": item_id,
+                    "expires_at": now + literal(timedelta(seconds=secs), Interval()),
+                }
+                for item_id, secs in sorted(expiring)
+            ]
+        )
+        _ = await conn.execute(
+            stmt.on_conflict_do_update(
+                index_elements=[expiry.c.item_id],
+                set_={"expires_at": stmt.excluded.expires_at},
+            )
+        )
