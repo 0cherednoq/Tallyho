@@ -7,7 +7,7 @@
 
 * **Ветка:** `impl/v1`
 * **Текущая волна:** — (цикл остановлен по просьбе пользователя после волны 6)
-* **Последний зелёный коммит:** c364a2d
+* **Последний зелёный коммит:** 0f4cf16
 
 ## Задачи
 
@@ -28,7 +28,7 @@
 | T4.1 | Продюсер: батчи, под-батчи, th_feed, add, seal, expect | T2.4, T3.1 | done | ec5f273..16b7f8d (4), merge 0080570 |
 | T4.2 | Relay | T4.1 | done | 1fc674d..7dc194e (6), merge 41ede95 |
 | T4.3a | Completer: буфер, claim/heartbeat/release | T4.1 | done | 1e029d8..03ce255 (4), merge c364a2d |
-| T4.3b | Completer: finish без spawn | T4.3a, T4.2 | todo | |
+| T4.3b | Completer: finish без spawn | T4.3a, T4.2 | done | 0f4cf16 |
 | T4.3c | Spawn, into=, лимиты, дедуп, sub_batch из задачи | T4.3b | todo | |
 | T4.4 | Finalizer | T4.3c | todo | |
 | T4.5 | Путь B: complete_in и свёртка | T4.4, Fix-1 | todo | |
@@ -72,6 +72,13 @@
 - Отклонения от плана/доков: … (или «нет»)
 - Узнали / на что обратить внимание дальше: …
 -->
+
+### 2026-09-30 · T4.3b · done · 0f4cf16
+- Сделано: пакетный CAS `finish` в Completer (до 500 Items одним UPDATE), JSON result/error, labels и пользовательские метрики, `th_item_mark`, счётчики и удаление lease/expiry. Повторный finish и неверный `batch_id` — no-op.
+- После commit: Item снимается из `held`, Observer получает событие, Relay получает `kick` после освобождения окна, Finalizer — затронутые батчи. PARKED и CANCELLED в claim теперь тоже освобождают `th_window` (D-035).
+- Проверка: `poe check` зелёный; `poe test-all` — 776 passed, покрытие 99,57%. Интеграция включает 1 000 finish за не более чем `ceil(1000/500)+1` транзакций.
+- Отклонения от плана/доков: аргументы finish собраны в типизированный `FinishResult`, post-commit зависимости — в `CompleterTriggers`, чтобы сохранить строгий лимит числа аргументов.
+- Узнали / на что обратить внимание дальше: `pytest tmp_path` на Windows нельзя переиспользовать между sandbox и повышенным Docker-процессом; полный прогон требует уникальный `--basetemp`. Для T4.3c пакет spawn должен войти в ту же транзакцию между CAS и единым `write_counters()`.
 
 ### 2026-09-30 · цикл остановлен · —
 - По просьбе пользователя: волна 6 доведена и влита, новые волны не запускались.
