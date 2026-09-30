@@ -21,7 +21,18 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Final, TypeVar
 
-from sqlalchemy import BigInteger, Uuid, cast, func, literal, literal_column, select, true
+from sqlalchemy import (
+    BigInteger,
+    Uuid,
+    any_,
+    cast,
+    delete,
+    func,
+    literal,
+    literal_column,
+    select,
+    true,
+)
 from sqlalchemy.dialects.postgresql import ARRAY, insert
 
 if TYPE_CHECKING:
@@ -39,6 +50,7 @@ __all__ = [
     "CounterDelta",
     "CounterTotals",
     "SlotKey",
+    "fold_deltas",
     "insert_delta",
     "read_counters",
     "upsert_slots",
@@ -347,3 +359,54 @@ async def insert_delta(
         rows.append(row)
     for chunk in _chunks(rows):
         _ = await conn.execute(insert(tables.counter_delta).values(chunk))
+
+
+async def fold_deltas(
+    conn: AsyncConnection, tables: Tables, batch_ids: Iterable[UUID]
+) -> dict[UUID, CounterDelta]:
+    """Забрать закоммиченные дельты батчей: ``DELETE … RETURNING`` с суммой по батчу.
+
+    Удаляются только строки, видимые снимку запроса, то есть закоммиченные:
+    дельты незавершённой транзакции пользователя остаются до следующего
+    прохода. Параллельная свёртка тех же строк ждёт блокировку и после commit
+    первой их уже не находит, поэтому дельта сворачивается ровно один раз.
+
+    Вызывающий обязан в **той же** транзакции прибавить результат к слоту
+    (:func:`upsert_slots`, вместе с остальными дельтами — одним вызовом, чтобы
+    не нарушить порядок блокировок): тогда перенос атомарен и
+    :func:`read_counters` не «мигает».
+
+    Args:
+        conn: Соединение в открытой транзакции.
+        tables: Таблицы установки.
+        batch_ids: Батчи, дельты которых сворачиваются.
+
+    Returns:
+        Сумма удалённых дельт по батчам; батчи без дельт не попадают.
+    """
+    ids = sorted(set(batch_ids))
+    if not ids:
+        return {}
+    delta = tables.counter_delta
+    gone = (
+        delete(delta)
+        .where(delta.c.batch_id == any_(literal(ids, ARRAY(Uuid()))))
+        .returning(
+            delta.c.batch_id,
+            delta.c.d_total,
+            delta.c.d_ok,
+            delta.c.d_skip,
+            delta.c.d_error,
+            delta.c.d_cancelled,
+            delta.c.d_w_done,
+        )
+        .cte("gone")
+    )
+    sums = [_sum(gone.c[f"d_{name}"]).label(name) for name in DELTA_FIELDS]
+    columns: list[ColumnElement[UUID] | ColumnElement[int]] = [gone.c.batch_id, *sums]
+    stmt = select(*columns).group_by(gone.c.batch_id)
+    folded: dict[UUID, CounterDelta] = {}
+    for row in (await conn.execute(stmt)).mappings():
+        values: dict[str, int] = {name: row[name] for name in DELTA_FIELDS}
+        folded[row["batch_id"]] = CounterDelta(**values)
+    return folded
