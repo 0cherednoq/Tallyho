@@ -22,8 +22,24 @@ from datetime import timedelta
 from enum import StrEnum
 from typing import TYPE_CHECKING, Final, TypeVar, cast
 
-from sqlalchemy import BigInteger, DateTime, Interval, exists, func, literal, select, update
-from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy import (
+    BigInteger,
+    DateTime,
+    Integer,
+    Interval,
+    LargeBinary,
+    SmallInteger,
+    Text,
+    Uuid,
+    exists,
+    func,
+    literal,
+    literal_column,
+    select,
+    update,
+)
+from sqlalchemy import cast as sql_cast
+from sqlalchemy.dialects.postgresql import ARRAY, insert
 
 from tallyho.model.errors import (
     ConfigurationError,
@@ -32,12 +48,12 @@ from tallyho.model.errors import (
     SealError,
     SpawnTargetError,
 )
-from tallyho.model.states import BatchState, ItemState, OnFeederFailed
+from tallyho.model.states import BatchState, ItemState, OnFeederFailed, OutboxKind
 from tallyho.storage.counters import CounterDelta, upsert_slots
 from tallyho.storage.now import sql_now
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Mapping, Sequence
+    from collections.abc import Iterable, Iterator, Mapping, Sequence
     from datetime import datetime
     from uuid import UUID
 
@@ -53,8 +69,10 @@ if TYPE_CHECKING:
     from tallyho.storage.tables import Tables
 
 __all__ = [
+    "ITEM_CHUNK",
     "MAX_PAYLOAD_BYTES",
     "VIRTUAL_TASK",
+    "AddResult",
     "BatchRef",
     "CallbackName",
     "Producer",
@@ -67,6 +85,9 @@ _V = TypeVar("_V")
 
 MAX_PAYLOAD_BYTES: Final = 1024 * 1024
 """Предел закодированного payload по умолчанию: ``max_payload_bytes`` flexiq (1 MiB)."""
+
+ITEM_CHUNK: Final = 1000
+"""Вызовов в одном запросе add_items: массивы unnest, 5 параметров на чанк."""
 
 VIRTUAL_TASK: Final = "tallyho.sub_batch"
 """``task_name`` виртуального Item под-батча: он не отправляется брокеру."""
@@ -266,6 +287,19 @@ class _BatchRow:
     start_at: datetime | None
     is_stage: bool
     """Батч — этап с источниками ``th_feed``: продюсер в него не пишет."""
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class AddResult:
+    """Итог :meth:`Producer.add_items`.
+
+    Attributes:
+        found: Вставлено новых Items.
+        duplicates: Отсечено по ``key`` как дубли.
+    """
+
+    found: int
+    duplicates: int
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -530,6 +564,137 @@ class Producer:
         found = await conn.scalar(select(down.c.id).where(down.c.id.in_(targets)).limit(1))
         return found is not None
 
+    # --- Items ---------------------------------------------------------------
+
+    async def add_items(
+        self, conn: AsyncConnection, batch_id: UUID, calls: Iterable[TaskCall]
+    ) -> AddResult:
+        """Добавить Items в батч: ``th_item`` + ``th_outbox`` чанками через ``unnest`` (UC-02).
+
+        Чанк из :data:`ITEM_CHUNK` вызовов — один запрос: ``INSERT th_item …
+        ON CONFLICT (batch_id, key) DO NOTHING RETURNING`` и ``INSERT
+        th_outbox`` из вернувшихся строк. Дубли по ``key`` (с уже
+        существующими Items и внутри одного вызова) не вставляются и
+        считаются в ``duplicates``. В конце один ``upsert_slots``: ``total``,
+        ``w_total``, ``duplicates`` батча и ``tree_total`` корня.
+
+        ``available_at`` записей outbox — ``start_at`` батча или «сейчас»;
+        у батча на паузе — ``infinity`` (запись припаркована до resume).
+        Строка батча держится ``FOR SHARE``: параллельные продюсеры не мешают
+        друг другу, а seal, отмена и финализация ждут commit.
+
+        Опции брокера из ``TaskCall`` (``queue``, ``options``) здесь не
+        сохраняются: в ``th_item`` для них нет колонки.
+
+        Ошибки: ``SpawnTargetError`` — батч является этапом с ``fed_by``;
+        ``SealError`` — батч закрыт, финализирован или отменяется;
+        ``ConfigurationError`` — payload больше ``max_payload_bytes``.
+
+        Args:
+            conn: Соединение в открытой транзакции.
+            batch_id: Батч.
+            calls: Вызовы задач; итерируется один раз, потоково.
+
+        Returns:
+            Сколько Items вставлено и сколько отсечено как дубли.
+        """
+        target = (await self._lock_batches(conn, [batch_id], share=True))[batch_id]
+        self._check_producer_target(target)
+        available_at = self._available_at(target)
+        found = duplicates = w_total = 0
+        for chunk in _chunked(calls, ITEM_CHUNK):
+            inserted, weight = await self._insert_chunk(
+                conn, target.id, calls=chunk, available_at=available_at
+            )
+            found += inserted
+            duplicates += len(chunk) - inserted
+            w_total += weight
+        batch_key = (target.id, self.slot)
+        root_key = (target.root_id, self.slot)
+        deltas = {batch_key: CounterDelta(total=found, w_total=w_total, duplicates=duplicates)}
+        deltas[root_key] = deltas.get(root_key, CounterDelta()) + CounterDelta(tree_total=found)
+        await upsert_slots(conn, self.tables, deltas)
+        return AddResult(found=found, duplicates=duplicates)
+
+    async def _insert_chunk(
+        self,
+        conn: AsyncConnection,
+        batch_id: UUID,
+        *,
+        calls: list[TaskCall],
+        available_at: ColumnElement[datetime],
+    ) -> tuple[int, int]:
+        ids = [self.ids.new_id() for _ in calls]
+        payloads = [self._encode(call) for call in calls]
+        item = self.tables.item
+        outbox = self.tables.outbox
+        rows = (
+            func.unnest(
+                literal(ids, ARRAY(Uuid())),
+                literal([call.task_name for call in calls], ARRAY(Text())),
+                literal(payloads, ARRAY(LargeBinary())),
+                literal([call.key for call in calls], ARRAY(Text())),
+                literal([call.weight for call in calls], ARRAY(Integer())),
+            )
+            .table_valued("id", "task_name", "payload", "key", "weight")
+            .render_derived("u")
+        )
+        source = select(
+            rows.c.id,
+            literal(batch_id, Uuid()),
+            _small_literal(ItemState.ACTIVE),
+            rows.c.task_name,
+            rows.c.payload,
+            rows.c.key,
+            rows.c.weight,
+            sql_now(self.clock),
+        )
+        inserted = (
+            insert(item)
+            .from_select(
+                ["id", "batch_id", "state", "task_name", "payload", "key", "weight", "created_at"],
+                source,
+            )
+            .on_conflict_do_nothing(
+                index_elements=[item.c.batch_id, item.c.key],
+                index_where=item.c.key.is_not(None),
+            )
+            .returning(item.c.id, item.c.task_name, item.c.weight)
+            .cte("ins")
+        )
+        queued = (
+            insert(outbox)
+            .from_select(
+                ["id", "kind", "batch_id", "item_id", "task_name", "available_at"],
+                select(
+                    inserted.c.id,
+                    _small_literal(OutboxKind.ITEM),
+                    literal(batch_id, Uuid()),
+                    inserted.c.id,
+                    inserted.c.task_name,
+                    available_at,
+                ),
+            )
+            .cte("ob")
+        )
+        summary = (
+            select(
+                sql_cast(func.count(), BigInteger),
+                sql_cast(func.coalesce(func.sum(inserted.c.weight), 0), BigInteger),
+            )
+            .select_from(inserted)
+            .add_cte(queued)
+        )
+        count, weight = (await conn.execute(summary)).one()
+        return count, weight
+
+    def _available_at(self, target: _BatchRow) -> ColumnElement[datetime]:
+        if target.paused_at is not None:
+            return literal_column("'infinity'::timestamptz", DateTime(timezone=True))
+        if target.start_at is not None:
+            return literal(target.start_at, DateTime(timezone=True))
+        return sql_now(self.clock)
+
     # --- expect ------------------------------------------------------------
 
     async def expect(self, conn: AsyncConnection, batch_id: UUID, n: int) -> None:
@@ -560,9 +725,9 @@ class Producer:
     # --- общее -------------------------------------------------------------
 
     async def _lock_batches(
-        self, conn: AsyncConnection, batch_ids: Iterable[UUID]
+        self, conn: AsyncConnection, batch_ids: Iterable[UUID], *, share: bool = False
     ) -> dict[UUID, _BatchRow]:
-        # FOR UPDATE в порядке id: глобальный порядок блокировок th_batch.
+        # FOR UPDATE (или FOR SHARE) в порядке id: глобальный порядок блокировок th_batch.
         ids = sorted(set(batch_ids))
         batch = self.tables.batch
         feed = self.tables.feed
@@ -581,7 +746,7 @@ class Producer:
             )
             .where(batch.c.id.in_(ids))
             .order_by(batch.c.id)
-            .with_for_update(of=batch)
+            .with_for_update(of=batch, read=share)
         )
         rows: dict[UUID, _BatchRow] = {}
         for (
@@ -664,6 +829,22 @@ class Producer:
         if isinstance(deadline, timedelta):
             return sql_now(self.clock) + literal(deadline, Interval())
         return literal(deadline, DateTime(timezone=True))
+
+
+def _chunked(calls: Iterable[TaskCall], size: int) -> Iterator[list[TaskCall]]:
+    chunk: list[TaskCall] = []
+    for call in calls:
+        chunk.append(call)
+        if len(chunk) == size:
+            yield chunk
+            chunk = []
+    if chunk:
+        yield chunk
+
+
+def _small_literal(value: int) -> ColumnElement[int]:
+    # Коды состояний — литералами, а не bind-параметрами (D-020).
+    return literal_column(str(int(value)), SmallInteger())
 
 
 def _key_taken(key: str) -> str:
