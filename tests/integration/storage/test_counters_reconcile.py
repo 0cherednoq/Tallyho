@@ -162,3 +162,34 @@ async def test_reconcile_keeps_concurrent_completion(
         await fixer.commit()
     assert drift == CounterDelta(error=-7)
     assert await read_a(engine, schema, tables) == TRUTH + CounterDelta(ok=1, w_done=1)
+
+
+async def test_reconcile_carries_every_field(
+    engine: AsyncEngine, schema: str, tables: Tables
+) -> None:
+    # Счётчики, не выводимые из Items, переносятся из слотов и дельт пути B без потерь.
+    extra = CounterDelta(dispatched=5, duplicates=2, skipped_by_limit=3, tree_total=40)
+    async with schema_transaction(engine, schema) as conn:
+        await seed(conn, tables)
+        await upsert_slots(
+            conn,
+            tables,
+            {
+                (A, 1): CounterDelta(total=5, ok=2, w_total=9, dispatched=4, tree_total=30),
+                (A, 2): CounterDelta(skip=1, w_done=6, duplicates=2),
+            },
+        )
+        await insert_delta(
+            conn,
+            tables,
+            {A: CounterDelta(total=3, w_total=5, dispatched=1, skipped_by_limit=3, tree_total=10)},
+        )
+    async with schema_transaction(engine, schema) as conn:
+        drift = await reconcile(conn, tables, A)
+    assert drift == CounterDelta(ok=1, error=1, cancelled=1, w_done=5)
+    assert await read_a(engine, schema, tables) == TRUTH + extra
+    assert await slots(engine, schema, tables) == {0: 5, 1: 0, 2: 0}
+    # Несвёрнутая дельта со всеми полями осталась в th_counter_delta.
+    async with schema_connection(engine, schema) as conn:
+        pending = await conn.scalar(select(tables.counter_delta.c.d_tree_total))
+    assert pending == 10
