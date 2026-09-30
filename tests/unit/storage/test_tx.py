@@ -6,10 +6,12 @@ from typing import TYPE_CHECKING
 
 import pytest
 from sqlalchemy.exc import OperationalError
+from sqlalchemy.ext.asyncio import AsyncConnection, create_async_engine
 
 from tallyho.storage.tx import (
     RETRYABLE_SQLSTATES,
     RetryPolicy,
+    after_commit,
     is_retryable,
     sqlstate_of,
 )
@@ -97,3 +99,11 @@ def test_default_policy() -> None:
     assert policy.attempts == 5
     assert policy.base_delay == pytest.approx(0.05)
     assert policy.max_delay == pytest.approx(2.0)
+
+
+async def test_after_commit_needs_open_connection() -> None:
+    engine = create_async_engine("postgresql+asyncpg://")
+    conn = AsyncConnection(engine)
+
+    with pytest.raises(TypeError, match="AsyncConnection"):
+        await after_commit(conn, lambda: None)

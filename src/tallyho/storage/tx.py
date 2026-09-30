@@ -9,33 +9,42 @@
   ``statement_timeout`` (:func:`own_transaction`), а :func:`run_transaction`
   повторяет её целиком на ``40001`` (serialization failure), ``40P01``
   (deadlock) и ``55P03`` (lock not available) с экспоненциальным backoff и
-  джиттером.
+  джиттером;
+* :func:`after_commit` вызывает колбэк только после commit внешней транзакции
+  пользователя (откат транзакции или savepoint'а его отбрасывает).
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import random
-from dataclasses import dataclass
+from collections.abc import Callable
+from dataclasses import dataclass, field
 from datetime import timedelta
 from typing import TYPE_CHECKING, Final, TypeVar, cast
+from weakref import WeakKeyDictionary
 
-from sqlalchemy import text
+from sqlalchemy import event, text
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from tallyho.model.errors import ConcurrentModification
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator, Awaitable, Callable
+    from collections.abc import AsyncGenerator, Awaitable
 
+    from sqlalchemy.engine import Connection
     from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
+    from sqlalchemy.orm import Session, SessionTransaction
 
 __all__ = [
     "RETRYABLE_SQLSTATES",
+    "AfterCommit",
     "RetryPolicy",
     "TxSettings",
+    "after_commit",
     "is_retryable",
     "own_transaction",
     "resolve_connection",
@@ -45,6 +54,8 @@ __all__ = [
 ]
 
 T = TypeVar("T")
+
+_log = logging.getLogger(__name__)
 
 RETRYABLE_SQLSTATES: Final = frozenset({"40001", "40P01", "55P03"})
 """SQLSTATE, на которых своя транзакция повторяется: serialization failure,
@@ -242,3 +253,158 @@ async def run_transaction(
                 raise ConcurrentModification(_RETRIES_EXHAUSTED) from exc
         _ = await sleep(policy.delay(retry, rng))
         retry += 1
+
+
+# --- after_commit ---------------------------------------------------------------------
+
+AfterCommit = Callable[[], object]
+"""Колбэк после commit: синхронный, без аргументов; результат игнорируется."""
+
+_NOT_STARTED = "AsyncConnection ещё не открыт: after_commit нужен в транзакции"
+
+
+@dataclass(eq=False)
+class _Pending:
+    """Колбэки одной сессии или соединения и стек их savepoint'ов.
+
+    Для каждого открытого savepoint'а стек хранит число колбэков на момент его
+    начала: откат savepoint'а отбрасывает всё, что зарегистрировано после, а
+    release оставляет колбэки родителю. Savepoint'ы вложены строго (LIFO), поэтому
+    закрывается всегда вершина стека. Если стек пуст, закрывается savepoint,
+    открытый до первой регистрации, — он старше всех колбэков, и его откат
+    отбрасывает всё.
+    """
+
+    callbacks: list[AfterCommit] = field(default_factory=list)
+    stack: list[int] = field(default_factory=list)
+    released: set[object] = field(default_factory=set)
+
+    def savepoint_started(self) -> None:
+        self.stack.append(len(self.callbacks))
+
+    def savepoint_ended(self, *, rolled_back: bool) -> None:
+        start = self.stack.pop() if self.stack else 0
+        if rolled_back:
+            del self.callbacks[start:]
+
+    def committed(self) -> None:
+        callbacks = self.callbacks
+        self.reset()
+        for callback in callbacks:
+            _run_callback(callback)
+
+    def reset(self) -> None:
+        self.callbacks = []
+        self.stack.clear()
+        self.released.clear()
+
+
+def _run_callback(callback: AfterCommit) -> None:
+    # Commit уже состоялся: ошибка колбэка не должна выглядеть как ошибка commit
+    # и не должна мешать остальным колбэкам. Колбэки — подсказки (kick relay,
+    # fold), пропуск страхуют relay scan и sweeper.
+    try:
+        _ = callback()
+    except Exception:  # ruff: ignore[blind-except]  # commit уже прошёл, ошибку только логируем
+        _log.exception("after_commit: колбэк %r упал", callback)
+
+
+_sessions: WeakKeyDictionary[Session, _Pending] = WeakKeyDictionary()
+_connections: WeakKeyDictionary[Connection, _Pending] = WeakKeyDictionary()
+
+
+def _session_pending(session: Session) -> _Pending:
+    pending = _sessions.get(session)
+    if pending is not None:
+        return pending
+    pending = _sessions[session] = _Pending()
+
+    def on_create(_session: Session, transaction: SessionTransaction) -> None:
+        if transaction.nested:
+            pending.savepoint_started()
+
+    def on_commit(sess: Session) -> None:
+        # after_commit срабатывает и на release savepoint'а, пока он ещё текущий.
+        nested = sess.get_nested_transaction()
+        if nested is None:
+            pending.committed()
+        else:
+            pending.released.add(nested)
+
+    def on_end(_session: Session, transaction: SessionTransaction) -> None:
+        if transaction.nested:
+            released = transaction in pending.released
+            pending.released.discard(transaction)
+            pending.savepoint_ended(rolled_back=not released)
+        elif transaction.parent is None:
+            pending.reset()
+
+    event.listen(session, "after_transaction_create", on_create)
+    event.listen(session, "after_commit", on_commit)
+    event.listen(session, "after_transaction_end", on_end)
+    return pending
+
+
+def _connection_pending(conn: Connection) -> _Pending:
+    pending = _connections.get(conn)
+    if pending is not None:
+        return pending
+    pending = _connections[conn] = _Pending()
+
+    # Имя в событии savepoint бывает None (его генерирует SQLAlchemy позже),
+    # поэтому savepoint'ы соединения отслеживаются стеком, а не по имени.
+    def on_savepoint(_conn: Connection, _name: str | None) -> None:
+        pending.savepoint_started()
+
+    def on_release(_conn: Connection, _name: str, _context: object) -> None:
+        pending.savepoint_ended(rolled_back=False)
+
+    def on_rollback_savepoint(_conn: Connection, _name: str, _context: object) -> None:
+        pending.savepoint_ended(rolled_back=True)
+
+    def on_commit(_conn: Connection) -> None:
+        pending.committed()
+
+    def on_rollback(_conn: Connection) -> None:
+        pending.reset()
+
+    event.listen(conn, "savepoint", on_savepoint)
+    event.listen(conn, "release_savepoint", on_release)
+    event.listen(conn, "rollback_savepoint", on_rollback_savepoint)
+    event.listen(conn, "commit", on_commit)
+    event.listen(conn, "rollback", on_rollback)
+    return pending
+
+
+async def after_commit(target: AsyncSession | AsyncConnection, callback: AfterCommit) -> None:
+    """Вызвать ``callback`` после commit внешней транзакции ``target``.
+
+    Колбэк привязан к текущему уровню транзакции: откат savepoint'а (или всей
+    транзакции) отбрасывает его, release savepoint'а передаёт родителю, а
+    commit корневой транзакции вызывает — ровно один раз. Колбэки вызываются в
+    порядке регистрации; исключение колбэка логируется и не мешает остальным.
+
+    * ``AsyncSession`` — события ``sync_session``; колбэк вызывается после
+      успешного COMMIT. Сессия начинает транзакцию, если её ещё нет.
+    * ``AsyncConnection`` — события ``Connection``. В SQLAlchemy нет события
+      после COMMIT соединения, поэтому колбэк вызывается событием ``commit``
+      непосредственно **перед** отправкой COMMIT. Если COMMIT упадёт, колбэк
+      уже вызван, а данные транзакции могут быть ещё не видны другим
+      соединениям. Колбэк должен только подталкивать фоновую работу, которая
+      перечитывает БД сама и страхуется опросом (relay scan, sweeper).
+
+    Args:
+        target: Сессия или соединение пользователя.
+        callback: Синхронная функция без аргументов; должна быть быстрой.
+
+    Raises:
+        TypeError: ``AsyncConnection`` ещё не открыт.
+    """
+    if isinstance(target, AsyncSession):
+        _ = await target.connection()
+        _session_pending(target.sync_session).callbacks.append(callback)
+        return
+    sync = target.sync_connection
+    if sync is None:
+        raise TypeError(_NOT_STARTED)
+    _connection_pending(sync).callbacks.append(callback)
