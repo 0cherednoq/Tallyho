@@ -159,7 +159,11 @@ async def open_completer(
         engine=engine,
         clock=clock or MovableClock(),
         settings=settings,
-        triggers=CompleterTriggers(finalizer=finalizer, relay=relay),
+        triggers=CompleterTriggers(
+            finalizer=finalizer,
+            relay=relay,
+            producer=env.producer,
+        ),
     )
     try:
         yield completer

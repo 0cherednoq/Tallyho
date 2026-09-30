@@ -75,6 +75,7 @@ __all__ = [
     "AddResult",
     "BatchRef",
     "CallbackName",
+    "InsertResult",
     "Producer",
     "RootSpec",
     "StoredCallback",
@@ -306,6 +307,14 @@ class AddResult:
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
+class InsertResult:
+    """Фактически вставленные строки до записи агрегатных счётчиков."""
+
+    found: int
+    weight: int
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
 class BatchRef:
     """Созданный или найденный батч.
 
@@ -418,15 +427,43 @@ class Producer:
         Returns:
             Ссылка на под-батч; ``created=False`` для существующего.
 
+        """
+        ref = await self.create_sub_batch_unaccounted(conn, parent_id, spec)
+        if ref.created:
+            await upsert_slots(conn, self.tables, {(parent_id, self.slot): CounterDelta(total=1)})
+        return ref
+
+    async def create_sub_batch_unaccounted(
+        self,
+        conn: AsyncConnection,
+        parent_id: UUID,
+        spec: SubBatchSpec,
+        *,
+        from_task: bool = False,
+    ) -> BatchRef:
+        """Создать под-батч без записи счётчика виртуального Item.
+
+        Примитив Completer: вызывающий при ``created=True`` добавляет
+        ``CounterDelta(total=1)`` родителю в свой единый агрегированный write.
+
+        Returns:
+            Созданный или ранее существовавший под-батч.
+
         Raises:
             ConfigurationError: ключ в дереве уже занят под-батчем другого
                 родителя.
+            SealError: задача пытается создать новый под-батч у терминального
+                или отменяемого родителя.
         """
         parent = (await self._lock_batches(conn, [parent_id]))[parent_id]
         existing = await self._find_child(conn, parent, spec.key)
         if existing is not None:
             return existing
-        self._check_producer_target(parent)
+        if from_task:
+            if parent.state.is_terminal or parent.cancel_requested_at is not None:
+                raise SealError(_NOT_OPEN)
+        else:
+            self._check_producer_target(parent)
         child_id = self.ids.new_id()
         virtual_id = self.ids.new_id()
         now = sql_now(self.clock)
@@ -482,7 +519,6 @@ class Producer:
                 created_at=now,
             )
         )
-        await upsert_slots(conn, self.tables, {(parent.id, self.slot): CounterDelta(total=1)})
         if spec.fed_by:
             await self.add_feed(conn, child_id, spec.fed_by)
         return BatchRef(id=child_id, root_id=parent.root_id, created=True)
@@ -608,12 +644,16 @@ class Producer:
         available_at = self._available_at(target)
         found = duplicates = w_total = 0
         for chunk in _chunked(calls, ITEM_CHUNK):
-            inserted, weight = await self._insert_chunk(
-                conn, target.id, calls=chunk, available_at=available_at
+            inserted = await self.insert_items(
+                conn,
+                target.id,
+                calls=chunk,
+                depths=[0] * len(chunk),
+                available_at=available_at,
             )
-            found += inserted
-            duplicates += len(chunk) - inserted
-            w_total += weight
+            found += inserted.found
+            duplicates += len(chunk) - inserted.found
+            w_total += inserted.weight
         batch_key = (target.id, self.slot)
         root_key = (target.root_id, self.slot)
         deltas = {batch_key: CounterDelta(total=found, w_total=w_total, duplicates=duplicates)}
@@ -621,14 +661,32 @@ class Producer:
         await upsert_slots(conn, self.tables, deltas)
         return AddResult(found=found, duplicates=duplicates)
 
-    async def _insert_chunk(
+    async def insert_items(
         self,
         conn: AsyncConnection,
         batch_id: UUID,
         *,
         calls: list[TaskCall],
+        depths: Sequence[int],
         available_at: ColumnElement[datetime],
-    ) -> tuple[int, int]:
+    ) -> InsertResult:
+        """Вставить Items и outbox без счётчиков (примитив Producer/Completer).
+
+        Вызывающий агрегирует ``total/w_total/duplicates/tree_total`` и пишет
+        счётчики один раз в своей транзакции. Пустой список допустим.
+
+        Returns:
+            Число и суммарный вес строк после дедупликации.
+
+        Raises:
+            ConfigurationError: число depth не совпадает с числом вызовов,
+                payload превышает лимит или опции не сериализуются в JSON.
+        """
+        if len(calls) != len(depths):
+            message = "для каждого spawn требуется depth"
+            raise ConfigurationError(message)
+        if not calls:
+            return InsertResult(found=0, weight=0)
         ids = [self.ids.new_id() for _ in calls]
         payloads = [self._encode(call) for call in calls]
         options = [_call_options(call) for call in calls]
@@ -641,9 +699,10 @@ class Producer:
                 literal(payloads, ARRAY(LargeBinary())),
                 literal([call.key for call in calls], ARRAY(Text())),
                 literal([call.weight for call in calls], ARRAY(Integer())),
+                literal(list(depths), ARRAY(SmallInteger())),
                 literal(options, ARRAY(Text())),
             )
-            .table_valued("id", "task_name", "payload", "key", "weight", "options")
+            .table_valued("id", "task_name", "payload", "key", "weight", "depth", "options")
             .render_derived("u")
         )
         source = select(
@@ -654,6 +713,7 @@ class Producer:
             rows.c.payload,
             rows.c.key,
             rows.c.weight,
+            rows.c.depth,
             sql_cast(rows.c.options, JSONB),
             sql_now(self.clock),
         )
@@ -668,6 +728,7 @@ class Producer:
                     "payload",
                     "key",
                     "weight",
+                    "depth",
                     "options",
                     "created_at",
                 ],
@@ -704,14 +765,22 @@ class Producer:
             .add_cte(queued)
         )
         count, weight = (await conn.execute(summary)).one()
-        return count, weight
+        return InsertResult(found=count, weight=weight)
+
+    def available_at(self, *, paused: bool, start_at: datetime | None) -> ColumnElement[datetime]:
+        """Время доступности outbox для известного состояния целевого батча.
+
+        Returns:
+            ``infinity`` на паузе, ``start_at`` или текущее время SQL.
+        """
+        if paused:
+            return literal_column("'infinity'::timestamptz", DateTime(timezone=True))
+        if start_at is not None:
+            return literal(start_at, DateTime(timezone=True))
+        return sql_now(self.clock)
 
     def _available_at(self, target: _BatchRow) -> ColumnElement[datetime]:
-        if target.paused_at is not None:
-            return literal_column("'infinity'::timestamptz", DateTime(timezone=True))
-        if target.start_at is not None:
-            return literal(target.start_at, DateTime(timezone=True))
-        return sql_now(self.clock)
+        return self.available_at(paused=target.paused_at is not None, start_at=target.start_at)
 
     # --- seal ----------------------------------------------------------------
 

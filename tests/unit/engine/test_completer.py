@@ -8,8 +8,21 @@ from uuid import uuid4
 
 import pytest
 
-from tallyho.engine.completer import ClaimOutcome, ClaimResult, CompleterSettings, ItemRef
+from tallyho.engine.completer import (
+    ClaimOutcome,
+    ClaimResult,
+    CompleterSettings,
+    ExpectRequest,
+    FinishResult,
+    ItemRef,
+    SpawnRequest,
+    SubBatchRequest,
+)
+from tallyho.engine.producer import SubBatchSpec
+from tallyho.engine.spawn import SpawnRoute
+from tallyho.model.calls import TaskCall
 from tallyho.model.errors import ConfigurationError
+from tallyho.model.states import ResultClass
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -50,3 +63,39 @@ def test_item_ref_is_hashable_value() -> None:
     item_id, batch_id = uuid4(), uuid4()
     assert ItemRef(item_id, batch_id) == ItemRef(item_id, batch_id)
     assert len({ItemRef(item_id, batch_id), ItemRef(item_id, batch_id)}) == 1
+
+
+@pytest.mark.parametrize("value", [-1, True])
+def test_expect_rejects_invalid_total(value: int) -> None:
+    source = uuid4()
+    route = SpawnRoute(source_id=source, target_id=source, root_id=source)
+    with pytest.raises(ConfigurationError, match="expected"):
+        _ = ExpectRequest(route=route, total=value)
+
+
+def test_finish_result_freezes_dynamic_buffers() -> None:
+    source = uuid4()
+    route = SpawnRoute(source_id=source, target_id=source, root_id=source)
+    spawn = SpawnRequest(route=route, call=TaskCall(task_name="child"))
+    expect = ExpectRequest(route=route, total=2)
+    sub = SubBatchRequest(spec=SubBatchSpec(key="parts"), calls=[TaskCall(task_name="part")])
+    metrics = {"bytes": 1}
+    spawns = [spawn]
+    expects = [expect]
+    subs = [sub]
+    value = FinishResult(
+        result_class=ResultClass.OK,
+        metrics=metrics,
+        spawns=spawns,
+        expects=expects,
+        sub_batches=subs,
+    )
+    metrics["bytes"] = 2
+    spawns.clear()
+    expects.clear()
+    subs.clear()
+    assert dict(value.metrics) == {"bytes": 1}
+    assert value.spawns == (spawn,)
+    assert value.expects == (expect,)
+    assert value.sub_batches == (sub,)
+    assert sub.calls == (TaskCall(task_name="part"),)

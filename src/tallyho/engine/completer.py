@@ -45,6 +45,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import timedelta
 from enum import StrEnum
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Final, Protocol, TypeVar, final
 
 from sqlalchemy import (
@@ -65,10 +66,15 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB, insert
 
 from tallyho.engine.relay import release_window
-from tallyho.model.errors import CompleterError, ConfigurationError, InvalidStateError
-from tallyho.model.states import ItemState, OutboxKind, ResultClass
+from tallyho.model.errors import (
+    CompleterError,
+    ConfigurationError,
+    InvalidStateError,
+    SpawnTargetError,
+)
+from tallyho.model.states import BatchState, ItemState, OutboxKind, ResultClass
 from tallyho.protocols.observer import NullObserver
-from tallyho.storage.counters import CounterDelta, upsert_metrics, upsert_slots
+from tallyho.storage.counters import CounterDelta, read_counters, upsert_metrics, upsert_slots
 from tallyho.storage.now import sql_now
 from tallyho.storage.tx import RetryPolicy, TxSettings, run_transaction
 
@@ -80,8 +86,12 @@ if TYPE_CHECKING:
     from sqlalchemy import ColumnElement
     from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
+    from tallyho.engine.producer import Producer, SubBatchSpec
+    from tallyho.engine.spawn import SpawnRoute, TreeCache
+    from tallyho.model.calls import TaskCall
     from tallyho.protocols.clock import Clock
     from tallyho.protocols.observer import Observer
+    from tallyho.storage.counters import CounterTotals
     from tallyho.storage.tables import Tables
 
 __all__ = [
@@ -91,10 +101,13 @@ __all__ = [
     "Completer",
     "CompleterSettings",
     "CompleterTriggers",
+    "ExpectRequest",
     "FinalizeTrigger",
     "FinishResult",
     "ItemRef",
     "RelayTrigger",
+    "SpawnRequest",
+    "SubBatchRequest",
 ]
 
 _log = logging.getLogger(__name__)
@@ -107,6 +120,9 @@ CANCELLED_LABEL: Final = "cancelled"
 _CLOSED = "Completer закрыт: новые операции не принимаются"
 _OTHER_LOOP = "Completer привязан к другому event loop: создайте свой экземпляр на loop"
 _FLUSH_FAILED = "групповая транзакция Completer не прошла"
+_SPAWN_SERVICES = "Completer не настроен для spawn: передайте Producer в CompleterTriggers"
+_SPAWN_ROUTE = "маршрут spawn не соответствует завершаемому Item или дереву"
+_SPAWN_TARGET_CLOSED = "целевой этап spawn уже закрыт"
 
 
 class ClaimOutcome(StrEnum):
@@ -234,6 +250,47 @@ class CompleterTriggers:
 
     finalizer: FinalizeTrigger | None = None
     relay: RelayTrigger | None = None
+    producer: Producer | None = None
+    tree_cache: TreeCache | None = None
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class SpawnRequest:
+    """Вызов, чей маршрут проверен :class:`~tallyho.engine.spawn.TreeSnapshot`."""
+
+    route: SpawnRoute
+    call: TaskCall
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class ExpectRequest:
+    """Монотонное обновление expected целевого батча."""
+
+    route: SpawnRoute
+    total: int
+
+    def __post_init__(self) -> None:
+        """Проверить неотрицательное ожидаемое число.
+
+        Raises:
+            ConfigurationError: ``total`` отрицателен или является bool.
+        """
+        if isinstance(self.total, bool) or self.total < 0:
+            message = f"expected должен быть целым >= 0, получено {self.total!r}"
+            raise ConfigurationError(message)
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class SubBatchRequest:
+    """Динамический под-батч и его начальные Items из одной задачи."""
+
+    spec: SubBatchSpec
+    calls: Sequence[TaskCall] = ()
+    seal: bool = True
+
+    def __post_init__(self) -> None:
+        """Заморозить начальные вызовы."""
+        object.__setattr__(self, "calls", tuple(self.calls))
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -246,6 +303,16 @@ class FinishResult:
     error: object = None
     metrics: Mapping[str, int] = field(default_factory=dict[str, int])
     mark: bool | None = None
+    spawns: Sequence[SpawnRequest] = ()
+    expects: Sequence[ExpectRequest] = ()
+    sub_batches: Sequence[SubBatchRequest] = ()
+
+    def __post_init__(self) -> None:
+        """Заморозить накопленные во время задачи буферы."""
+        object.__setattr__(self, "metrics", MappingProxyType(dict(self.metrics)))
+        object.__setattr__(self, "spawns", tuple(self.spawns))
+        object.__setattr__(self, "expects", tuple(self.expects))
+        object.__setattr__(self, "sub_batches", tuple(self.sub_batches))
 
     @property
     def effective_label(self) -> str:
@@ -306,8 +373,13 @@ def _pending(ops: Sequence[_Op]) -> list[_Op]:
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class _BatchFlags:
+    root_id: UUID
+    state: BatchState
     paused: bool
     cancel_requested: bool
+    start_at: datetime | None
+    max_items: int | None
+    max_depth: int | None
 
 
 @dataclass(slots=True, kw_only=True)
@@ -335,6 +407,7 @@ class _Applied:
     released: set[UUID] = field(default_factory=set["UUID"])
     finalize: set[UUID] = field(default_factory=set["UUID"])
     kick: set[UUID] = field(default_factory=set["UUID"])
+    invalidate_trees: set[UUID] = field(default_factory=set["UUID"])
     finished: dict[UUID, tuple[UUID, FinishResult, int]] = field(
         default_factory=dict["UUID", tuple["UUID", FinishResult, int]]
     )
@@ -366,7 +439,7 @@ class _Tx:
 
     # --- блокировки ----------------------------------------------------------------
 
-    async def lock_batches(self, batch_ids: Iterable[UUID]) -> None:
+    async def lock_batches(self, batch_ids: Iterable[UUID], *, write: bool = False) -> None:
         ids = sorted(set(batch_ids))
         if not ids:
             return
@@ -374,15 +447,37 @@ class _Tx:
         result = await self.conn.execute(
             select(
                 batch.c.id,
+                batch.c.root_id,
+                batch.c.state,
                 batch.c.paused_at.is_not(None),
                 batch.c.cancel_requested_at.is_not(None),
+                batch.c.start_at,
+                batch.c.max_items,
+                batch.c.max_depth,
             )
             .where(batch.c.id == any_(_uuids(ids)))
             .order_by(batch.c.id)
-            .with_for_update(read=True)
+            .with_for_update(read=not write)
         )
-        for batch_id, paused, cancel_requested in result:
-            self.batches[batch_id] = _BatchFlags(paused=paused, cancel_requested=cancel_requested)
+        for (
+            batch_id,
+            root_id,
+            state,
+            paused,
+            cancel_requested,
+            start_at,
+            max_items,
+            max_depth,
+        ) in result:
+            self.batches[batch_id] = _BatchFlags(
+                root_id=root_id,
+                state=BatchState(state),
+                paused=paused,
+                cancel_requested=cancel_requested,
+                start_at=start_at,
+                max_items=max_items,
+                max_depth=max_depth,
+            )
 
     async def lock_items(self, item_ids: Iterable[UUID]) -> None:
         ids = sorted(set(item_ids))
@@ -739,6 +834,202 @@ class _Tx:
         released = await self._release_window(successful)
         self.applied.kick.update(released)
 
+    async def expand(self, values: dict[UUID, tuple[ItemRef, FinishResult]]) -> None:
+        """Записать spawn/expect только для Items, чей CAS finish был успешен."""
+        successful = set(self.applied.finished)
+        if not successful:
+            return
+        spawns: list[tuple[UUID, SpawnRequest]] = []
+        expects: list[tuple[UUID, ExpectRequest]] = []
+        for item_id in sorted(successful):
+            _, finish = values[item_id]
+            spawns.extend((item_id, request) for request in finish.spawns)
+            expects.extend((item_id, request) for request in finish.expects)
+        await self._spawn(spawns)
+        await self._expect(expects)
+        await self._sub_batches(values, successful)
+
+    async def _sub_batches(
+        self,
+        values: dict[UUID, tuple[ItemRef, FinishResult]],
+        successful: set[UUID],
+    ) -> None:
+        requests = [
+            (item_id, request)
+            for item_id in sorted(successful)
+            for request in values[item_id][1].sub_batches
+        ]
+        if not requests:
+            return
+        producer = self.c.triggers.producer
+        if producer is None:
+            raise ConfigurationError(_SPAWN_SERVICES)
+        root_ids = {self.items[item_id].batch_id for item_id, _ in requests}
+        roots = {self.batches[batch_id].root_id for batch_id in root_ids}
+        totals = await read_counters(self.conn, self.tables, roots)
+        for item_id, request in requests:
+            parent_id = self.items[item_id].batch_id
+            root_id = self.batches[parent_id].root_id
+            await self._sub_batch(
+                producer,
+                parent_id=parent_id,
+                request=request,
+                total=totals[root_id],
+            )
+
+    async def _sub_batch(
+        self,
+        producer: Producer,
+        *,
+        parent_id: UUID,
+        request: SubBatchRequest,
+        total: CounterTotals,
+    ) -> None:
+        parent = self.batches[parent_id]
+        ref = await producer.create_sub_batch_unaccounted(
+            self.conn, parent_id, request.spec, from_task=True
+        )
+        if ref.created:
+            self.deltas[parent_id] += CounterDelta(total=1)
+            self.applied.invalidate_trees.add(ref.root_id)
+        calls = list(request.calls)
+        over_items = parent.max_items is not None and total.tree_total >= parent.max_items
+        accepted = [] if over_items else calls
+        found = weight = duplicates = 0
+        for start in range(0, len(accepted), 1000):
+            chunk = accepted[start : start + 1000]
+            inserted = await producer.insert_items(
+                self.conn,
+                ref.id,
+                calls=chunk,
+                depths=[0] * len(chunk),
+                available_at=producer.available_at(
+                    paused=parent.paused,
+                    start_at=request.spec.start_at or parent.start_at,
+                ),
+            )
+            found += inserted.found
+            weight += inserted.weight
+            duplicates += len(chunk) - inserted.found
+        self.deltas[ref.id] += CounterDelta(
+            total=found,
+            w_total=weight,
+            duplicates=duplicates,
+            skipped_by_limit=len(calls) - len(accepted),
+        )
+        self.deltas[ref.root_id] += CounterDelta(tree_total=found)
+        if found:
+            self.applied.kick.add(ref.id)
+        if request.seal and not request.spec.fed_by:
+            batch = self.tables.batch
+            _ = await self.conn.execute(
+                update(batch)
+                .where(batch.c.id == ref.id, batch.c.state == _small(BatchState.OPEN))
+                .values(state=_small(BatchState.SEALED), updated_at=self.now)
+            )
+            self.applied.finalize.add(ref.id)
+
+    async def _spawn(self, requests: list[tuple[UUID, SpawnRequest]]) -> None:
+        if not requests:
+            return
+        producer = self.c.triggers.producer
+        if producer is None:
+            raise ConfigurationError(_SPAWN_SERVICES)
+        roots = {request.route.root_id for _, request in requests}
+        totals = await read_counters(self.conn, self.tables, roots)
+        accepted: defaultdict[UUID, list[tuple[TaskCall, int]]] = defaultdict(list)
+        skipped: defaultdict[UUID, int] = defaultdict(int)
+        for item_id, request in requests:
+            parent = self.items[item_id]
+            target = self._validate_route(parent.batch_id, request.route)
+            depth = parent.depth + 1 if request.route.into_self else 0
+            over_depth = target.max_depth is not None and depth > target.max_depth
+            root_total = totals[request.route.root_id].tree_total
+            over_items = target.max_items is not None and root_total >= target.max_items
+            if over_depth or over_items:
+                skipped[request.route.target_id] += 1
+                continue
+            accepted[request.route.target_id].append((request.call, depth))
+        for target_id in sorted(set(accepted) | set(skipped)):
+            await self._spawn_target(
+                producer,
+                target_id=target_id,
+                rows=accepted[target_id],
+                skipped=skipped[target_id],
+            )
+
+    async def _spawn_target(
+        self,
+        producer: Producer,
+        *,
+        target_id: UUID,
+        rows: list[tuple[TaskCall, int]],
+        skipped: int,
+    ) -> None:
+        target = self.batches[target_id]
+        found = weight = duplicates = 0
+        for start in range(0, len(rows), 1000):
+            chunk = rows[start : start + 1000]
+            inserted = await producer.insert_items(
+                self.conn,
+                target_id,
+                calls=[call for call, _ in chunk],
+                depths=[depth for _, depth in chunk],
+                available_at=producer.available_at(
+                    paused=target.paused,
+                    start_at=target.start_at,
+                ),
+            )
+            found += inserted.found
+            weight += inserted.weight
+            duplicates += len(chunk) - inserted.found
+        self.deltas[target_id] += CounterDelta(
+            total=found,
+            w_total=weight,
+            duplicates=duplicates,
+            skipped_by_limit=skipped,
+        )
+        self.deltas[target.root_id] += CounterDelta(tree_total=found)
+        if found:
+            self.applied.kick.add(target_id)
+
+    async def _expect(self, requests: list[tuple[UUID, ExpectRequest]]) -> None:
+        if not requests:
+            return
+        expected: dict[UUID, int] = {}
+        for item_id, request in requests:
+            source_id = self.items[item_id].batch_id
+            _ = self._validate_route(source_id, request.route)
+            expected[request.route.target_id] = max(
+                expected.get(request.route.target_id, 0), request.total
+            )
+        batch = self.tables.batch
+        for target_id in sorted(expected):
+            _ = await self.conn.execute(
+                update(batch)
+                .where(batch.c.id == target_id)
+                .values(
+                    expected_total=func.greatest(
+                        batch.c.expected_total, literal(expected[target_id], BigInteger())
+                    )
+                )
+            )
+
+    def _validate_route(self, source_id: UUID, route: SpawnRoute) -> _BatchFlags:
+        source = self.batches.get(source_id)
+        target = self.batches.get(route.target_id)
+        if source is None or target is None:
+            raise SpawnTargetError(_SPAWN_ROUTE)
+        if (
+            route.source_id != source_id
+            or route.root_id != source.root_id
+            or target.root_id != source.root_id
+        ):
+            raise SpawnTargetError(_SPAWN_ROUTE)
+        if not route.into_self and target.state is not BatchState.OPEN:
+            raise SpawnTargetError(_SPAWN_TARGET_CLOSED)
+        return target
+
     async def _write_marks(self, item_ids: list[UUID], values: dict[UUID, FinishResult]) -> None:
         rows = [
             {
@@ -907,7 +1198,13 @@ class Completer:
         Returns:
             ``True``, если этот вызов перевёл Item из active в терминальное
             состояние; ``False`` для повторного или уже завершённого Item.
+
+        Raises:
+            ConfigurationError: есть динамические операции, но Completer
+                создан без Producer.
         """
+        if (value.spawns or value.sub_batches) and self.triggers.producer is None:
+            raise ConfigurationError(_SPAWN_SERVICES)
         future = self._new_future(bool)
         return await self._submit(_Finish(item, value, future), future)
 
@@ -1045,7 +1342,28 @@ class Completer:
         # Все блокировки строк — в начале и по порядку: batch → item → lease.
         batch_ids = [ref.batch_id for ref in claims.values()]
         batch_ids.extend(op.item.batch_id for op in ops if isinstance(op, _Finish))
-        await tx.lock_batches(batch_ids)
+        writes_structure = False
+        for _, value in finishes.values():
+            for spawn_request in value.spawns:
+                batch_ids.extend(
+                    [
+                        spawn_request.route.source_id,
+                        spawn_request.route.target_id,
+                        spawn_request.route.root_id,
+                    ]
+                )
+            for expect_request in value.expects:
+                batch_ids.extend(
+                    [
+                        expect_request.route.source_id,
+                        expect_request.route.target_id,
+                        expect_request.route.root_id,
+                    ]
+                )
+            for sub_batch in value.sub_batches:
+                writes_structure = True
+                batch_ids.extend(sub_batch.spec.fed_by)
+        await tx.lock_batches(batch_ids, write=writes_structure)
         await tx.lock_items([*releases, *claims, *finishes])
         await tx.lock_leases([*releases, *claims, *beats, *finishes])
         # release раньше claim: ретрай брокера мог прийти в ту же пачку.
@@ -1053,6 +1371,7 @@ class Completer:
         await tx.claim(claims)
         await tx.heartbeat(beats)
         await tx.finish(finishes)
+        await tx.expand(finishes)
         await tx.write_counters()
         return tx.applied
 
@@ -1114,6 +1433,9 @@ class Completer:
             _log.exception("Observer упал на событии Completer")
 
     async def _after_commit(self, applied: _Applied) -> None:
+        if self.triggers.tree_cache is not None:
+            for root_id in applied.invalidate_trees:
+                self.triggers.tree_cache.invalidate(root_id)
         if self.triggers.relay is not None and applied.kick:
             self.triggers.relay.kick(sorted(applied.kick))
         if self.triggers.finalizer is None:
