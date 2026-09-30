@@ -301,7 +301,7 @@ classDiagram
         <<Protocol>>
         +wrap(fn) fn
         +retry_verdict(exc) Verdict
-        +reconcile_dead(since) list~UUID~
+        +reconcile_dead(cursor) DeadLetters
     }
 
     Tallyho --> BatchBuilder
@@ -341,7 +341,7 @@ UUIDv7 генерируем сами (≈30 строк). В Python 3.14+ исп�
 
 | Протокол | Кто реализует | Для чего |
 |---|---|---|
-| `Dispatcher`, `Runtime` | адаптер брокера | отправка; обёртка исполнения, вердикт ретрая, сверка с DLQ (§11.3) |
+| `Dispatcher`, `Runtime`, `PayloadCodec` | адаптер брокера | отправка; обёртка исполнения, вердикт ретрая, сверка с DLQ по курсору (§11.3); кодек payload Items (без своего кодека — `SerializerCodec` поверх `Serializer`) |
 | Tx-хуки `on_finalized / on_progress / on_policy_breach` | пользователь | перенос итога и прогресса в доменные таблицы (§7) |
 | `Serializer` | пользователь (есть json/msgspec) | аргументы задач, `result` Item |
 | `Observer` | пользователь | метрики, OpenTelemetry, логи — вне транзакций, fire-and-forget |
