@@ -2,4 +2,22 @@
 
 from __future__ import annotations
 
-__all__: list[str] = []
+from tallyho.hooks.registry import (
+    FinalizedHook,
+    HookName,
+    HookRegistry,
+    PolicyBreachHook,
+    ProgressHook,
+    ProgressRegistration,
+    import_hook_modules,
+)
+
+__all__ = [
+    "FinalizedHook",
+    "HookName",
+    "HookRegistry",
+    "PolicyBreachHook",
+    "ProgressHook",
+    "ProgressRegistration",
+    "import_hook_modules",
+]
