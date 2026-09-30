@@ -367,6 +367,7 @@ erDiagram
     TH_BATCH ||--o{ TH_FEED : "fed_id: кто наполняет"
     TH_ITEM ||--o| TH_LEASE : "пока выполняется"
     TH_ITEM ||--o| TH_ITEM_MARK : "только помеченные"
+    TH_ITEM ||--o| TH_WINDOW : "отправлен, окно max_in_flight"
 
     TH_BATCH {
         uuid id PK "UUIDv7"
@@ -407,6 +408,7 @@ erDiagram
         smallint depth "глубина самоподпитки"
         text task_name
         bytea payload
+        jsonb options "NULL, queue и опции брокера вызова"
         text key "NULL"
         uuid child_batch_id "NULL"
         int weight
@@ -422,6 +424,7 @@ erDiagram
         uuid item_id "NULL"
         text task_name "NULL"
         bytea payload "NULL"
+        jsonb options "NULL, опции колбэка"
         timestamptz available_at
         smallint attempts
     }
@@ -479,6 +482,10 @@ erDiagram
         text label PK
         uuid item_id PK
     }
+    TH_WINDOW {
+        uuid item_id PK
+        uuid batch_id
+    }
 ```
 
 `th_meta(key PK, value)` хранит версию схемы и на диаграмме не показана. Колонок `status` и `data` у батча нет: доменное состояние живёт у пользователя.
@@ -501,7 +508,8 @@ erDiagram
 | th_item | `(batch_id, id)` | листинг, cancel, reconcile | O(log n + k) |
 | th_item | `UNIQUE (batch_id, key) WHERE key IS NOT NULL` | дедуп spawn/add | O(log n) |
 | th_outbox | `(available_at)` | relay | размер = неотправленное |
-| th_outbox | `(batch_id)` | pause/resume/cancel/reschedule | размер = неотправленное |
+| th_outbox | `(batch_id, available_at)` | pause/resume/cancel/reschedule; окно `max_in_flight`: запаркованные (`∞`) и готовые записи батча | размер = неотправленное |
+| th_window | PK `(item_id)`, `(batch_id)` | окно `max_in_flight`: сколько Items батча отправлено и не завершено | размер ≤ сумма окон активных батчей |
 | th_lease | PK, `(lease_until)` | claim, истёкшие lease | размер = in-flight |
 | th_lease | `(batch_id)` | `handle.in_flight()`, `in_flight` в прогрессе | размер = in-flight |
 | th_feed | PK `(feeder_id, fed_id)` | при финализации источника: какие этапы он наполняет | O(log n) |
@@ -1407,6 +1415,8 @@ await th.migrate()                          # или в Alembic: tallyho.storage
 `into=` — ключ под-батча внутри дерева (`"cards"`) или `BatchHandle`. `key=` — ключ дедупликации Item в целевом батче. Для URL рекомендуем нормализованный адрес без фрагмента, как `uniqueKey` у Crawlee.
 
 `max_in_flight` действует **на этот экземпляр батча**. Глобальный лимит на тип задачи для всех батчей сразу — это забота брокера (flexiq `max_concurrent`, `rate_limit`). Это разделение важно: у Airflow `max_active_tis_per_dag` неожиданно действует на все запуски.
+
+Окно считается по узкой таблице `th_window`: relay при захвате записи outbox вставляет строку `(item_id, batch_id)`, завершение Item её удаляет и возвращает в очередь столько запаркованных записей батча, сколько мест освободилось. Захват по батчу с окном сериализуется `pg_try_advisory_xact_lock`: занятый батч relay пропускает до следующего прохода. Записи сверх окна паркуются (`available_at = ∞`), scan relay страхует возврат мест. Строка окна ключом по `item_id`, поэтому повторный захват после падения relay место не удваивает.
 
 Метки итога — свободные строки. По умолчанию `ok()` без label → `"ok"`, исчерпанные попытки → `error("exhausted")`, lease истёк на последней попытке → `error("lease_expired")`, отмена → `cancelled`. `error()` по умолчанию помечается в `th_item_mark`, `ok()`/`skip()` — нет (переопределяется `mark=`).
 
