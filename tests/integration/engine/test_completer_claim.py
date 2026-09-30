@@ -25,6 +25,7 @@ from tests.integration.engine.completer_env import (
     CommitCounter,
     Finalized,
     MovableClock,
+    RecordingRelay,
     lease_row,
     open_completer,
     seed,
@@ -156,8 +157,18 @@ async def test_claim_on_paused_batch_parks_item(env: Env) -> None:
     first, second = seeded.refs
     await set_batch(env, seeded.batch_id, paused_at=NOW)
     await put_lease(env, second, until=timedelta(0))
+    async with env.transaction() as conn:
+        _ = await conn.execute(
+            insert(env.tables.window).values(
+                [
+                    {"item_id": first.id, "batch_id": seeded.batch_id},
+                    {"item_id": second.id, "batch_id": seeded.batch_id},
+                ]
+            )
+        )
     before = await env.counters(seeded.batch_id)
-    async with open_completer(env) as completer:
+    relay = RecordingRelay()
+    async with open_completer(env, relay=relay) as completer:
         results = await asyncio.gather(completer.claim(first), completer.claim(second))
         assert completer.held == frozenset()
     assert {result.outcome for result in results} == {ClaimOutcome.PARKED}
@@ -172,6 +183,8 @@ async def test_claim_on_paused_batch_parks_item(env: Env) -> None:
     assert finite is False
     # Истёкший lease припаркованного Item удалён, окно max_in_flight освобождено.
     assert await env.count(env.tables.lease) == 0
+    assert await env.count(env.tables.window) == 0
+    assert relay.calls == [[seeded.batch_id]]
     after = await env.counters(seeded.batch_id)
     assert after.dispatched == before.dispatched - 2
     assert after.pending == before.pending
@@ -206,8 +219,17 @@ async def test_claim_on_cancelled_batch_cancels_lazily(env: Env) -> None:
                 available_at=NOW,
             )
         )
+        _ = await conn.execute(
+            insert(env.tables.window).values(
+                [
+                    {"item_id": first.id, "batch_id": seeded.batch_id},
+                    {"item_id": second.id, "batch_id": seeded.batch_id},
+                ]
+            )
+        )
     finalizer = Finalized()
-    async with open_completer(env, finalizer=finalizer) as completer:
+    relay = RecordingRelay()
+    async with open_completer(env, finalizer=finalizer, relay=relay) as completer:
         results = await asyncio.gather(completer.claim(first), completer.claim(second))
     assert {result.outcome for result in results} == {ClaimOutcome.CANCELLED}
     for ref in (first, second):
@@ -219,6 +241,8 @@ async def test_claim_on_cancelled_batch_cancels_lazily(env: Env) -> None:
     assert (counters.cancelled, counters.w_done, counters.pending) == (2, 2, 0)
     assert await env.count(env.tables.outbox) == 0
     assert await env.count(env.tables.lease) == 0
+    assert await env.count(env.tables.window) == 0
+    assert relay.calls == [[seeded.batch_id]]
     assert finalizer.calls == [seeded.batch_id]
 
 

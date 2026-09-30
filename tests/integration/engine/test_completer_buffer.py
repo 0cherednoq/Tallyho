@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING
 import pytest
 from typing_extensions import override
 
-from tallyho.engine.completer import ClaimOutcome, Completer
+from tallyho.engine.completer import ClaimOutcome, Completer, CompleterTriggers
 from tallyho.model.errors import CompleterError, InvalidStateError
 from tallyho.protocols.observer import NullObserver
 from tallyho.storage.tables import build_metadata
@@ -135,7 +135,7 @@ async def test_observer_and_finalizer_errors_do_not_break_accounting(
         clock=MovableClock(),
         settings=SETTINGS,
         observer=BrokenObserver(),
-        finalizer=BrokenFinalizer(),
+        triggers=CompleterTriggers(finalizer=BrokenFinalizer()),
     )
     with caplog.at_level(logging.ERROR, logger="tallyho.engine.completer"):
         try:

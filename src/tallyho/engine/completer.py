@@ -62,17 +62,18 @@ from sqlalchemy import (
     select,
     update,
 )
-from sqlalchemy.dialects.postgresql import ARRAY, insert
+from sqlalchemy.dialects.postgresql import ARRAY, JSONB, insert
 
+from tallyho.engine.relay import release_window
 from tallyho.model.errors import CompleterError, ConfigurationError, InvalidStateError
 from tallyho.model.states import ItemState, OutboxKind, ResultClass
 from tallyho.protocols.observer import NullObserver
-from tallyho.storage.counters import CounterDelta, upsert_slots
+from tallyho.storage.counters import CounterDelta, upsert_metrics, upsert_slots
 from tallyho.storage.now import sql_now
 from tallyho.storage.tx import RetryPolicy, TxSettings, run_transaction
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Sequence
+    from collections.abc import Iterable, Mapping, Sequence
     from datetime import datetime
     from uuid import UUID
 
@@ -89,8 +90,11 @@ __all__ = [
     "ClaimResult",
     "Completer",
     "CompleterSettings",
+    "CompleterTriggers",
     "FinalizeTrigger",
+    "FinishResult",
     "ItemRef",
+    "RelayTrigger",
 ]
 
 _log = logging.getLogger(__name__)
@@ -216,6 +220,46 @@ class FinalizeTrigger(Protocol):
         ...
 
 
+class RelayTrigger(Protocol):
+    """Минимальный интерфейс Relay для fast-path после commit."""
+
+    def kick(self, batch_ids: Iterable[UUID]) -> None:
+        """Разбудить Relay для затронутых батчей."""
+        ...
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class CompleterTriggers:
+    """Получатели действий Completer после успешного commit."""
+
+    finalizer: FinalizeTrigger | None = None
+    relay: RelayTrigger | None = None
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class FinishResult:
+    """Итог, который путь A атомарно записывает в Item."""
+
+    result_class: ResultClass
+    label: str | None = None
+    result: object = None
+    error: object = None
+    metrics: Mapping[str, int] = field(default_factory=dict[str, int])
+    mark: bool | None = None
+
+    @property
+    def effective_label(self) -> str:
+        """Метка по умолчанию совпадает с техническим классом итога."""
+        return self.label or self.result_class.name.lower()
+
+    @property
+    def effective_mark(self) -> bool:
+        """Ошибки помечаются по умолчанию, остальные классы — только явно."""
+        if self.mark is not None:
+            return self.mark
+        return self.result_class is ResultClass.ERROR
+
+
 # --- операции буфера -----------------------------------------------------------------
 
 
@@ -242,7 +286,14 @@ class _Release:
     future: asyncio.Future[bool]
 
 
-_Op = _Claim | _Heartbeat | _Release
+@dataclass(eq=False, slots=True)
+class _Finish:
+    item: ItemRef
+    value: FinishResult
+    future: asyncio.Future[bool]
+
+
+_Op = _Claim | _Heartbeat | _Release | _Finish
 
 
 def _pending(ops: Sequence[_Op]) -> list[_Op]:
@@ -283,6 +334,10 @@ class _Applied:
     """Items, чей lease продлён heartbeat'ом: lease всё ещё у этого процесса."""
     released: set[UUID] = field(default_factory=set["UUID"])
     finalize: set[UUID] = field(default_factory=set["UUID"])
+    kick: set[UUID] = field(default_factory=set["UUID"])
+    finished: dict[UUID, tuple[UUID, FinishResult, int]] = field(
+        default_factory=dict["UUID", tuple["UUID", FinishResult, int]]
+    )
     cancelled: list[tuple[UUID, UUID, int]] = field(
         default_factory=list[tuple["UUID", "UUID", int]]
     )
@@ -306,6 +361,7 @@ class _Tx:
         self.items: dict[UUID, _ItemRow] = {}
         self.leases: dict[UUID, _LeaseRow] = {}
         self.deltas: defaultdict[UUID, CounterDelta] = defaultdict(CounterDelta)
+        self.metrics: defaultdict[tuple[UUID, str, int], int] = defaultdict(int)
         self.applied = _Applied()
 
     # --- блокировки ----------------------------------------------------------------
@@ -410,6 +466,8 @@ class _Tx:
         await self._take_leases(take)
         await self._park(park)
         await self._delete_expiry([*take, *cancel])
+        released = await self._release_window([*cancel, *park])
+        self.applied.kick.update(released)
 
     def _classify(self, ref: ItemRef, *, expired: bool) -> ClaimOutcome:
         row = self.items.get(ref.id)
@@ -620,6 +678,83 @@ class _Tx:
         )
         self.applied.beating.update(own)
 
+    # --- finish -------------------------------------------------------------------
+
+    async def finish(self, values: dict[UUID, tuple[ItemRef, FinishResult]]) -> None:
+        """CAS ``active -> terminal`` и учёт только действительно изменённых Items."""
+        if not values:
+            return
+        item = self.tables.item
+        ids = sorted(values)
+        rows = (
+            func.unnest(
+                _uuids(ids),
+                literal([values[item_id][0].batch_id for item_id in ids], ARRAY(Uuid())),
+                literal(
+                    [int(values[item_id][1].result_class) for item_id in ids],
+                    ARRAY(SmallInteger()),
+                ),
+                literal([values[item_id][1].effective_label for item_id in ids], ARRAY(Text())),
+                literal([values[item_id][1].result for item_id in ids], ARRAY(JSONB())),
+                literal([values[item_id][1].error for item_id in ids], ARRAY(JSONB())),
+            )
+            .table_valued("id", "batch_id", "state", "label", "result", "error")
+            .render_derived("u")
+        )
+        state: ColumnElement[int] = rows.c.state
+        label: ColumnElement[str] = rows.c.label
+        stored_result: ColumnElement[object] = rows.c.result
+        stored_error: ColumnElement[object] = rows.c.error
+        changed = await self.conn.execute(
+            update(item)
+            .where(
+                item.c.id == rows.c.id,
+                item.c.batch_id == rows.c.batch_id,
+                item.c.state == _ACTIVE,
+            )
+            .values(
+                state=state,
+                label=label,
+                result=stored_result,
+                error=stored_error,
+                finished_at=self.now,
+            )
+            .returning(item.c.id, item.c.batch_id, item.c.weight, item.c.attempt)
+        )
+        successful: list[UUID] = []
+        plain_values = {item_id: value for item_id, (_, value) in values.items()}
+        for finished_id, batch_id, weight, attempt in changed:
+            value = plain_values[finished_id]
+            successful.append(finished_id)
+            counter = value.result_class.name.lower()
+            self.deltas[batch_id] += CounterDelta(**{counter: 1, "w_done": weight})
+            self.metrics[batch_id, value.effective_label, self.c.settings.slot] += 1
+            for name, increment in value.metrics.items():
+                self.metrics[batch_id, name, self.c.settings.slot] += increment
+            self.applied.finished[finished_id] = (batch_id, value, attempt)
+            self.applied.finalize.add(batch_id)
+        await self._delete_leases(list(values))
+        await self._delete_expiry(successful)
+        await self._write_marks(successful, plain_values)
+        released = await self._release_window(successful)
+        self.applied.kick.update(released)
+
+    async def _write_marks(self, item_ids: list[UUID], values: dict[UUID, FinishResult]) -> None:
+        rows = [
+            {
+                "batch_id": self.items[item_id].batch_id,
+                "label": values[item_id].effective_label,
+                "item_id": item_id,
+            }
+            for item_id in sorted(item_ids)
+            if values[item_id].effective_mark
+        ]
+        if rows:
+            _ = await self.conn.execute(insert(self.tables.item_mark).values(rows))
+
+    async def _release_window(self, item_ids: Iterable[UUID]) -> list[UUID]:
+        return await release_window(self.conn, self.tables, item_ids)
+
     def _lease_until(self) -> ColumnElement[datetime]:
         return self.now + literal(self.c.settings.lease_ttl, Interval())
 
@@ -629,6 +764,7 @@ class _Tx:
         slot = self.c.settings.slot
         deltas = {(batch_id, slot): delta for batch_id, delta in self.deltas.items()}
         await upsert_slots(self.conn, self.tables, deltas)
+        await upsert_metrics(self.conn, self.tables, self.metrics)
 
 
 _ACTIVE: Final = literal_column(str(int(ItemState.ACTIVE)), SmallInteger())
@@ -661,7 +797,7 @@ class Completer:
     clock: Clock
     settings: CompleterSettings
     observer: Observer
-    finalizer: FinalizeTrigger | None
+    triggers: CompleterTriggers
 
     def __init__(
         self,
@@ -671,7 +807,7 @@ class Completer:
         clock: Clock,
         settings: CompleterSettings,
         observer: Observer | None = None,
-        finalizer: FinalizeTrigger | None = None,
+        triggers: CompleterTriggers | None = None,
     ) -> None:
         """Completer поверх ``engine`` (со ``schema_translate_map`` установки).
 
@@ -681,15 +817,14 @@ class Completer:
             clock: Часы: «сейчас» в SQL (D-002).
             settings: Настройки.
             observer: Получатель событий; по умолчанию пустой.
-            finalizer: Кого звать после commit для батчей, где Items стали
-                терминальными (Finalizer, T4.4).
+            triggers: Получатели действий после commit: Finalizer и Relay.
         """
         self.tables = tables
         self.engine = engine
         self.clock = clock
         self.settings = settings
         self.observer = observer or NullObserver()
-        self.finalizer = finalizer
+        self.triggers = triggers or CompleterTriggers()
         self._buffer: list[_Op] = []
         self._loop: asyncio.AbstractEventLoop | None = None
         self._task: asyncio.Task[None] | None = None
@@ -761,6 +896,20 @@ class Completer:
         """
         future = self._new_future(bool)
         return await self._submit(_Release(item, future), future)
+
+    async def finish(
+        self,
+        item: ItemRef,
+        value: FinishResult,
+    ) -> bool:
+        """Завершить Item идемпотентным CAS и дождаться commit.
+
+        Returns:
+            ``True``, если этот вызов перевёл Item из active в терминальное
+            состояние; ``False`` для повторного или уже завершённого Item.
+        """
+        future = self._new_future(bool)
+        return await self._submit(_Finish(item, value, future), future)
 
     async def close(self, *, requeue_held: bool = False) -> None:
         """Мягкая остановка: дослать буфер и остановить задачу сброса.
@@ -878,6 +1027,7 @@ class Completer:
         claims: dict[UUID, ItemRef] = {}
         beats: dict[UUID, _Progress] = {}
         releases: set[UUID] = set()
+        finishes: dict[UUID, tuple[ItemRef, FinishResult]] = {}
         for op in ops:
             if isinstance(op, _Claim):
                 _ = claims.setdefault(op.item.id, op.item)
@@ -888,22 +1038,28 @@ class Completer:
                     done if new_done is None else new_done,
                     total if new_total is None else new_total,
                 )
-            else:
+            elif isinstance(op, _Release):
                 releases.add(op.item.id)
+            else:
+                _ = finishes.setdefault(op.item.id, (op.item, op.value))
         # Все блокировки строк — в начале и по порядку: batch → item → lease.
-        await tx.lock_batches(ref.batch_id for ref in claims.values())
-        await tx.lock_items([*releases, *claims])
-        await tx.lock_leases([*releases, *claims, *beats])
+        batch_ids = [ref.batch_id for ref in claims.values()]
+        batch_ids.extend(op.item.batch_id for op in ops if isinstance(op, _Finish))
+        await tx.lock_batches(batch_ids)
+        await tx.lock_items([*releases, *claims, *finishes])
+        await tx.lock_leases([*releases, *claims, *beats, *finishes])
         # release раньше claim: ретрай брокера мог прийти в ту же пачку.
         await tx.release(releases)
         await tx.claim(claims)
         await tx.heartbeat(beats)
+        await tx.finish(finishes)
         await tx.write_counters()
         return tx.applied
 
     def _resolve(self, ops: Sequence[_Op], applied: _Applied) -> None:
         seen: set[UUID] = set()
         released: set[UUID] = set()
+        finished: set[UUID] = set()
         for op in ops:
             if isinstance(op, _Claim):
                 self._resolve_claim(op, applied.claims[op.item.id], again=op.item.id in seen)
@@ -911,11 +1067,14 @@ class Completer:
                 continue
             if isinstance(op, _Heartbeat):
                 value = op.item.id in applied.beating
-            else:
+            elif isinstance(op, _Release):
                 # Повторный release того же Item в пачке уже ничего не отпускает.
                 value = op.item.id in applied.released and op.item.id not in released
                 released.add(op.item.id)
-            if not value or isinstance(op, _Release):
+            else:
+                value = op.item.id in applied.finished and op.item.id not in finished
+                finished.add(op.item.id)
+            if not value or isinstance(op, _Release | _Finish):
                 _ = self._held.pop(op.item.id, None)
             if not op.future.done():
                 op.future.set_result(value)
@@ -943,14 +1102,24 @@ class Completer:
                     label=CANCELLED_LABEL,
                     attempt=attempt,
                 )
+            for item_id, (batch_id, value, attempt) in applied.finished.items():
+                self.observer.item_finished(
+                    batch_id=batch_id,
+                    item_id=item_id,
+                    result=value.result_class,
+                    label=value.effective_label,
+                    attempt=attempt,
+                )
         except Exception:  # ruff: ignore[blind-except]  # сбой наблюдателя не влияет на учёт
             _log.exception("Observer упал на событии Completer")
 
     async def _after_commit(self, applied: _Applied) -> None:
-        if self.finalizer is None:
+        if self.triggers.relay is not None and applied.kick:
+            self.triggers.relay.kick(sorted(applied.kick))
+        if self.triggers.finalizer is None:
             return
         for batch_id in sorted(applied.finalize):
             try:
-                _ = await self.finalizer.try_finalize(batch_id)
+                _ = await self.triggers.finalizer.try_finalize(batch_id)
             except Exception:  # ruff: ignore[blind-except]  # финализацию подхватит sweeper
                 _log.exception("try_finalize(%s) после flush упал", batch_id)

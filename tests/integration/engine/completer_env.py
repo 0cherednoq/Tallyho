@@ -10,14 +10,14 @@ from typing import TYPE_CHECKING
 from sqlalchemy import delete, event, select, update
 from typing_extensions import override
 
-from tallyho.engine.completer import Completer, CompleterSettings, ItemRef
+from tallyho.engine.completer import Completer, CompleterSettings, CompleterTriggers, ItemRef
 from tallyho.engine.producer import RootSpec
 from tallyho.model.calls import TaskCall
 from tallyho.protocols.clock import SystemClock
 from tallyho.storage.counters import CounterDelta, upsert_slots
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator
+    from collections.abc import AsyncGenerator, Iterable
     from uuid import UUID
 
     from sqlalchemy import RowMapping
@@ -36,6 +36,7 @@ __all__ = [
     "CommitCounter",
     "Finalized",
     "MovableClock",
+    "RecordingRelay",
     "Seeded",
     "lease_row",
     "open_completer",
@@ -71,6 +72,16 @@ class Finalized:
     async def try_finalize(self, batch_id: UUID) -> bool:
         self.calls.append(batch_id)
         return False
+
+
+@dataclass
+class RecordingRelay:
+    """Заглушка Relay: запоминает батчи из fast-path ``kick``."""
+
+    calls: list[list[UUID]] = field(default_factory=list[list["UUID"]])
+
+    def kick(self, batch_ids: Iterable[UUID]) -> None:
+        self.calls.append(list(batch_ids))
 
 
 @dataclass(eq=False)
@@ -135,6 +146,7 @@ async def open_completer(
     *,
     clock: Clock | None = None,
     finalizer: Finalized | None = None,
+    relay: RecordingRelay | None = None,
     counter: CommitCounter | None = None,
     settings: CompleterSettings = SETTINGS,
 ) -> AsyncGenerator[Completer]:
@@ -147,7 +159,7 @@ async def open_completer(
         engine=engine,
         clock=clock or MovableClock(),
         settings=settings,
-        finalizer=finalizer,
+        triggers=CompleterTriggers(finalizer=finalizer, relay=relay),
     )
     try:
         yield completer
