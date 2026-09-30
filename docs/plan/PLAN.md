@@ -232,6 +232,12 @@
 * **Сделать:** `tallyho.storage.counters`: `read_counters(conn, batch_ids)` одним statement (`sum(counter) + sum(delta)` LATERAL, §9.3), `upsert_slots(conn, deltas)` в порядке `(batch_id, slot)`, `insert_delta(conn, …)`, `fold_deltas(conn, batch_ids)` через `DELETE … RETURNING`, `reconcile(conn, batch_id)` по `count(*) GROUP BY state` под `FOR UPDATE` строки батча, `upsert_metrics`.
 * **DoD:** интеграция: чтение не «мигает» при параллельной свёртке (конкурентный тест 1 000 итераций); reconcile чинит искусственный дрейф; дельты из незакоммиченной транзакции не сворачиваются.
 
+#### Fix-1 — Полный набор d_* колонок в `th_counter_delta`
+* **Зависит:** T2.4
+* **Док:** ARCHITECTURE §5.1 (TH_COUNTER, TH_COUNTER_DELTA), §9.1, UC-08; DECISIONS D-025, D-029
+* **Сделать:** в `th_counter_delta` не хватает дельт для `w_total`, `dispatched`, `duplicates`, `skipped_by_limit`, `tree_total`, а путь B (`complete_in` со spawn внутри транзакции пользователя, T4.5) должен уметь записать их все. Добавить колонки `d_w_total, d_dispatched, d_duplicates, d_skipped_by_limit, d_tree_total` (bigint, default 0) в `tables.py` **прямо в схему v1** (D-029: релиза ещё не было), обновить golden-DDL, `DELTA_FIELDS`/`insert_delta`/`fold_deltas`/`read_counters`/`reconcile` в `storage/counters.py` (теперь `DELTA_FIELDS == COUNTER_FIELDS`, проверка «поле вне DELTA_FIELDS» становится ненужной или остаётся как страховка), ER-диаграмму ARCHITECTURE §5.1.
+* **DoD:** round-trip каждой из 11 дельт через `insert_delta` → `read_counters` → `fold_deltas`; тест «каталог после migrate == create_all» зелёный; `reconcile` переносит все поля.
+
 ### Ф3. hooks
 
 #### T3.1 — Реестр tx-хуков и `hook_modules`
@@ -281,7 +287,7 @@
 * **DoD:** интеграция: две конкурентные финализации → один commit, хук выполнился ≤ 2 раз, закоммитился 1 раз; пустой этап финализируется сразу и каскадом закрывает следующий; два источника финализируются одновременно (100 повторов) → этап всегда закрыт; `on_finalized` детей закоммичен раньше родителя; хук с `session.commit()` → `HookTransactionError`, финализации нет.
 
 #### T4.5 — Путь B: `complete_in(session)` и свёртка дельт
-* **Зависит:** T4.4
+* **Зависит:** T4.4, Fix-1
 * **Док:** ARCHITECTURE UC-08, §9.1; COUNTERS §3.3 «Путь B»; ACCEPTANCE A-DB-01, A-DB-06, A-DB-07, A-DB-09
 * **Сделать:** `tallyho.engine.completion.complete_in(conn, item, …)`: HOT-update `th_item`, `DELETE th_lease`, `INSERT th_counter_delta` (+ дельты метрик, spawns — те же правила, что в T4.3c, но через дельты), флаг «уже завершён» для обёртки; `after_commit` → `Completer.fold(batch_id)` → `try_finalize`.
 * **DoD:** интеграция: исключение до commit → нет ни доменной строки, ни завершения; savepoint откатился → Item не завершён; пользователь в `REPEATABLE READ` и `SERIALIZABLE` под нагрузкой → 0 `40001` из-за таблиц tallyho; 20% транзакций держатся 2 с → в `pg_locks` нет ожиданий на `th_counter` > 100 мс.

@@ -6,8 +6,8 @@
 ## Текущее состояние
 
 * **Ветка:** `impl/v1`
-* **Текущая волна:** 4 — T2.4 (единственная доступная: T4.1 ждёт её)
-* **Последний зелёный коммит:** 8d43fd4
+* **Текущая волна:** 5 — T4.1, Fix-1
+* **Последний зелёный коммит:** 2ee4bab
 
 ## Задачи
 
@@ -22,15 +22,16 @@
 | T2.1 | Таблицы и индексы | T1.1 | done | 91aa770..42f6ef3 (5), merge 1f7278a |
 | T2.2 | Миграции, установка в схему, alembic | T2.1, T0.2 | done | be7c687..09b272b (3), merge 416dc02 |
 | T2.3 | Транзакции: сессия пользователя, ретраи, after_commit, HookSession | T2.1, T1.4 | done | 171307e..f665530 (4), merge 2adeed6 |
-| T2.4 | Запросы счётчиков, дельты, свёртка, reconcile | T2.2, T2.3 | in_progress | |
+| T2.4 | Запросы счётчиков, дельты, свёртка, reconcile | T2.2, T2.3 | done | b65787f..a51c75d (5), merge 2ee4bab |
 | T3.1 | Реестр tx-хуков | T1.2 | done | 27b762a..880903c (2), merge 4521aa4 |
-| T4.1 | Продюсер: батчи, под-батчи, th_feed, add, seal, expect | T2.4, T3.1 | todo | |
+| Fix-1 | d_* колонки в th_counter_delta для пути B | T2.4 | in_progress | |
+| T4.1 | Продюсер: батчи, под-батчи, th_feed, add, seal, expect | T2.4, T3.1 | in_progress | |
 | T4.2 | Relay | T4.1 | todo | |
 | T4.3a | Completer: буфер, claim/heartbeat/release | T4.2 | todo | |
 | T4.3b | Completer: finish без spawn | T4.3a | todo | |
 | T4.3c | Spawn, into=, лимиты, дедуп, sub_batch из задачи | T4.3b | todo | |
 | T4.4 | Finalizer | T4.3c | todo | |
-| T4.5 | Путь B: complete_in и свёртка | T4.4 | todo | |
+| T4.5 | Путь B: complete_in и свёртка | T4.4, Fix-1 | todo | |
 | T4.6 | Политики ошибок, on_policy_breach | T4.4 | todo | |
 | T4.7 | Операции над деревом | T4.6 | todo | |
 | T4.8 | Sweeper | T4.7 | todo | |
@@ -71,6 +72,17 @@
 - Отклонения от плана/доков: … (или «нет»)
 - Узнали / на что обратить внимание дальше: …
 -->
+
+### 2026-09-30 · волна 5 запущена · T4.1, Fix-1
+
+### 2026-09-30 · волна 4 влита · T2.4
+- **T2.4 · done.** `storage/counters.py`: `CounterDelta`/`CounterTotals`, `read_counters` одним SELECT по многим батчам, `upsert_slots`, `insert_delta`, `fold_deltas`, `reconcile`, `upsert_metrics`. Фикстура `tables` и хелперы `schema_transaction`/`schema_connection`. D-027, D-028. 598 тестов, покрытие 99,77%.
+- **Найден пробел:** в `th_counter_delta` нет d_* для `w_total/dispatched/duplicates/skipped_by_limit/tree_total`, поэтому путь B со spawn записать их не может. Заведена задача **Fix-1** (колонки в схему v1, D-029), T4.5 теперь зависит от неё.
+- **Для следующих задач:**
+  - Шаг Completer: `folded = fold_deltas(...)` → слить с буфером по `(batch_id, slot процесса)` → один `upsert_slots` → `upsert_metrics`.
+  - Многострочную вставку с `func.now()` делать через `insert(t).values([...])`, не через executemany.
+  - `Result.tuples()` в SQLAlchemy 2.1 устарел и даёт warning = ошибку.
+  - Для basedpyright нужен типизированный список колонок (`list[ColumnElement[...]]`) и явные колонки в `returning`.
 
 ### 2026-09-30 · волна 4 запущена · T2.4
 - Доступна только T2.4, на ней держится вся Ф4. Волна из одного сабагента.
