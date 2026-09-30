@@ -102,3 +102,21 @@ Completer складывает результат свёртки со своим
 
 ## D-029 · Схема v1 редактируема до первого релиза · ACCEPTED (автономно, пересмотреть)
 Пока нет ни одного релиза и установок, недостающие колонки добавляются прямо в v1 (`tables.py` + golden), без миграции v2. Правило D-025 «заморозить v1» начинает действовать с первого опубликованного релиза. Первый случай — Fix-1 (d_* колонки в `th_counter_delta`).
+
+## D-030 · kind под-батча по умолчанию — `<kind родителя>.<key>` · ACCEPTED (автономно, пересмотреть) (T4.1)
+В §11.2 у `sub_batch` нет `kind`, а хуки регистрируются на kind корня (§12.4). Если бы этап наследовал kind корня, `on_finalized` корня срабатывал бы на каждом этапе. Явный `kind=` разрешён (UC-06).
+
+## D-031 · Виртуальный Item и запись outbox · ACCEPTED (автономно, пересмотреть) (T4.1)
+Виртуальный Item: `task_name="tallyho.sub_batch"`, `payload=b""`, `key=NULL`, `weight=0`. В outbox он не попадает и в `tree_total` не считается: `max_items` ограничивает только реальные Items. Запись outbox Item'а: `id = item_id`, `task_name` заполнен, `payload=NULL` — relay берёт payload из `th_item`.
+
+## D-032 · Блокировки продюсера и колбэки в options · ACCEPTED (автономно, пересмотреть) (T4.1)
+* `add_items` держит строку батча `FOR SHARE`: параллельные продюсеры не мешают друг другу, а seal, отмена и CAS финализации ждут commit. `create_sub_batch`, `add_feed` и `seal` берут `FOR UPDATE` в порядке id. `add_feed` отказывает, если источник уже финализирован или этап закрыт.
+* `options = {"failure_policy": …, "callbacks": {"on_succeeded": {task_name, payload (base64 кодека), queue, options}}}` читается через `StoredCallback.from_json`.
+* Ошибки: `add`/`sub_batch` продюсера в этап → `SpawnTargetError`; в закрытый, финализированный или отменяемый батч → `SealError`. `seal` не запускает финализацию сам: после commit вызывающий зовёт `try_finalize`.
+* Продюсеру в транзакции пользователя api даёт **отдельный слот** счётчиков, не слот Completer процесса. Иначе длинная транзакция пользователя держит строку `th_counter`.
+
+## D-033 · Опции вызова хранятся в `th_item.options` · ACCEPTED (автономно, пересмотреть)
+`TaskCall.queue` и опции брокера (priority, max_retries, timeout, expires …) нужны relay при каждой отправке, в том числе при повторной отправке sweeper-ом после истёкшего lease. Поэтому они хранятся в колонке `th_item.options jsonb NULL`, а не в outbox. Колонка добавляется в v1 (D-029). Делается первым шагом T4.2.
+
+## D-034 · Completer claim/heartbeat/release не зависит от Relay · ACCEPTED
+T4.3a зависит только от T4.1, T4.3b — от T4.3a и T4.2 (там нужны `relay.kick` и окно `max_in_flight`). Так T4.2 и T4.3a идут в одной волне.

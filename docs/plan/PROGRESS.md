@@ -6,8 +6,8 @@
 ## Текущее состояние
 
 * **Ветка:** `impl/v1`
-* **Текущая волна:** 5 — T4.1, Fix-1
-* **Последний зелёный коммит:** 2ee4bab
+* **Текущая волна:** 6 — T4.2, T4.3a
+* **Последний зелёный коммит:** 0080570
 
 ## Задачи
 
@@ -24,11 +24,11 @@
 | T2.3 | Транзакции: сессия пользователя, ретраи, after_commit, HookSession | T2.1, T1.4 | done | 171307e..f665530 (4), merge 2adeed6 |
 | T2.4 | Запросы счётчиков, дельты, свёртка, reconcile | T2.2, T2.3 | done | b65787f..a51c75d (5), merge 2ee4bab |
 | T3.1 | Реестр tx-хуков | T1.2 | done | 27b762a..880903c (2), merge 4521aa4 |
-| Fix-1 | d_* колонки в th_counter_delta для пути B | T2.4 | in_progress | |
-| T4.1 | Продюсер: батчи, под-батчи, th_feed, add, seal, expect | T2.4, T3.1 | in_progress | |
-| T4.2 | Relay | T4.1 | todo | |
-| T4.3a | Completer: буфер, claim/heartbeat/release | T4.2 | todo | |
-| T4.3b | Completer: finish без spawn | T4.3a | todo | |
+| Fix-1 | d_* колонки в th_counter_delta для пути B | T2.4 | done | b58dd92..3a07ef4 (3), merge 1bb1b8a |
+| T4.1 | Продюсер: батчи, под-батчи, th_feed, add, seal, expect | T2.4, T3.1 | done | ec5f273..16b7f8d (4), merge 0080570 |
+| T4.2 | Relay | T4.1 | in_progress | |
+| T4.3a | Completer: буфер, claim/heartbeat/release | T4.1 | in_progress | |
+| T4.3b | Completer: finish без spawn | T4.3a, T4.2 | todo | |
 | T4.3c | Spawn, into=, лимиты, дедуп, sub_batch из задачи | T4.3b | todo | |
 | T4.4 | Finalizer | T4.3c | todo | |
 | T4.5 | Путь B: complete_in и свёртка | T4.4, Fix-1 | todo | |
@@ -72,6 +72,20 @@
 - Отклонения от плана/доков: … (или «нет»)
 - Узнали / на что обратить внимание дальше: …
 -->
+
+### 2026-09-30 · волна 6 запущена · T4.2, T4.3a
+- Зависимость T4.3a от T4.2 снята (D-034), чтобы цепочка engine шла в две ветки.
+
+### 2026-09-30 · волна 5 влита · Fix-1, T4.1
+- **Fix-1 · done.** `th_counter_delta` получила d_* для всех 11 счётчиков, `DELTA_FIELDS == COUNTER_FIELDS`, ER §5.1 обновлена.
+- **T4.1 · done.** `engine/producer.py`: `Producer` с методами `create_root`, `create_sub_batch`, `add_feed`, `add_items` (unnest, чанки по 1 000, 100k Items ≤ 103 запросов), `seal`, `expect`. D-030…D-032.
+- **Найден пробел:** опции вызова (`queue`, `priority`, `expires` …) продюсер отбрасывает. Решение D-033: колонка `th_item.options`, первым шагом T4.2.
+- **Вливание:** без конфликтов, 676 тестов, покрытие 99,81%.
+- **Для следующих задач:**
+  - `seal` сам не финализирует. После commit нужен `try_finalize` (T4.4), иначе пустой батч никто не закроет.
+  - Признак «этап»: `EXISTS th_feed WHERE fed_id = id`.
+  - В `select(...)` типизировано не больше 10 колонок. Если их больше, дробить запрос.
+  - Фикстура `env` в `tests/integration/engine/conftest.py`.
 
 ### 2026-09-30 · волна 5 запущена · T4.1, Fix-1
 

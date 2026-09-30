@@ -258,18 +258,19 @@
 
 #### T4.2 — Relay: fast-path и scan, окно `max_in_flight`, `start_at`, пауза
 * **Зависит:** T4.1
+* **Сначала (D-033):** в схему v1 добавить колонку `th_item.options jsonb NULL` (D-029, golden-DDL). Продюсер пишет в неё `TaskCall.queue` и опции брокера — сейчас он их отбрасывает. Relay передаёт опции в `Message.options`, а при `expires` пишет `th_expiry(item_id, expires_at)` (§11.4). Опции хранятся в `th_item`, а не в outbox, потому что должны пережить повторную отправку sweeper-ом.
 * **Док:** ARCHITECTURE §6.3, UC-01 (шаги relay), UC-10, §11.3 (группировка по task_name, чанки 1 000), §15 (`relay_grace`, `relay_claim_ttl`)
 * **Сделать:** `tallyho.engine.relay.Relay`: `kick(batch_ids)` (fast-path после commit), `scan_once()` (claim `UPDATE th_outbox SET available_at = now + claim_ttl … FOR UPDATE SKIP LOCKED RETURNING`), сборка `Message` (с `_th`/заголовками через адаптер), `dispatch` группами по `task_name`, `DELETE th_outbox` + `dispatched += n`. Окно `max_in_flight`: при превышении запись остаётся с `available_at = ∞` (parked), освобождение — при finish (T4.3b) и в scan. Пауза: не отправлять Items батча с `paused_at`.
 * **DoD:** интеграция: падение между claim и dispatch → повторная отправка после `relay_claim_ttl`; два параллельных scan не отправляют одно и то же; `max_in_flight=3` — одновременно отправлено ≤ 3; `start_at` в будущем → 0 отправок до срока (FakeClock).
 
 #### T4.3a — Completer: буфер, групповой коммит, claim / heartbeat / release
-* **Зависит:** T4.2
+* **Зависит:** T4.1 (claim/heartbeat/release не требуют relay; D-034)
 * **Док:** ARCHITECTURE UC-03, UC-04, §6.2 (производные состояния), §11.3 (чужой живой lease → успех), §15 (tick 20 мс / 500 / backpressure 10 000, lease 60 с / heartbeat 20 с); COUNTERS §3.2
 * **Сделать:** `tallyho.engine.completer.Completer`: очередь операций с futures, flush по тику или размеру, backpressure; ленивое создание в текущем loop; `claim` (`INSERT th_lease ON CONFLICT DO NOTHING` при `state=active`; исходы: `CLAIMED / DUPLICATE / TERMINAL / PARKED(pause) / CANCELLED(lazy cancel) / EXPIRED`), `heartbeat(+progress)`, `release(attempt+1)`. Graceful shutdown: дослать буфер; `SIGTERM`-путь освобождает lease сразу (A-CH-08).
 * **DoD:** интеграция: 1 000 claim → ≤ ceil(1000/500)+1 транзакций; повторный claim того же Item → `DUPLICATE`; claim на паузе → Item в outbox с `available_at=∞`; heartbeat продлевает `lease_until`.
 
 #### T4.3b — Completer: finish (путь A) без spawn
-* **Зависит:** T4.3a
+* **Зависит:** T4.3a, T4.2
 * **Док:** ARCHITECTURE §9.2 шаги 1–3, 6, 8–9, §11.2 (метки по умолчанию, `mark=`), UC-03
 * **Сделать:** `finish(item, result_class, label, result, error, metrics)`: `SELECT … ORDER BY id FOR UPDATE`, CAS `state=active` с `RETURNING` (считать только вернувшиеся), `DELETE th_lease`, `th_item_mark` для `error` (и `mark=True`), агрегация дельт по `(batch_id, slot процесса)` в порядке сортировки, `th_metric` (labels + `incr`), освобождение окна `max_in_flight`. После commit — резолв futures, `relay.kick`, вызов `finalizer.try_finalize` для затронутых `sealed` батчей (интерфейс-заглушка до T4.4).
 * **DoD:** интеграция: двойной finish → счётчики изменились один раз; 64 конкурентных «воркера» × 10 000 finish → счётчики = `count(*)` (I-05), `deadlocks = 0`; `th_lease` пуст после finish.
