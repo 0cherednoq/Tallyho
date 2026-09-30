@@ -6,7 +6,7 @@
 ## Текущее состояние
 
 * **Ветка:** `impl/v1`
-* **Текущая волна:** T4.4
+* **Текущая волна:** T4.5, T4.6, T4.11
 * **Последний зелёный коммит:** d30eef4
 
 ## Задачи
@@ -31,13 +31,13 @@
 | T4.3b | Completer: finish без spawn | T4.3a, T4.2 | done | 0f4cf16 |
 | T4.3c | Spawn, into=, лимиты, дедуп, sub_batch из задачи | T4.3b | done | 350c711 |
 | T4.4 | Finalizer | T4.3c | done | d30eef4 |
-| T4.5 | Путь B: complete_in и свёртка | T4.4, Fix-1 | todo | |
-| T4.6 | Политики ошибок, on_policy_breach | T4.4 | todo | |
+| T4.5 | Путь B: complete_in и свёртка | T4.4, Fix-1 | in_progress | |
+| T4.6 | Политики ошибок, on_policy_breach | T4.4 | in_progress | |
 | T4.7 | Операции над деревом | T4.6 | todo | |
 | T4.8 | Sweeper | T4.7 | todo | |
 | T4.9 | Snapshotter | T4.8 | todo | |
 | T4.10 | Maintenance, лидерство, watch | T4.9 | todo | |
-| T4.11 | Чтение: view, in_flight, items, find | T4.4 | todo | |
+| T4.11 | Чтение: view, in_flight, items, find | T4.4 | in_progress | |
 | T5.1 | Runtime: ItemContext, th.item, tracked | T4.5, T4.7 | todo | |
 | T6.1 | Tallyho, Settings, install, migrate | T5.1, T4.10, T4.11 | todo | |
 | T6.2 | th.batch → BatchBuilder, BatchHandle | T6.1 | todo | |
@@ -72,6 +72,9 @@
 - Отклонения от плана/доков: … (или «нет»)
 - Узнали / на что обратить внимание дальше: …
 -->
+
+### 2026-09-30 · волна 7 запущена · T4.5, T4.6, T4.11
+- Три независимые задачи выполняются параллельно в изолированных worktree от зелёного `e33ab7e`; общий merge и гейты выполнит оркестратор.
 
 ### 2026-09-30 · T4.4 · done · d30eef4
 - Сделано: `engine/finalizer.py` — проверка точных счётчиков, `on_finalized` в `HookSession` с таймаутом, CAS по состоянию и `snap_seq`, выбор терминального состояния, callback-outbox, завершение виртуального Item родителя и рекурсивная финализация дерева.
