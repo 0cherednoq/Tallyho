@@ -6,8 +6,8 @@
 ## Текущее состояние
 
 * **Ветка:** `impl/v1`
-* **Текущая волна:** T5.1
-* **Последний зелёный коммит:** 2d9f6bd
+* **Текущая волна:** T6.1
+* **Последний зелёный коммит:** 8160725
 
 ## Задачи
 
@@ -38,7 +38,7 @@
 | T4.9 | Snapshotter | T4.8 | done | 237bdee |
 | T4.10 | Maintenance, лидерство, watch | T4.9 | done | 2d9f6bd |
 | T4.11 | Чтение: view, in_flight, items, find | T4.4 | done | 8b45a88 |
-| T5.1 | Runtime: ItemContext, th.item, tracked | T4.5, T4.7 | todo | |
+| T5.1 | Runtime: ItemContext, th.item, tracked | T4.5, T4.7 | done | 8160725 |
 | T6.1 | Tallyho, Settings, install, migrate | T5.1, T4.10, T4.11 | todo | |
 | T6.2 | th.batch → BatchBuilder, BatchHandle | T6.1 | todo | |
 | T6.3 | th.call с ParamSpec, типовые тесты | T6.1 | todo | |
@@ -72,6 +72,15 @@
 - Отклонения от плана/доков: … (или «нет»)
 - Узнали / на что обратить внимание дальше: …
 -->
+### 2026-09-30 · T6.1 · in_progress · —
+- Начата сборка публичного `Tallyho`, конфигурации и install/migrate поверх завершённых engine/runtime-компонентов.
+
+### 2026-09-30 · T5.1 · done · 8160725
+- Сделано: `ContextVar`-контексты Item/callback, безопасный модульный фасад `item`, атомарные буферы spawn/expect/metrics/sub-batch, `tracked` с сохранением метаданных, разбором `_th`, claim, heartbeat, finish/release и вердиктом RETRY/FINAL.
+- `complete_in` помечает Item завершённым для middleware только после commit внешней транзакции; rollback оставляет обычный finish, а служебный `_th` никогда не передаётся пользовательской функции. Повторная доставка отсекается до вызова функции.
+- Проверка: 22 runtime-теста, включая дубли, rollback/commit, heartbeat, кооперативную отмену, отмену coroutine, callback scope и exhausted; `poe check` зелёный; `poe test-all` — 936 passed, 1 platform skip, покрытие 96,18% (`context.py` 97%, `tracked.py` 96%); pre-commit зелёный.
+- Отклонения от плана/доков: нет.
+- Дальше: T6.1 `Tallyho`, Settings, install и migrate.
 
 ### 2026-09-30 · T5.1 · in_progress · —
 - Начата реализация runtime (`ItemContext`, `th.item.*`, `tracked`, `callback.current`) после завершения engine-фазы.
