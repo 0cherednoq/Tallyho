@@ -6,6 +6,7 @@ import asyncio
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, ParamSpec
 
+from sqlalchemy import func, select
 from typing_extensions import override
 
 from tallyho.engine.relay import Relay, RelaySettings
@@ -103,6 +104,15 @@ class RelayEnv:
     def another_relay(self, dispatcher: RecordingDispatcher | None = None) -> Relay:
         """Второй relay над той же схемой (другой «процесс»)."""
         return replace(self.relay, dispatcher=dispatcher or self.dispatcher)
+
+    async def window_size(self, batch_id: UUID) -> int:
+        """Строк ``th_window`` батча."""
+        window = self.tables.window
+        async with self.env.connection() as conn:
+            found = await conn.scalar(
+                select(func.count()).select_from(window).where(window.c.batch_id == batch_id)
+            )
+            return int(found or 0)
 
 
 def relay_env(env: Env, now: datetime, settings: RelaySettings | None = None) -> RelayEnv:

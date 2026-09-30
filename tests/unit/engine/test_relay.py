@@ -1,13 +1,14 @@
-"""Relay без БД: параметры."""
+"""Relay без БД: параметры и ключ advisory-блокировки окна."""
 
 from __future__ import annotations
 
 from datetime import timedelta
 from typing import TYPE_CHECKING
+from uuid import UUID
 
 import pytest
 
-from tallyho.engine.relay import RelaySettings
+from tallyho.engine.relay import RelaySettings, window_lock_key
 from tallyho.model.errors import ConfigurationError
 
 if TYPE_CHECKING:
@@ -38,3 +39,12 @@ def test_settings_validation(build: Callable[[], RelaySettings], match: str) -> 
 
 def test_zero_grace_is_allowed() -> None:
     assert RelaySettings(grace=timedelta(0)).grace == timedelta(0)
+
+
+def test_window_lock_key_is_stable_signed_int64() -> None:
+    first = UUID("01234567-89ab-7def-8123-456789abcdef")
+    second = UUID("01234567-89ab-7def-8123-456789abcdee")
+    key = window_lock_key(first)
+    assert key == window_lock_key(first)
+    assert key != window_lock_key(second)
+    assert -(2**63) <= key < 2**63

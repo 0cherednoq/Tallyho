@@ -5,8 +5,8 @@ Relay не зависит от адаптера: он говорит тольк�
 
 1. своя транзакция: захват готовых записей ``UPDATE th_outbox SET
    available_at = now + claim_ttl … FOR UPDATE SKIP LOCKED``. Записи
-   отменённых или удалённых Items удаляются, записи батча на паузе
-   паркуются (``available_at = infinity``);
+   отменённых или удалённых Items удаляются, записи батча на паузе и сверх
+   окна ``max_in_flight`` паркуются (``available_at = infinity``);
 2. вне транзакции: сборка :class:`~tallyho.protocols.broker.Message`
    (payload и опции Item — из ``th_item``, колбэка — из самой записи) и
    ``dispatch`` группами по ``task_name``;
@@ -19,12 +19,20 @@ Relay не зависит от адаптера: он говорит тольк�
 Два входа: :meth:`Relay.kick` — fast-path после commit продюсера (только
 названные батчи, без ``grace``) и :meth:`Relay.scan_once` — страховочный
 проход по всем записям старше ``relay_grace``.
+
+Окно ``max_in_flight`` считается по ``th_window``: строка на отправленный и
+не завершённый Item. Захват записей батча с окном сериализован
+``pg_try_advisory_xact_lock``; занятый батч relay пропускает до следующего
+прохода. Места освобождает завершение Item — :func:`release_window`
+(Completer, T4.3b); scan дополнительно возвращает места функцией
+:func:`refill_window`.
 """
 
 from __future__ import annotations
 
 import asyncio
 import functools
+import hashlib
 import logging
 from collections import Counter
 from dataclasses import dataclass, field
@@ -33,8 +41,11 @@ from typing import TYPE_CHECKING, Final, cast
 from uuid import UUID
 
 from sqlalchemy import (
+    BigInteger,
+    Boolean,
     DateTime,
     Interval,
+    SmallInteger,
     Uuid,
     any_,
     delete,
@@ -67,12 +78,14 @@ if TYPE_CHECKING:
     from tallyho.storage.tables import Tables
     from tallyho.storage.tx import TxSettings
 
-__all__ = ["Relay", "RelaySettings"]
+__all__ = ["Relay", "RelaySettings", "refill_window", "release_window", "window_lock_key"]
 
 _log = logging.getLogger(__name__)
 
 _MAX_ATTEMPTS: Final = 32767
 """Предел ``th_outbox.attempts`` (smallint): счётчик захватов не переполняется."""
+
+_LOCK_PERSON: Final = b"tallyho.window"
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -125,6 +138,7 @@ class _Row:
     payload: bytes | None
     options: object
     paused: bool
+    max_in_flight: int | None
     item_state: int | None
 
     @property
@@ -163,9 +177,28 @@ def _uuids(ids: Iterable[UUID]) -> ColumnElement[Sequence[UUID]]:
     return literal(list(ids), ARRAY(Uuid()))
 
 
-def _infinity() -> ColumnElement[datetime]:
-    # Запись запаркована: relay её не видит до resume.
-    return literal_column("'infinity'::timestamptz", DateTime(timezone=True))
+def _infinity(*, negative: bool = False) -> ColumnElement[datetime]:
+    # infinity — запаркована; -infinity — возвращена из парковки в начало очереди.
+    value = "'-infinity'::timestamptz" if negative else "'infinity'::timestamptz"
+    return literal_column(value, DateTime(timezone=True))
+
+
+def _small(value: int) -> ColumnElement[int]:
+    # Коды — литералами, а не bind-параметрами (D-020).
+    return literal_column(str(int(value)), SmallInteger())
+
+
+def window_lock_key(batch_id: UUID) -> int:
+    """Ключ ``pg_advisory_xact_lock``, под которым relay захватывает записи батча с окном.
+
+    Args:
+        batch_id: Батч с ``max_in_flight``.
+
+    Returns:
+        Знаковое 64-битное число из blake2b от id батча.
+    """
+    digest = hashlib.blake2b(batch_id.bytes, digest_size=8, person=_LOCK_PERSON).digest()
+    return int.from_bytes(digest, "big", signed=True)
 
 
 def _expires(options: Mapping[str, object]) -> float | None:
@@ -242,7 +275,7 @@ class Relay:
                 _log.exception("relay: проход fast-path упал")
 
     async def scan_once(self) -> int:
-        """Страховочный проход: отправить все записи старше ``grace``.
+        """Страховочный проход: вернуть места окна и отправить все записи старше ``grace``.
 
         Раунды по ``chunk`` записей идут, пока готовые записи не кончатся, раунд
         не перестанет что-либо менять или брокер не откажет.
@@ -250,6 +283,11 @@ class Relay:
         Returns:
             Сколько сообщений принял брокер.
         """
+
+        async def refill(conn: AsyncConnection) -> None:
+            _ = await refill_window(conn, self.tables)
+
+        await run_transaction(self.engine, refill, settings=self.tx_settings)
         return await self._drain(None)
 
     # --- раунд -------------------------------------------------------------
@@ -272,6 +310,7 @@ class Relay:
         send: list[_Row] = []
         park: list[UUID] = []
         drop: list[UUID] = []
+        windowed: dict[UUID, list[_Row]] = {}
         for row in rows:
             if row.broken:
                 drop.append(row.id)
@@ -279,12 +318,31 @@ class Relay:
                 send.append(row)
             elif row.paused:
                 park.append(row.id)
+            elif row.max_in_flight is not None:
+                windowed.setdefault(row.batch_id, []).append(row)
             else:
                 send.append(row)
+        new_window: list[_Row] = []
+        for batch_id in sorted(windowed):
+            passed = await self._fit_window(conn, batch_id, windowed[batch_id])
+            if passed is None:
+                continue  # батч захватывает другой relay: записи остаются готовыми
+            allowed, fresh = passed
+            send.extend(allowed)
+            new_window.extend(fresh)
+            taken = {row.id for row in allowed}
+            park.extend(row.id for row in windowed[batch_id] if row.id not in taken)
         if drop:
             _log.warning("relay: удалено %d записей outbox без живого Item или задачи", len(drop))
             _ = await conn.execute(delete(self.tables.outbox).where(self._outbox_in(drop)))
         await self._take(conn, [row.id for row in send], park)
+        if new_window:
+            window = self.tables.window
+            _ = await conn.execute(
+                insert(window)
+                .values([{"item_id": row.id, "batch_id": row.batch_id} for row in new_window])
+                .on_conflict_do_nothing()
+            )
         return _Claim(
             selected=len(rows),
             changed=len(send) + len(park) + len(drop),
@@ -308,6 +366,7 @@ class Relay:
                 func.coalesce(outbox.c.payload, item.c.payload),
                 func.coalesce(item.c.options, outbox.c.options),
                 batch.c.paused_at.is_not(None),
+                batch.c.max_in_flight,
                 item.c.state,
             )
             .select_from(
@@ -332,6 +391,7 @@ class Relay:
                 payload=payload,
                 options=options,
                 paused=bool(paused),
+                max_in_flight=max_in_flight,
                 item_state=item_state,
             )
             for (
@@ -342,9 +402,46 @@ class Relay:
                 payload,
                 options,
                 paused,
+                max_in_flight,
                 item_state,
             ) in result
         ]
+
+    async def _fit_window(
+        self, conn: AsyncConnection, batch_id: UUID, rows: list[_Row]
+    ) -> tuple[list[_Row], list[_Row]] | None:
+        # Сколько записей батча с окном можно отправить. None — батч занят другим relay.
+        lock = func.pg_try_advisory_xact_lock(
+            literal(window_lock_key(batch_id), BigInteger()), type_=Boolean()
+        )
+        if not await conn.scalar(select(lock)):
+            return None
+        window = self.tables.window
+        used = int(
+            await conn.scalar(
+                select(func.count()).select_from(window).where(window.c.batch_id == batch_id)
+            )
+            or 0
+        )
+        # Уже в окне: захвачены прошлым проходом, который не дошёл до DELETE.
+        held = set(
+            await conn.scalars(
+                select(window.c.item_id).where(
+                    window.c.item_id == any_(_uuids(row.id for row in rows))
+                )
+            )
+        )
+        room = (rows[0].max_in_flight or 0) - used
+        allowed: list[_Row] = []
+        fresh: list[_Row] = []
+        for row in rows:
+            if row.id in held:
+                allowed.append(row)
+            elif room > 0:
+                allowed.append(row)
+                fresh.append(row)
+                room -= 1
+        return allowed, fresh
 
     async def _take(self, conn: AsyncConnection, send: list[UUID], park: list[UUID]) -> None:
         outbox = self.tables.outbox
@@ -445,3 +542,140 @@ class Relay:
                 set_={"expires_at": stmt.excluded.expires_at},
             )
         )
+
+
+# --- окно max_in_flight --------------------------------------------------------
+
+
+async def release_window(
+    conn: AsyncConnection, tables: Tables, item_ids: Iterable[UUID]
+) -> list[UUID]:
+    """Освободить места окна ``max_in_flight`` завершённых Items.
+
+    Вызывает Completer в транзакции finish (T4.3b) после CAS Items: удаляет
+    их строки ``th_window`` и возвращает в очередь столько запаркованных
+    записей каждого батча (не на паузе), сколько мест освободилось. Для Items
+    без окна — ничего не делает. После commit вызывающий зовёт
+    :meth:`Relay.kick` для вернувшихся батчей.
+
+    Возвращённая запись получает ``available_at = -infinity``: она ждала
+    дольше всех, поэтому встаёт в начало очереди и сразу видна scan, без
+    ``relay_grace``.
+
+    Args:
+        conn: Соединение в открытой транзакции.
+        tables: Таблицы установки.
+        item_ids: Завершённые Items.
+
+    Returns:
+        Батчи, в которых освободились места, по возрастанию id.
+    """
+    ids = sorted(set(item_ids))
+    if not ids:
+        return []
+    window = tables.window
+    freed: Counter[UUID] = Counter(
+        await conn.scalars(
+            delete(window).where(window.c.item_id == any_(_uuids(ids))).returning(window.c.batch_id)
+        )
+    )
+    _ = await _unpark(conn, tables, freed)
+    return sorted(freed)
+
+
+async def refill_window(conn: AsyncConnection, tables: Tables) -> int:
+    """Вернуть в очередь запаркованные записи батчей, у которых в окне есть место.
+
+    Страховка scan: места могли освободиться без :func:`release_window`
+    (resume, sweeper, ручная правка). Рассматриваются активные батчи с
+    ``max_in_flight`` не на паузе, у которых есть запаркованные записи.
+    Свободно = окно - строки ``th_window`` - готовые (не запаркованные)
+    записи батча.
+
+    Args:
+        conn: Соединение в открытой транзакции.
+        tables: Таблицы установки.
+
+    Returns:
+        Сколько записей возвращено в очередь.
+    """
+    batch = tables.batch
+    outbox = tables.outbox
+    parked = (
+        select(outbox.c.id)
+        .where(outbox.c.batch_id == batch.c.id, outbox.c.available_at == _infinity())
+        .exists()
+    )
+    candidates = await conn.execute(
+        select(batch.c.id, batch.c.max_in_flight)
+        .where(
+            batch.c.state < _small(TERMINAL_THRESHOLD),
+            batch.c.max_in_flight.is_not(None),
+            batch.c.paused_at.is_(None),
+            parked,
+        )
+        .order_by(batch.c.id)
+    )
+    room: Counter[UUID] = Counter()
+    for batch_id, max_in_flight in candidates:
+        limit = max_in_flight or 0
+        in_window = await _bounded_count(
+            conn,
+            tables.window.c.batch_id == batch_id,
+            column=tables.window.c.item_id,
+            limit=limit,
+        )
+        ready = await _bounded_count(
+            conn,
+            (outbox.c.batch_id == batch_id)
+            & (outbox.c.kind == _small(OutboxKind.ITEM))
+            & (outbox.c.available_at < _infinity()),
+            column=outbox.c.id,
+            limit=limit,
+        )
+        busy = in_window + ready
+        if busy < limit:
+            room[batch_id] = limit - busy
+    return await _unpark(conn, tables, room)
+
+
+async def _bounded_count(
+    conn: AsyncConnection, where: ColumnElement[bool], *, column: ColumnElement[UUID], limit: int
+) -> int:
+    # count(*) не дальше limit строк: окно маленькое, а готовых записей может быть много.
+    sample = select(column).where(where).limit(limit).subquery()
+    return int(await conn.scalar(select(func.count()).select_from(sample)) or 0)
+
+
+async def _unpark(conn: AsyncConnection, tables: Tables, room: Mapping[UUID, int]) -> int:
+    # Не больше room[batch] запаркованных записей Items батча, не стоящего на паузе.
+    if not room:
+        return 0
+    batch = tables.batch
+    outbox = tables.outbox
+    active = set(
+        await conn.scalars(
+            select(batch.c.id).where(
+                batch.c.id == any_(_uuids(sorted(room))), batch.c.paused_at.is_(None)
+            )
+        )
+    )
+    moved = 0
+    for batch_id in sorted(active):
+        chosen = (
+            select(outbox.c.id)
+            .where(
+                outbox.c.batch_id == batch_id,
+                outbox.c.available_at == _infinity(),
+                outbox.c.kind == _small(OutboxKind.ITEM),
+            )
+            .limit(room[batch_id])
+            .with_for_update(skip_locked=True)
+        )
+        result = await conn.execute(
+            update(outbox)
+            .where(outbox.c.id.in_(chosen))
+            .values(available_at=_infinity(negative=True))
+        )
+        moved += result.rowcount
+    return moved
