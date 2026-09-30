@@ -366,7 +366,7 @@ known_first_party = ["tallyho"]
 [tool.deptry.per_rule_ignores]
 # Скелет ещё не импортирует эти пакеты. Удаляй из списка по мере появления кода —
 # иначе deptry не заметит, что зависимость стала лишней.
-DEP002 = ["sqlalchemy", "asyncpg", "psycopg", "flexiq", "alembic", "typing-extensions"]
+DEP002 = ["asyncpg", "psycopg", "flexiq", "alembic", "typing-extensions"]
 
 # -----------------------------------------------------------------------------
 # pytest
