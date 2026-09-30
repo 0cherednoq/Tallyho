@@ -470,6 +470,7 @@ erDiagram
         bigint d_duplicates
         bigint d_skipped_by_limit
         bigint d_tree_total
+        timestamptz created_at "для sweeper fold после grace"
     }
     TH_METRIC {
         uuid batch_id PK
@@ -516,6 +517,7 @@ erDiagram
 | th_feed | `(fed_id)` | все ли источники этапа финализированы; правило записи в этап | O(log n) |
 | th_counter | PK `(batch_id, slot)` | прогресс, финализация | O(slots) |
 | th_counter_delta | `(batch_id)` | точное чтение и свёртка | размер = несвёрнутое |
+| th_counter_delta | `(created_at, id)` | sweeper: свёртка дельт старше `finalize_grace` | размер = несвёрнутое |
 | th_metric | PK `(batch_id, name, slot)` | разбивка по labels | O(names × slots) |
 | th_item_mark | PK `(batch_id, label, item_id)` | «все hard_bounce батча» для экспорта | O(log n + k) |
 
@@ -1396,7 +1398,7 @@ th.install(fq)                              # системная задача ta
 @fq.task(max_retries=4)                     # = queue.task(...)(th.tracked(fn)), см. §11.3
 async def my_task(x: int) -> None: ...
 
-await th.migrate()                          # или в Alembic: tallyho.storage.alembic.upgrade(op, version=1, schema="app")
+await th.migrate()                          # или ревизии Alembic: upgrade(..., version=1), затем version=2
 ```
 
 ### 11.2 Сводка

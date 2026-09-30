@@ -85,7 +85,13 @@ async def test_server_defaults(engine: AsyncEngine, schema: str) -> None:
                 updated_at=text("now()"),
             )
         )
-        await conn.execute(insert(tables.counter_delta).values(batch_id=batch_id, d_ok=2))
+        await conn.execute(
+            insert(tables.counter_delta).values(
+                batch_id=batch_id,
+                d_ok=2,
+                created_at=text("now()"),
+            )
+        )
         row = (
             await conn.execute(
                 select(

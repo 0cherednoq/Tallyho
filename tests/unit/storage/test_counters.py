@@ -12,10 +12,11 @@ def test_fields_match_counter_columns() -> None:
     delta_columns = [
         c.name.removeprefix("d_")
         for c in tables.counter_delta.columns
-        if c.name not in {"id", "batch_id"}
+        if c.name not in {"id", "batch_id", "created_at"}
     ]
     assert list(COUNTER_FIELDS) == counter_columns
     assert list(DELTA_FIELDS) == delta_columns
+    assert tables.counter_delta.c.created_at.nullable is False
     assert list(CounterDelta().as_dict()) == counter_columns
 
 

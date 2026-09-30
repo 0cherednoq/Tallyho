@@ -13,8 +13,9 @@
 расставляет диалект. Префикс проверяется регулярным выражением, схема — по
 ограничениям PostgreSQL на идентификаторы.
 
-Схема версии 1 — ровно то, что описывает ``build_metadata``. Когда схема
-изменится, операции версии 1 нужно заморозить, а изменения описать версией 2.
+Схема версии 1 заморожена без ``th_counter_delta.created_at``. Версия 2
+добавляет timestamp и индекс для ограниченной по возрасту свёртки Sweeper;
+``build_metadata`` всегда описывает итоговую актуальную схему.
 """
 
 from __future__ import annotations
@@ -23,11 +24,12 @@ import hashlib
 import re
 from dataclasses import dataclass
 from datetime import timedelta
-from typing import TYPE_CHECKING, Final
+from typing import TYPE_CHECKING, Final, cast
 
 from sqlalchemy import MetaData, Text, func, literal_column, select, text
 from sqlalchemy.dialects.postgresql import insert
-from sqlalchemy.schema import CreateIndex, CreateSchema, CreateTable
+from sqlalchemy.ext.compiler import compiles
+from sqlalchemy.schema import CreateIndex, CreateSchema, CreateTable, ExecutableDDLElement
 
 from tallyho.model.errors import ConfigurationError
 from tallyho.storage.tables import DEFAULT_PREFIX, build_metadata
@@ -38,6 +40,7 @@ if TYPE_CHECKING:
     from sqlalchemy import Table, TypedColumns
     from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
     from sqlalchemy.sql.base import Executable
+    from sqlalchemy.sql.compiler import DDLCompiler
 
     from tallyho.storage.tables import MetaColumns
 
@@ -51,7 +54,7 @@ __all__ = [
     "validate_schema",
 ]
 
-SCHEMA_VERSION: Final = 1
+SCHEMA_VERSION: Final = 2
 """Версия схемы, которую знает эта версия библиотеки."""
 
 VERSION_KEY: Final = "schema_version"
@@ -64,6 +67,7 @@ _PREFIX_RE: Final = re.compile(r"[a-z_][a-z0-9_]{0,15}")
 # PostgreSQL молча обрезает идентификаторы длиннее NAMEDATALEN - 1 байт.
 _MAX_IDENTIFIER_BYTES: Final = 63
 _LOCK_NAMESPACE: Final = "tallyho.migrate"
+_DELTA_TIMESTAMP_VERSION: Final = 2
 
 _PREFIX_ERROR: Final = "Префикс должен соответствовать ^[a-z_][a-z0-9_]{0,15}$"
 _SCHEMA_ERROR: Final = "Имя схемы должно быть непустым, без NUL и не длиннее 63 байт в UTF-8"
@@ -117,16 +121,20 @@ class _Installation:
     schema: str | None
     tables: list[Table[TypedColumns]]
     meta: Table[MetaColumns]
+    counter_delta: Table[TypedColumns]
 
 
-def _installation(schema: str | None, prefix: str) -> _Installation:
+def _installation(
+    schema: str | None, prefix: str, *, delta_timestamps: bool = True
+) -> _Installation:
     """Таблицы ``build_metadata(prefix)`` в схеме ``schema``.
 
     Returns:
         Таблицы установки; при ``schema=None`` — без квалификатора схемы.
     """
-    source = build_metadata(prefix)
+    source = build_metadata(prefix, _delta_timestamps=delta_timestamps)
     meta = source.meta
+    counter_delta: Table[TypedColumns] = source.counter_delta
     tables: list[Table[TypedColumns]] = [
         source.batch,
         source.item,
@@ -144,8 +152,12 @@ def _installation(schema: str | None, prefix: str) -> _Installation:
         target = MetaData()
         meta = meta.to_metadata(target, schema=schema)
         tables = [table.to_metadata(target, schema=schema) for table in tables]
+        counter_delta = next(table for table in tables if table.name == source.counter_delta.name)
     return _Installation(
-        schema=schema, tables=sorted([*tables, meta], key=lambda t: t.name), meta=meta
+        schema=schema,
+        tables=sorted([*tables, meta], key=lambda t: t.name),
+        meta=meta,
+        counter_delta=counter_delta,
     )
 
 
@@ -161,7 +173,62 @@ def _v1(installation: _Installation) -> list[Executable]:
     return statements
 
 
-_MIGRATIONS: Final[Mapping[int, Callable[[_Installation], list[Executable]]]] = {1: _v1}
+class _AddCounterDeltaTimestamp(ExecutableDDLElement):
+    """Добавить timestamp с безопасно скомпилированным именем таблицы."""
+
+    table: Table[TypedColumns]
+
+    def __init__(self, table: Table[TypedColumns]) -> None:
+        self.table = table
+
+
+class _DropCounterDeltaTimestampDefault(ExecutableDDLElement):
+    """Убрать временный DEFAULT после заполнения исторических строк."""
+
+    table: Table[TypedColumns]
+
+    def __init__(self, table: Table[TypedColumns]) -> None:
+        self.table = table
+
+
+@compiles(_AddCounterDeltaTimestamp, "postgresql")
+def _compile_add_counter_delta_timestamp(
+    element: _AddCounterDeltaTimestamp, compiler: object, **_: object
+) -> str:
+    preparer = cast("DDLCompiler", compiler).preparer
+    table = preparer.format_table(element.table)
+    return (
+        f"ALTER TABLE {table} ADD COLUMN created_at TIMESTAMP WITH TIME ZONE "
+        "NOT NULL DEFAULT CURRENT_TIMESTAMP"
+    )
+
+
+@compiles(_DropCounterDeltaTimestampDefault, "postgresql")
+def _compile_drop_counter_delta_timestamp_default(
+    element: _DropCounterDeltaTimestampDefault, compiler: object, **_: object
+) -> str:
+    preparer = cast("DDLCompiler", compiler).preparer
+    table = preparer.format_table(element.table)
+    return f"ALTER TABLE {table} ALTER COLUMN created_at DROP DEFAULT"
+
+
+def _v2(installation: _Installation) -> list[Executable]:
+    created_index = next(
+        index
+        for index in installation.counter_delta.indexes
+        if str(index.name).endswith("_created_idx")
+    )
+    return [
+        _AddCounterDeltaTimestamp(installation.counter_delta),
+        _DropCounterDeltaTimestampDefault(installation.counter_delta),
+        CreateIndex(created_index),
+    ]
+
+
+_MIGRATIONS: Final[Mapping[int, Callable[[_Installation], list[Executable]]]] = {
+    1: _v1,
+    2: _v2,
+}
 
 
 def _lock_timeout_statement(lock_timeout: timedelta) -> Executable:
@@ -213,7 +280,11 @@ def migration_statements(
     migration = _MIGRATIONS.get(version)
     if migration is None:
         raise ConfigurationError(_UNKNOWN_VERSION_ERROR)
-    installation = _installation(schema, prefix)
+    installation = _installation(
+        schema,
+        prefix,
+        delta_timestamps=version >= _DELTA_TIMESTAMP_VERSION,
+    )
     return [
         _lock_timeout_statement(lock_timeout),
         *migration(installation),

@@ -145,6 +145,23 @@ async def test_repeated_migrate_is_noop(engine: AsyncEngine, schema: str) -> Non
     assert await batch_kinds(engine, schema) == ["mailing"]
 
 
+async def test_upgrade_from_v1_backfills_counter_delta_timestamp(
+    engine: AsyncEngine, schema: str
+) -> None:
+    tables = build_metadata()
+    async with engine.begin() as raw:
+        for statement in migration_statements(1, schema=schema):
+            await raw.execute(statement)
+        conn = await raw.execution_options(schema_translate_map={None: schema})
+        await conn.execute(insert(tables.counter_delta).values(batch_id=uuid4(), d_ok=1))
+    assert await migrate(engine, schema) == SCHEMA_VERSION
+    async with engine.connect() as raw:
+        conn = await raw.execution_options(schema_translate_map={None: schema})
+        created_at = await conn.scalar(select(tables.counter_delta.c.created_at))
+    assert created_at is not None
+    assert await stored_version(engine, schema) == str(SCHEMA_VERSION)
+
+
 async def test_migrate_creates_missing_schema(engine: AsyncEngine) -> None:
     async with dropped_after(engine, unique_schema_name()) as schema:
         await migrate(engine, schema)

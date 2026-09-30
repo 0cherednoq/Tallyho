@@ -128,7 +128,12 @@ async def test_reconcile_fixes_artificial_drift(
                 (A, 4): CounterDelta(total=2, skip=1, error=1, w_total=4, w_done=3, duplicates=2),
             },
         )
-        await insert_delta(conn, tables, {A: CounterDelta(ok=2, cancelled=1, w_done=4)})
+        await insert_delta(
+            conn,
+            tables,
+            {A: CounterDelta(ok=2, cancelled=1, w_done=4)},
+            created_at=func.now(),
+        )
     async with schema_transaction(engine, schema) as conn:
         drift = await reconcile(conn, tables, A)
     assert drift == CounterDelta(total=3, ok=-1, w_done=4)
@@ -183,6 +188,7 @@ async def test_reconcile_carries_every_field(
             conn,
             tables,
             {A: CounterDelta(total=3, w_total=5, dispatched=1, skipped_by_limit=3, tree_total=10)},
+            created_at=func.now(),
         )
     async with schema_transaction(engine, schema) as conn:
         drift = await reconcile(conn, tables, A)

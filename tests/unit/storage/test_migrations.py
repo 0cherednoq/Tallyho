@@ -22,7 +22,7 @@ from tallyho.storage.migrations import (
 if TYPE_CHECKING:
     from sqlalchemy.sql.base import Executable
 
-GOLDEN = Path(__file__).parent / "golden" / "ddl.sql"
+GOLDEN = Path(__file__).parent / "golden" / "ddl_v1.sql"
 DIALECT = create_mock_engine("postgresql+asyncpg://", executor=print).dialect
 
 
@@ -43,8 +43,22 @@ def ddl_without_schema(schema: str) -> str:
 
 
 def test_version_one_matches_tables_snapshot() -> None:
-    # Схема миграции — ровно та, что описывает build_metadata (golden T2.1).
+    # Историческая схема v1 заморожена отдельным golden-снимком.
     assert ddl_without_schema("app") == GOLDEN.read_text(encoding="utf-8")
+
+
+def test_version_two_adds_timestamp_and_index() -> None:
+    statements = migration_statements(2, schema="app")
+    sql = [compiled(statement) for statement in statements]
+    assert sql[1] == (
+        "ALTER TABLE app.th_counter_delta ADD COLUMN created_at "
+        "TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP"
+    )
+    assert sql[2] == ("ALTER TABLE app.th_counter_delta ALTER COLUMN created_at DROP DEFAULT")
+    assert sql[3] == (
+        "CREATE INDEX th_counter_delta_created_idx ON app.th_counter_delta (created_at, id)"
+    )
+    assert "VALUES ('schema_version', '2')" in sql[-1]
 
 
 def test_statements_order() -> None:

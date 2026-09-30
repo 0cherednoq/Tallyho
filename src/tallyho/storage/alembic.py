@@ -6,7 +6,12 @@
 
 
     def upgrade() -> None:
-        tallyho_upgrade(op, version=1, schema="app")
+        tallyho_upgrade(op, version=1, schema="app")  # первая ревизия
+
+
+    # В следующей ревизии:
+    def upgrade() -> None:
+        tallyho_upgrade(op, version=2, schema="app")
 
 Версия указывается в ревизии явно: ревизия не должна менять смысл, когда
 обновляется библиотека. Для новой версии схемы tallyho пишется новая ревизия

@@ -40,4 +40,14 @@ def test_offline_script_quotes_schema_and_uses_prefix() -> None:
 
 def test_unknown_version_rejected() -> None:
     with pytest.raises(ConfigurationError):
-        offline_sql(version=2)
+        offline_sql(version=3)
+
+
+def test_version_two_offline_script_is_safe_and_complete() -> None:
+    sql = offline_sql(version=2, schema='we"ird', prefix="acme_")
+    assert (
+        'ALTER TABLE "we""ird".acme_counter_delta ADD COLUMN created_at '
+        "TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP;"
+    ) in sql
+    assert "CREATE INDEX acme_counter_delta_created_idx" in sql
+    assert "VALUES ('schema_version', '2')" in sql

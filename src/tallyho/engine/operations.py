@@ -259,7 +259,7 @@ class Operations:
             for row in rows:
                 deltas[row.batch_id] += CounterDelta(cancelled=1, w_done=row.weight)
                 metrics[row.batch_id, "cancelled", self.slot] += 1
-            _ = await insert_delta(conn, self.tables, deltas)
+            _ = await insert_delta(conn, self.tables, deltas, created_at=now)
             await upsert_metrics(conn, self.tables, metrics)
             changed += len(rows)
         await self._after(target, finalize=ids)
@@ -384,12 +384,14 @@ class Operations:
                 updated_at=now,
             )
         )
-        await self._reactivate_virtuals(conn, child_ids=set(ids))
+        await self._reactivate_virtuals(conn, child_ids=set(ids), now=now)
         changed = await self._retry_items(conn, ids=ids, labels=labels, now=now)
         await self._after(target, relay=ids, finalize=reopen_ids)
         return changed
 
-    async def _reactivate_virtuals(self, conn: AsyncConnection, *, child_ids: set[UUID]) -> None:
+    async def _reactivate_virtuals(
+        self, conn: AsyncConnection, *, child_ids: set[UUID], now: datetime
+    ) -> None:
         item = self.tables.item
         raw_rows = list(
             await conn.execute(
@@ -416,7 +418,7 @@ class Operations:
             deltas[row.batch_id] += CounterDelta(**values)
             if row.label is not None:
                 metrics[row.batch_id, row.label, self.slot] -= 1
-        _ = await insert_delta(conn, self.tables, deltas)
+        _ = await insert_delta(conn, self.tables, deltas, created_at=now)
         await upsert_metrics(conn, self.tables, metrics)
 
     async def _retry_items(
@@ -509,7 +511,7 @@ class Operations:
                 deltas[row.batch_id] += CounterDelta(error=-1, w_done=-row.weight)
                 if row.label is not None:
                     metrics[row.batch_id, row.label, self.slot] -= 1
-            _ = await insert_delta(conn, self.tables, deltas)
+            _ = await insert_delta(conn, self.tables, deltas, created_at=now)
             await upsert_metrics(conn, self.tables, metrics)
             total += len(rows)
         return total

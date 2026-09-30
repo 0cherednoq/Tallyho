@@ -58,9 +58,17 @@ async def test_fold_moves_deltas_into_slot(
 ) -> None:
     async with schema_transaction(engine, schema) as conn:
         await insert_delta(
-            conn, tables, {A: CounterDelta(total=2, ok=1, w_done=3), B: CounterDelta(error=1)}
+            conn,
+            tables,
+            {A: CounterDelta(total=2, ok=1, w_done=3), B: CounterDelta(error=1)},
+            created_at=func.now(),
         )
-        await insert_delta(conn, tables, {A: CounterDelta(skip=1, cancelled=1, w_done=1)})
+        await insert_delta(
+            conn,
+            tables,
+            {A: CounterDelta(skip=1, cancelled=1, w_done=1)},
+            created_at=func.now(),
+        )
     before = await read_a(engine, schema, tables)
     folded = await fold_into_slot(engine, schema, tables, A)
     assert folded == {A: CounterDelta(total=2, ok=1, skip=1, cancelled=1, w_done=4)}
@@ -75,7 +83,7 @@ async def test_uncommitted_deltas_are_not_folded(
     engine: AsyncEngine, schema: str, tables: Tables
 ) -> None:
     async with schema_connection(engine, schema) as user:
-        await insert_delta(user, tables, {A: CounterDelta(total=1, ok=1)})
+        await insert_delta(user, tables, {A: CounterDelta(total=1, ok=1)}, created_at=func.now())
         assert await fold_into_slot(engine, schema, tables, A) == {}
         await user.commit()
     assert await fold_into_slot(engine, schema, tables, A) == {A: CounterDelta(total=1, ok=1)}
@@ -86,7 +94,7 @@ async def test_concurrent_folds_count_delta_once(
     engine: AsyncEngine, schema: str, tables: Tables
 ) -> None:
     async with schema_transaction(engine, schema) as conn:
-        await insert_delta(conn, tables, {A: CounterDelta(ok=1)})
+        await insert_delta(conn, tables, {A: CounterDelta(ok=1)}, created_at=func.now())
     async with (
         schema_connection(engine, schema) as first,
         schema_connection(engine, schema) as second,
@@ -112,7 +120,12 @@ async def test_read_does_not_flicker_during_fold(
         for _ in range(iterations):
             started += 1
             async with schema_transaction(engine, schema) as conn:
-                await insert_delta(conn, tables, {A: CounterDelta(total=1, ok=1, w_done=2)})
+                await insert_delta(
+                    conn,
+                    tables,
+                    {A: CounterDelta(total=1, ok=1, w_done=2)},
+                    created_at=func.now(),
+                )
             await asyncio.sleep(0)
         inserting = False
 

@@ -87,7 +87,9 @@ async def test_upsert_many_rows_in_chunks(engine: AsyncEngine, schema: str, tabl
     ids = [uuid4() for _ in range(1500)]
     async with schema_transaction(engine, schema) as conn:
         await upsert_slots(conn, tables, {(b, 0): CounterDelta(total=1) for b in ids})
-        await insert_delta(conn, tables, {b: CounterDelta(ok=1) for b in ids})
+        await insert_delta(
+            conn, tables, {b: CounterDelta(ok=1) for b in ids}, created_at=func.now()
+        )
     totals = await read(engine, schema, tables, *ids)
     assert set(totals.values()) == {CounterTotals(total=1, ok=1)}
     assert len(totals) == len(ids)
@@ -100,8 +102,14 @@ async def test_delta_adds_to_read(engine: AsyncEngine, schema: str, tables: Tabl
             conn,
             tables,
             {A: CounterDelta(ok=2, skip=1, error=1, cancelled=1, w_done=4), B: CounterDelta()},
+            created_at=func.now(),
         )
-        await insert_delta(conn, tables, {A: CounterDelta(total=1, ok=1, w_done=1)})
+        await insert_delta(
+            conn,
+            tables,
+            {A: CounterDelta(total=1, ok=1, w_done=1)},
+            created_at=func.now(),
+        )
     totals = await read(engine, schema, tables, A, B)
     assert totals[A] == CounterTotals(
         total=11, ok=3, skip=1, error=1, cancelled=1, w_total=10, w_done=5
@@ -117,7 +125,7 @@ async def test_each_delta_field_round_trip(
     # insert_delta -> read_counters -> fold_deltas -> слот: поле не теряется ни на одном шаге.
     delta = CounterDelta(**{name: 7})
     async with schema_transaction(engine, schema) as conn:
-        await insert_delta(conn, tables, {A: delta})
+        await insert_delta(conn, tables, {A: delta}, created_at=func.now())
     expected = CounterTotals(**delta.as_dict())
     assert await read(engine, schema, tables, A) == {A: expected}
     async with schema_transaction(engine, schema) as conn:
@@ -134,7 +142,7 @@ async def test_all_delta_fields_at_once(engine: AsyncEngine, schema: str, tables
     delta = CounterDelta(**{name: n for n, name in enumerate(COUNTER_FIELDS, start=1)})
     async with schema_transaction(engine, schema) as conn:
         await upsert_slots(conn, tables, {(A, 0): delta})
-        await insert_delta(conn, tables, {A: delta, B: -delta})
+        await insert_delta(conn, tables, {A: delta, B: -delta}, created_at=func.now())
     assert await read(engine, schema, tables, A, B) == {
         A: CounterTotals(**(delta + delta).as_dict()),
         B: CounterTotals(**(-delta).as_dict()),

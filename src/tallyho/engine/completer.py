@@ -1324,7 +1324,7 @@ class Completer:
         values = {item.id: (item, value)}
         await tx.finish(values, scalar=True)
         await tx.expand(values)
-        inserted = await insert_delta(conn, self.tables, tx.deltas)
+        inserted = await insert_delta(conn, self.tables, tx.deltas, created_at=tx.now)
         await upsert_metrics(conn, self.tables, tx.metrics)
         changed = item.id in tx.applied.finished
         if changed:

@@ -76,14 +76,11 @@ CREATE TABLE th_counter_delta (
 	d_duplicates BIGINT DEFAULT 0 NOT NULL,
 	d_skipped_by_limit BIGINT DEFAULT 0 NOT NULL,
 	d_tree_total BIGINT DEFAULT 0 NOT NULL,
-	created_at TIMESTAMP WITH TIME ZONE NOT NULL,
 	PRIMARY KEY (id)
 )
  WITH (autovacuum_vacuum_scale_factor = 0, autovacuum_vacuum_threshold = 1000);
 
 CREATE INDEX th_counter_delta_batch_idx ON th_counter_delta (batch_id);
-
-CREATE INDEX th_counter_delta_created_idx ON th_counter_delta (created_at, id);
 
 CREATE TABLE th_expiry (
 	item_id UUID NOT NULL,

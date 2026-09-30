@@ -21,7 +21,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Final, final
+from typing import TYPE_CHECKING, Final, cast, final
 
 from sqlalchemy import (
     BigInteger,
@@ -267,6 +267,7 @@ class CounterDeltaColumns(TypedColumns):
     d_duplicates = _big(default=0)
     d_skipped_by_limit = _big(default=0)
     d_tree_total = _big(default=0)
+    created_at = _utc()
 
 
 @final
@@ -335,7 +336,7 @@ class Tables:
     meta: Table[MetaColumns]
 
 
-def build_metadata(prefix: str = DEFAULT_PREFIX) -> Tables:
+def build_metadata(prefix: str = DEFAULT_PREFIX, *, _delta_timestamps: bool = True) -> Tables:
     """Описать таблицы tallyho с префиксом ``prefix`` в новом ``MetaData``.
 
     Args:
@@ -359,7 +360,7 @@ def build_metadata(prefix: str = DEFAULT_PREFIX) -> Tables:
             CounterColumns,
             postgresql_with={"fillfactor": _HOT_FILLFACTOR, **_AGGRESSIVE_AUTOVACUUM},
         ),
-        counter_delta=_counter_delta(metadata, prefix),
+        counter_delta=_counter_delta(metadata, prefix, timestamps=_delta_timestamps),
         metric=Table(
             f"{prefix}metric",
             metadata,
@@ -460,10 +461,50 @@ def _feed(metadata: MetaData, prefix: str) -> Table[FeedColumns]:
     return feed
 
 
-def _counter_delta(metadata: MetaData, prefix: str) -> Table[CounterDeltaColumns]:
+def _counter_delta(
+    metadata: MetaData, prefix: str, *, timestamps: bool
+) -> Table[CounterDeltaColumns]:
     name = f"{prefix}counter_delta"
-    delta = Table(name, metadata, CounterDeltaColumns, postgresql_with=_AGGRESSIVE_AUTOVACUUM)
+    delta: Table[CounterDeltaColumns]
+    if timestamps:
+        delta = Table(
+            name,
+            metadata,
+            CounterDeltaColumns,
+            postgresql_with=_AGGRESSIVE_AUTOVACUUM,
+        )
+    else:
+        # Историческая схема v1 заморожена без created_at; миграция v2 добавляет
+        # колонку. Этот путь используется только генератором миграции v1.
+        delta = cast(
+            "Table[CounterDeltaColumns]",
+            Table(
+                name,
+                metadata,
+                Column("id", BigInteger(), Identity(always=True), primary_key=True),
+                Column("batch_id", Uuid(), nullable=False),
+                *(
+                    Column(f"d_{field}", BigInteger(), nullable=False, server_default=text("0"))
+                    for field in (
+                        "total",
+                        "ok",
+                        "skip",
+                        "error",
+                        "cancelled",
+                        "dispatched",
+                        "w_total",
+                        "w_done",
+                        "duplicates",
+                        "skipped_by_limit",
+                        "tree_total",
+                    )
+                ),
+                postgresql_with=_AGGRESSIVE_AUTOVACUUM,
+            ),
+        )
     Index(f"{name}_batch_idx", delta.c.batch_id)
+    if timestamps:
+        Index(f"{name}_created_idx", delta.c.created_at, delta.c.id)
     return delta
 
 

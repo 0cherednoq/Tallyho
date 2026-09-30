@@ -42,6 +42,7 @@ from tallyho.model.states import TERMINAL_THRESHOLD, ItemState
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Iterator, Mapping
+    from datetime import datetime
     from uuid import UUID
 
     from sqlalchemy import ColumnElement, Select
@@ -343,7 +344,11 @@ async def _upsert_rows(
 
 
 async def insert_delta(
-    conn: AsyncConnection, tables: Tables, deltas: Mapping[UUID, CounterDelta]
+    conn: AsyncConnection,
+    tables: Tables,
+    deltas: Mapping[UUID, CounterDelta],
+    *,
+    created_at: datetime | ColumnElement[datetime],
 ) -> dict[UUID, list[int]]:
     """Записать дельты в ``th_counter_delta`` (путь B, транзакция пользователя).
 
@@ -355,6 +360,7 @@ async def insert_delta(
         conn: Соединение транзакции пользователя.
         tables: Таблицы установки.
         deltas: Приращения по батчам.
+        created_at: Время создания дельт из внедрённого Clock/DB-выражения.
 
     Returns:
         Идентификаторы вставленных строк по батчам.
@@ -367,6 +373,7 @@ async def insert_delta(
         values = value.as_dict()
         row: dict[str, object] = {f"d_{n}": values[n] for n in DELTA_FIELDS}
         row["batch_id"] = batch_id
+        row["created_at"] = created_at
         rows.append(row)
     inserted: defaultdict[UUID, list[int]] = defaultdict(list)
     for chunk in _chunks(rows):
