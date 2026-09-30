@@ -2,4 +2,11 @@
 
 from __future__ import annotations
 
-__all__: list[str] = []
+from tallyho.storage.migrations import SCHEMA_VERSION, migrate, validate_prefix, validate_schema
+
+__all__ = [
+    "SCHEMA_VERSION",
+    "migrate",
+    "validate_prefix",
+    "validate_schema",
+]
