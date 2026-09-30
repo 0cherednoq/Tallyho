@@ -6,8 +6,8 @@
 ## Текущее состояние
 
 * **Ветка:** `impl/v1`
-* **Текущая волна:** T6.2
-* **Последний зелёный коммит:** 5d9a433
+* **Текущая волна:** T6.3
+* **Последний зелёный коммит:** 3c5f331
 
 ## Задачи
 
@@ -40,7 +40,7 @@
 | T4.11 | Чтение: view, in_flight, items, find | T4.4 | done | 8b45a88 |
 | T5.1 | Runtime: ItemContext, th.item, tracked | T4.5, T4.7 | done | 8160725 |
 | T6.1 | Tallyho, Settings, install, migrate | T5.1, T4.10, T4.11 | done | 5d9a433 |
-| T6.2 | th.batch → BatchBuilder, BatchHandle | T6.1 | todo | |
+| T6.2 | th.batch → BatchBuilder, BatchHandle | T6.1 | done | 3c5f331 |
 | T6.3 | th.call с ParamSpec, типовые тесты | T6.1 | todo | |
 | T7.1 | tallyho.testing: InlineBroker, FakeClock | T6.2 | todo | |
 | T8.0 | Спайк flexiq | T0.1 | done | 4d318d0..f4155a6 (3), merge 9395ea6, b41b30d, 2a781c2 |
@@ -72,6 +72,16 @@
 - Отклонения от плана/доков: … (или «нет»)
 - Узнали / на что обратить внимание дальше: …
 -->
+### 2026-09-30 · T6.3 · in_progress · —
+- Начата реализация типизированного `th.call(...)`, `.opts(...)` и compile-time тестов публичных вызовов.
+
+### 2026-09-30 · T6.2 · done · 3c5f331
+- Сделано: `th.batch(...)` с собственной или пользовательской транзакцией; ленивые `sub_batch`/`fed_by`; `add`, `map`, `add_calls`, `expect`, ручной и автоматический `seal`; публичный `BatchHandle` со чтением, watch/wait и всеми управляющими операциями.
+- После commit producer подталкивает Relay и Finalizer; rollback собственной транзакции удаляет дерево, а исключение с внешней session не дописывает seal и оставляет commit/rollback пользователю. Пустой батч финализируется без ожидания maintenance.
+- Проверка: исполняемые сценарии `schedule` §12.4 и `start_import` §13.2 с fake broker; транзакционные rollback/external-session тесты; unit-покрытие всех ветвей builder/handle; `poe check` зелёный; `poe test-all` — 990 passed, 1 platform skip, покрытие 95,62%; pre-commit зелёный.
+- Отклонения от плана/доков: нет.
+- Дальше: T6.3 `th.call` с `ParamSpec` и типовыми тестами.
+
 ### 2026-09-30 · T6.2 · in_progress · —
 - Начата реализация `th.batch(...)`, `BatchBuilder` и `BatchHandle` поверх собранного Tallyho API.
 
