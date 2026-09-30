@@ -8,7 +8,9 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
+from datetime import timedelta
 from typing import TYPE_CHECKING, Final
 
 from tallyho.model.errors import ConfigurationError
@@ -22,9 +24,12 @@ if TYPE_CHECKING:
 __all__ = [
     "DEFAULT_ESTIMATE_MIN_BASIS",
     "DEFAULT_ESTIMATE_MIN_SHARE",
+    "DEFAULT_ETA_WINDOW",
     "NodeCounters",
     "ProgressSettings",
     "compute_progress",
+    "ema_rate",
+    "estimate_eta",
     "estimate_threshold",
 ]
 
@@ -34,6 +39,9 @@ DEFAULT_ESTIMATE_MIN_BASIS: Final = 20
 DEFAULT_ESTIMATE_MIN_SHARE: Final = 0.05
 """Какая доля источника достаточна для оценки итога (§15)."""
 
+DEFAULT_ETA_WINDOW: Final = timedelta(seconds=60)
+"""Окно скользящего среднего скорости для ETA (§15)."""
+
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class ProgressSettings:
@@ -41,15 +49,18 @@ class ProgressSettings:
 
     Оценка итога по ``fed_by`` показывается, когда число завершённых
     родителей достигло ``min(estimate_min_basis, estimate_min_share * expected_F)``.
+    ``eta_window`` — окно EMA скорости (:func:`ema_rate`).
     """
 
     estimate_min_basis: int = DEFAULT_ESTIMATE_MIN_BASIS
     estimate_min_share: float = DEFAULT_ESTIMATE_MIN_SHARE
+    eta_window: timedelta = DEFAULT_ETA_WINDOW
 
     def __post_init__(self) -> None:
         """Проверить параметры (``ConfigurationError`` при выходе за диапазон)."""
         _check_min_basis(self.estimate_min_basis)
         _check_min_share(self.estimate_min_share)
+        _check_window(self.eta_window)
 
 
 def _check_min_basis(basis: object) -> None:
@@ -62,6 +73,53 @@ def _check_min_share(share: object) -> None:
     if isinstance(share, bool) or not isinstance(share, int | float) or not 0 <= share <= 1:
         message = f"estimate_min_share должен быть в [0, 1], получено {share!r}"
         raise ConfigurationError(message)
+
+
+def _check_window(window: object) -> None:
+    if not isinstance(window, timedelta) or window <= timedelta(0):
+        message = f"eta_window должен быть положительным timedelta, получено {window!r}"
+        raise ConfigurationError(message)
+
+
+def ema_rate(
+    previous: float | None,
+    *,
+    done_delta: int,
+    elapsed: timedelta,
+    window: timedelta = DEFAULT_ETA_WINDOW,
+) -> float | None:
+    """Обновить скользящее среднее скорости (завершённых Items в секунду).
+
+    Вес нового замера ``1 - exp(-elapsed / window)``: снимки идут неравномерно,
+    поэтому сглаживание зависит от прошедшего времени, а не от числа замеров.
+
+    Returns:
+        Новую скорость; ``previous``, если время не прошло.
+    """
+    seconds = elapsed.total_seconds()
+    if seconds <= 0:
+        return previous
+    instant = max(done_delta, 0) / seconds
+    if previous is None:
+        return instant
+    alpha = 1.0 - math.exp(-seconds / window.total_seconds())
+    return previous + alpha * (instant - previous)
+
+
+def estimate_eta(*, expected: int | None, done: int, rate: float | None) -> timedelta | None:
+    """Время до опустошения: ``(expected - done) / rate`` (§9.4).
+
+    Returns:
+        ``timedelta(0)``, если работы не осталось; ``None`` без ``expected`` или скорости.
+    """
+    if expected is None:
+        return None
+    remaining = expected - done
+    if remaining <= 0:
+        return timedelta(0)
+    if rate is None or rate <= 0:
+        return None
+    return timedelta(seconds=remaining / rate)
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -255,7 +313,34 @@ class _Tree:
             return 1.0 if self.nodes[node_id].closed else None
         return min(max(done / expected, 0.0), 1.0)
 
-    def progress(self, node_id: UUID) -> Progress:
+    def eta(self, node_id: UUID, rates: Mapping[UUID, float]) -> timedelta | None:
+        """ETA узла: у листа — по своей скорости, у узла с детьми — максимум по поддереву.
+
+        Этапы идут параллельно, поэтому дерево опустеет, когда опустеет самый
+        медленный из них. Виртуальные Items из собственного объёма вычитаются.
+
+        Returns:
+            ETA или ``None``, если чего-то не хватает для расчёта.
+        """
+        node = self.nodes[node_id]
+        children = self.children[node_id]
+        expected = self.expected(node_id).value
+        if not children:
+            return estimate_eta(expected=expected, done=node.done, rate=rates.get(node_id))
+        parts = [self.eta(child_id, rates) for child_id in children]
+        virtual = len(children)
+        finished = sum(self.nodes[child_id].state.is_terminal for child_id in children)
+        own_left = node.total > virtual or (expected is not None and expected > virtual)
+        if own_left:
+            own_expected = None if expected is None else expected - virtual
+            own_done = node.done - finished
+            parts.append(
+                estimate_eta(expected=own_expected, done=own_done, rate=rates.get(node_id))
+            )
+        known = [part for part in parts if part is not None]
+        return max(known) if len(known) == len(parts) else None
+
+    def progress(self, node_id: UUID, rates: Mapping[UUID, float]) -> Progress:
         """Собрать :class:`Progress` узла.
 
         Returns:
@@ -279,6 +364,7 @@ class _Tree:
             expected_is_estimate=expected.is_estimate,
             estimate_basis=expected.basis,
             ratio=self.ratio(node_id),
+            eta=self.eta(node_id, rates),
         )
 
 
@@ -286,11 +372,16 @@ def compute_progress(
     nodes: Iterable[NodeCounters],
     *,
     settings: ProgressSettings | None = None,
+    rates: Mapping[UUID, float] | None = None,
 ) -> Mapping[UUID, Progress]:
     """Посчитать :class:`Progress` для каждого узла дерева.
+
+    ``rates`` — скорость (завершённых Items в секунду) по id батча, её ведёт
+    Snapshotter / ``watch()`` через :func:`ema_rate`. Без скорости ETA нет.
 
     Returns:
         ``Progress`` по id батча.
     """
     tree = _Tree(nodes, settings or ProgressSettings())
-    return {node_id: tree.progress(node_id) for node_id in tree.nodes}
+    known_rates: Mapping[UUID, float] = rates or {}
+    return {node_id: tree.progress(node_id, known_rates) for node_id in tree.nodes}

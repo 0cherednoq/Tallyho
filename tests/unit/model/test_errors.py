@@ -69,6 +69,7 @@ def test_model_package_reexports_public_names() -> None:
         "TERMINAL_THRESHOLD",
         "DEFAULT_ESTIMATE_MIN_BASIS",
         "DEFAULT_ESTIMATE_MIN_SHARE",
+        "DEFAULT_ETA_WINDOW",
     ):
         del sources[constant]
     assert set(tallyho.model.__all__) == set(sources)

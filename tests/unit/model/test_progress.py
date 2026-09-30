@@ -200,14 +200,16 @@ def test_duplicate_node_is_rejected() -> None:
 
 
 @pytest.mark.parametrize(
-    ("kwargs", "match"),
+    ("basis", "share", "match"),
     [
-        ({"estimate_min_basis": -1}, "estimate_min_basis"),
-        ({"estimate_min_basis": True}, "estimate_min_basis"),
-        ({"estimate_min_share": 1.5}, "estimate_min_share"),
-        ({"estimate_min_share": False}, "estimate_min_share"),
+        (-1, 0.05, "estimate_min_basis"),
+        (True, 0.05, "estimate_min_basis"),
+        (20, 1.5, "estimate_min_share"),
+        (20, False, "estimate_min_share"),
     ],
 )
-def test_settings_are_validated(kwargs: dict[str, object], match: str) -> None:
+def test_settings_are_validated(basis: object, share: object, match: str) -> None:
     with pytest.raises(ConfigurationError, match=match):
-        ProgressSettings(**cast("dict[str, int]", kwargs))
+        ProgressSettings(
+            estimate_min_basis=cast("int", basis), estimate_min_share=cast("float", share)
+        )

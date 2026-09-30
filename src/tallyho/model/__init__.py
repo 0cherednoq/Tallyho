@@ -29,6 +29,8 @@ from tallyho.model.progress import (
     NodeCounters,
     ProgressSettings,
     compute_progress,
+    ema_rate,
+    estimate_eta,
     estimate_threshold,
 )
 from tallyho.model.states import (
@@ -81,5 +83,7 @@ __all__ = [
     "TaskCall",
     "UnsupportedOption",
     "compute_progress",
+    "ema_rate",
+    "estimate_eta",
     "estimate_threshold",
 ]
