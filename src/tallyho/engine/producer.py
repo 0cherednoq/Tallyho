@@ -94,6 +94,8 @@ VIRTUAL_TASK: Final = "tallyho.sub_batch"
 
 _PRODUCER_INTO_STAGE = "в этап с fed_by пишут только его задачи и задачи источников (into=)"
 _NOT_OPEN = "батч уже закрыт (seal), финализирован или отменяется: добавлять нельзя"
+_SEAL_STAGE = "seal() этапа с fed_by запрещён: его закрывает финализация источников"
+_SEAL_CANCELLED = "seal() отменяемого батча запрещён"
 _FEED_CYCLE = "fed_by образует цикл"
 _FEED_SIBLINGS = "fed_by: источник и этап должны быть под-батчами одного родителя"
 _FEED_CLOSED = "fed_by: этап уже закрыт или отменяется"
@@ -694,6 +696,40 @@ class Producer:
         if target.start_at is not None:
             return literal(target.start_at, DateTime(timezone=True))
         return sql_now(self.clock)
+
+    # --- seal ----------------------------------------------------------------
+
+    async def seal(self, conn: AsyncConnection, batch_id: UUID) -> bool:
+        """Закрыть батч: ``open → sealed`` (UC-02, §6.1).
+
+        Повторный seal ничего не меняет. Проверку ``pending == 0`` и
+        финализацию после commit запускает вызывающий (Finalizer, T4.4).
+
+        Args:
+            conn: Соединение в открытой транзакции.
+            batch_id: Батч.
+
+        Returns:
+            ``True``, если батч был открыт и закрыт этим вызовом.
+
+        Raises:
+            SealError: батч — этап с ``fed_by`` (его закрывает финализация
+                источников) или у батча запрошена отмена.
+        """
+        target = (await self._lock_batches(conn, [batch_id]))[batch_id]
+        if target.is_stage:
+            raise SealError(_SEAL_STAGE)
+        if target.cancel_requested_at is not None:
+            raise SealError(_SEAL_CANCELLED)
+        if target.state is not BatchState.OPEN:
+            return False
+        batch = self.tables.batch
+        _ = await conn.execute(
+            update(batch)
+            .where(batch.c.id == batch_id, batch.c.state == _small_literal(BatchState.OPEN))
+            .values(state=_small_literal(BatchState.SEALED), updated_at=sql_now(self.clock))
+        )
+        return True
 
     # --- expect ------------------------------------------------------------
 
