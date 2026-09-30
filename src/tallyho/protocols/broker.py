@@ -20,7 +20,7 @@ if TYPE_CHECKING:
 
     from tallyho.model.states import OutboxKind
 
-__all__ = ["DeadLetters", "Dispatcher", "Message", "Runtime", "Verdict"]
+__all__ = ["DeadLetters", "Dispatcher", "Message", "Runtime", "RuntimeInstaller", "Verdict"]
 
 P = ParamSpec("P")
 R = TypeVar("R")
@@ -145,4 +145,18 @@ class Runtime(Protocol):
         Returns:
             Items из DLQ и курсор для следующего вызова.
         """
+        ...
+
+
+@runtime_checkable
+class RuntimeInstaller(Protocol):
+    """Необязательная часть адаптера, принимающая собранные worker-сервисы.
+
+    Конкретный объект сервисов принадлежит engine-слою. Протокол оставляет его
+    ``object``, чтобы нижний слой не импортировал engine, а адаптер проверил
+    ожидаемый тип на своей границе.
+    """
+
+    def install_runtime(self, services: object) -> None:
+        """Установить tracked around-hook и системные broker hooks."""
         ...

@@ -1,5 +1,7 @@
-"""Публичный клиентский API: Tallyho, BatchBuilder, BatchHandle, call."""
+"""Публичный клиентский API: Tallyho и Settings."""
 
 from __future__ import annotations
 
-__all__: list[str] = []
+from tallyho.api.client import Settings, Tallyho
+
+__all__ = ["Settings", "Tallyho"]

@@ -1,0 +1,131 @@
+"""Публичная конфигурация и сборка клиента Tallyho."""
+
+from __future__ import annotations
+
+import asyncio
+from dataclasses import fields
+from datetime import timedelta
+from typing import TYPE_CHECKING, ParamSpec, Self, cast
+
+import pytest
+
+from tallyho import Settings, Tallyho
+from tallyho.engine import RuntimeServices
+from tallyho.model.errors import ConfigurationError
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Sequence
+
+    from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
+
+    from tallyho.model.views import BatchSummary
+    from tallyho.protocols.broker import Message
+
+__all__: list[str] = []
+
+P = ParamSpec("P")
+
+
+class FakeEngine:
+    """Достаточная для не-I/O сборки замена AsyncEngine."""
+
+    def execution_options(self, **_options: object) -> Self:
+        return self
+
+
+class Adapter:
+    """Dispatcher с необязательным worker install hook."""
+
+    services: object = None
+
+    def task_name(self, fn: Callable[P, object]) -> str:
+        return getattr(fn, "__name__", "task")
+
+    async def dispatch(self, messages: Sequence[Message]) -> None:
+        _ = messages
+
+    def install_runtime(self, services: object) -> None:
+        self.services = services
+
+
+def _client() -> Tallyho:
+    engine = cast("AsyncEngine", cast("object", FakeEngine()))
+    return Tallyho(engine)
+
+
+def test_defaults_match_architecture_table() -> None:
+    value = Settings()
+    expected = {
+        "counter_slots": 8,
+        "completer_tick": timedelta(milliseconds=20),
+        "completer_max_batch": 500,
+        "completer_backpressure": 10_000,
+        "lease_ttl": timedelta(seconds=60),
+        "heartbeat_every": timedelta(seconds=20),
+        "relay_grace": timedelta(seconds=5),
+        "relay_claim_ttl": timedelta(seconds=30),
+        "finalize_grace": timedelta(seconds=30),
+        "hook_timeout": timedelta(seconds=10),
+        "hook_backoff_initial": timedelta(seconds=1),
+        "hook_backoff_max": timedelta(minutes=5),
+        "snapshot_tick": timedelta(milliseconds=500),
+        "estimate_min_basis": 20,
+        "estimate_min_share": 0.05,
+        "eta_window": timedelta(seconds=60),
+        "max_items": None,
+        "sweep_interval": timedelta(seconds=5),
+        "lock_timeout": timedelta(seconds=5),
+        "retention": timedelta(days=14),
+        "watch_throttle": timedelta(milliseconds=500),
+    }
+    assert {field.name: getattr(value, field.name) for field in fields(value)} == expected
+
+
+@pytest.mark.parametrize(
+    "settings",
+    [
+        {"counter_slots": 0},
+        {"counter_slots": True},
+        {"completer_backpressure": 10, "completer_max_batch": 11},
+        {"heartbeat_every": timedelta(0)},
+        {"relay_grace": timedelta(seconds=-1)},
+        {"hook_backoff_initial": timedelta(minutes=6)},
+        {"estimate_min_share": 2.0},
+        {"max_items": 0},
+        {"retention": timedelta(0)},
+        {"unknown": 1},
+        {"lease_ttl": "one minute"},
+    ],
+)
+def test_invalid_configuration_is_tallyho_error(settings: dict[str, object]) -> None:
+    with pytest.raises(ConfigurationError):
+        _ = Settings.overridden(settings)
+
+
+@pytest.mark.parametrize(("schema", "prefix"), [("x" * 64, "th_"), (None, "bad-prefix")])
+def test_invalid_installation_identifiers(schema: str | None, prefix: str) -> None:
+    engine = cast("AsyncEngine", cast("object", FakeEngine()))
+    with pytest.raises(ConfigurationError):
+        _ = Tallyho(engine, schema=schema, prefix=prefix)
+
+
+def test_install_assembles_services_once_and_requires_it_for_maintenance() -> None:
+    client = _client()
+    with pytest.raises(ConfigurationError, match="install"):
+        _ = client.maintenance()
+    adapter = Adapter()
+    client.install(adapter)
+    assert isinstance(adapter.services, RuntimeServices)
+    assert client.maintenance() is client.maintenance()
+    with pytest.raises(ConfigurationError, match="уже установлен"):
+        client.install(adapter)
+
+
+def test_hook_decorators_register_on_client_registry() -> None:
+    client = _client()
+
+    @client.on_finalized("mail")
+    async def finalized(_session: AsyncSession, _summary: BatchSummary) -> None:
+        await asyncio.sleep(0)
+
+    assert client.hooks.finalized("mail") is finalized

@@ -1,0 +1,66 @@
+"""Мост между публичным API и storage-слоем одной установки."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import TYPE_CHECKING
+
+from tallyho.storage.migrations import migrate, validate_prefix, validate_schema
+from tallyho.storage.tables import build_metadata
+
+if TYPE_CHECKING:
+    from datetime import timedelta
+
+    from sqlalchemy.ext.asyncio import AsyncEngine
+
+    from tallyho.engine.completer import Completer
+    from tallyho.engine.spawn import TreeCache
+    from tallyho.storage.tables import Tables
+
+__all__ = ["Installation", "RuntimeServices", "create_installation", "migrate_installation"]
+
+
+@dataclass(frozen=True, slots=True)
+class Installation:
+    """Движок со schema translation и таблицы выбранного prefix."""
+
+    source_engine: AsyncEngine
+    engine: AsyncEngine
+    schema: str | None
+    prefix: str
+    tables: Tables
+
+
+@dataclass(frozen=True, slots=True)
+class RuntimeServices:
+    """Worker-зависимости, которые broker adapter связывает с runtime."""
+
+    completer: Completer
+    tree_cache: TreeCache
+    heartbeat_every: timedelta
+
+
+def create_installation(engine: AsyncEngine, schema: str | None, prefix: str) -> Installation:
+    """Проверить идентификаторы и описать установку без обращения к БД.
+
+    Returns:
+        Неизменяемое описание установки.
+    """
+    validate_schema(schema)
+    validate_prefix(prefix)
+    scoped = engine.execution_options(schema_translate_map={None: schema})
+    return Installation(engine, scoped, schema, prefix, build_metadata(prefix))
+
+
+async def migrate_installation(value: Installation, *, lock_timeout: timedelta) -> int:
+    """Применить миграции описанной установки.
+
+    Returns:
+        Текущая версия схемы.
+    """
+    return await migrate(
+        value.source_engine,
+        value.schema,
+        value.prefix,
+        lock_timeout=lock_timeout,
+    )

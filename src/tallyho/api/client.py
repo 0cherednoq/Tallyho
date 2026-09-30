@@ -1,0 +1,281 @@
+"""Публичный клиент ``Tallyho`` и проверяемая конфигурация установки."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, replace
+from datetime import timedelta
+from typing import TYPE_CHECKING, final
+
+from tallyho.engine.public import (
+    EngineSettings,
+    create_engine_facade,
+)
+from tallyho.hooks.registry import HookRegistry, import_hook_modules
+from tallyho.model.errors import ConfigurationError
+from tallyho.model.progress import ProgressSettings
+from tallyho.protocols.clock import SystemClock
+from tallyho.protocols.ids import UuidV7Factory
+from tallyho.protocols.observer import NullObserver
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Iterable
+
+    from sqlalchemy.ext.asyncio import AsyncEngine
+
+    from tallyho.engine.public import EngineFacade, MaintenanceRunner
+    from tallyho.hooks.registry import FinalizedT, PolicyBreachT, ProgressT
+    from tallyho.protocols.broker import Dispatcher
+    from tallyho.protocols.clock import Clock
+    from tallyho.protocols.ids import IdFactory
+    from tallyho.protocols.observer import Observer
+    from tallyho.protocols.serialization import Serializer
+
+__all__ = ["Settings", "Tallyho"]
+
+_ALREADY_INSTALLED = "broker adapter уже установлен"
+_NOT_INSTALLED = "сначала вызовите Tallyho.install(adapter)"
+
+
+def _positive(name: str, value: object) -> None:
+    if not isinstance(value, timedelta) or value <= timedelta(0):
+        message = f"{name} должен быть положительным timedelta"
+        raise ConfigurationError(message)
+
+
+def _non_negative(name: str, value: object) -> None:
+    if not isinstance(value, timedelta) or value < timedelta(0):
+        message = f"{name} должен быть неотрицательным timedelta"
+        raise ConfigurationError(message)
+
+
+def _optional_positive_int(name: str, value: object) -> None:
+    if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < 1):
+        message = f"{name} должен быть целым >= 1 или None"
+        raise ConfigurationError(message)
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class Settings:
+    """Настройки v1 со значениями по умолчанию из ARCHITECTURE §15."""
+
+    counter_slots: int = 8
+    completer_tick: timedelta = timedelta(milliseconds=20)
+    completer_max_batch: int = 500
+    completer_backpressure: int = 10_000
+    lease_ttl: timedelta = timedelta(seconds=60)
+    heartbeat_every: timedelta = timedelta(seconds=20)
+    relay_grace: timedelta = timedelta(seconds=5)
+    relay_claim_ttl: timedelta = timedelta(seconds=30)
+    finalize_grace: timedelta = timedelta(seconds=30)
+    hook_timeout: timedelta = timedelta(seconds=10)
+    hook_backoff_initial: timedelta = timedelta(seconds=1)
+    hook_backoff_max: timedelta = timedelta(minutes=5)
+    snapshot_tick: timedelta = timedelta(milliseconds=500)
+    estimate_min_basis: int = 20
+    estimate_min_share: float = 0.05
+    eta_window: timedelta = timedelta(seconds=60)
+    max_items: int | None = None
+    sweep_interval: timedelta = timedelta(seconds=5)
+    lock_timeout: timedelta = timedelta(seconds=5)
+    retention: timedelta | None = timedelta(days=14)
+    watch_throttle: timedelta = timedelta(milliseconds=500)
+
+    def __post_init__(self) -> None:
+        """Проверить все диапазоны.
+
+        Raises:
+            ConfigurationError: хотя бы одно значение недопустимо.
+        """
+        integers: dict[str, object] = {
+            "counter_slots": self.counter_slots,
+            "completer_max_batch": self.completer_max_batch,
+            "completer_backpressure": self.completer_backpressure,
+        }
+        for name, value in integers.items():
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                message = f"{name} должен быть целым >= 1"
+                raise ConfigurationError(message)
+        if self.completer_backpressure < self.completer_max_batch:
+            message = "completer_backpressure должен быть >= completer_max_batch"
+            raise ConfigurationError(message)
+        for name, value in self._positive_durations().items():
+            _positive(name, value)
+        _non_negative("relay_grace", self.relay_grace)
+        _non_negative("finalize_grace", self.finalize_grace)
+        if self.hook_backoff_initial > self.hook_backoff_max:
+            message = "hook_backoff_initial должен быть <= hook_backoff_max"
+            raise ConfigurationError(message)
+        _ = ProgressSettings(
+            estimate_min_basis=self.estimate_min_basis,
+            estimate_min_share=self.estimate_min_share,
+            eta_window=self.eta_window,
+        )
+        _optional_positive_int("max_items", self.max_items)
+        if self.retention is not None:
+            _positive("retention", self.retention)
+
+    def _positive_durations(self) -> dict[str, timedelta]:
+        return {
+            "completer_tick": self.completer_tick,
+            "lease_ttl": self.lease_ttl,
+            "heartbeat_every": self.heartbeat_every,
+            "relay_claim_ttl": self.relay_claim_ttl,
+            "hook_timeout": self.hook_timeout,
+            "hook_backoff_initial": self.hook_backoff_initial,
+            "hook_backoff_max": self.hook_backoff_max,
+            "snapshot_tick": self.snapshot_tick,
+            "sweep_interval": self.sweep_interval,
+            "lock_timeout": self.lock_timeout,
+            "watch_throttle": self.watch_throttle,
+        }
+
+    @classmethod
+    def overridden(cls, values: dict[str, object]) -> Settings:
+        """Создать настройки из keyword overrides конструктора ``Tallyho``.
+
+        Returns:
+            Проверенный объект настроек.
+
+        Raises:
+            ConfigurationError: имя или тип настройки неверны.
+        """
+        try:
+            return replace(cls(), **values)  # type: ignore[arg-type]  # ключи проверяет dataclasses.replace
+        except TypeError as exc:
+            raise ConfigurationError(str(exc)) from exc
+
+    def engine_settings(self) -> EngineSettings:
+        """Передать engine только нужную ему часть конфигурации.
+
+        Returns:
+            Неизменяемый DTO engine-слоя.
+        """
+        return EngineSettings(
+            counter_slots=self.counter_slots,
+            completer_tick=self.completer_tick,
+            completer_max_batch=self.completer_max_batch,
+            completer_backpressure=self.completer_backpressure,
+            lease_ttl=self.lease_ttl,
+            heartbeat_every=self.heartbeat_every,
+            relay_grace=self.relay_grace,
+            relay_claim_ttl=self.relay_claim_ttl,
+            finalize_grace=self.finalize_grace,
+            hook_timeout=self.hook_timeout,
+            hook_backoff_max=self.hook_backoff_max,
+            snapshot_tick=self.snapshot_tick,
+            estimate_min_basis=self.estimate_min_basis,
+            estimate_min_share=self.estimate_min_share,
+            eta_window=self.eta_window,
+            sweep_interval=self.sweep_interval,
+            lock_timeout=self.lock_timeout,
+            watch_throttle=self.watch_throttle,
+        )
+
+
+@final
+class Tallyho:
+    """Одна установка tallyho поверх пользовательского ``AsyncEngine``."""
+
+    def __init__(  # ruff: ignore[too-many-arguments]  # публичный конструктор задан PLAN T6.1
+        self,
+        engine: AsyncEngine,
+        *,
+        schema: str | None = None,
+        prefix: str = "th_",
+        hook_modules: Iterable[str] = (),
+        clock: Clock | None = None,
+        id_factory: IdFactory | None = None,
+        observer: Observer | None = None,
+        serializer: Serializer | None = None,
+        **settings: object,
+    ) -> None:
+        """Настроить клиент без обращения к БД."""
+        self.engine = engine
+        self.schema = schema
+        self.prefix = prefix
+        self.hook_modules = tuple(hook_modules)
+        self.settings = Settings.overridden(settings)
+        self.clock = clock or SystemClock()
+        self.id_factory = id_factory or UuidV7Factory()
+        self.observer = observer or NullObserver()
+        self.serializer = serializer
+        self.hooks = HookRegistry()
+        self._adapter: Dispatcher | None = None
+        self._engine: EngineFacade = create_engine_facade(
+            engine,
+            schema=schema,
+            prefix=prefix,
+            clock=self.clock,
+            ids=self.id_factory,
+            observer=self.observer,
+            serializer=serializer,
+            hooks=self.hooks,
+            settings=self.settings.engine_settings(),
+        )
+        import_hook_modules(self.hook_modules)
+
+    def install(self, adapter: Dispatcher) -> None:
+        """Связать producer/worker/maintenance с broker adapter.
+
+        Raises:
+            ConfigurationError: adapter уже установлен.
+        """
+        if self._adapter is not None:
+            raise ConfigurationError(_ALREADY_INSTALLED)
+        self._engine.install(adapter)
+        self._adapter = adapter
+
+    async def migrate(self) -> int:
+        """Установить или обновить таблицы.
+
+        Returns:
+            Версия схемы БД.
+        """
+        return await self._engine.migrate()
+
+    def maintenance(self) -> MaintenanceRunner:
+        """Вернуть lifespan-сервис leader maintenance.
+
+        Returns:
+            Собранный lifespan-сервис.
+
+        Raises:
+            ConfigurationError: broker adapter ещё не установлен.
+        """
+        value = self._engine.maintenance()
+        if value is None:
+            raise ConfigurationError(_NOT_INSTALLED)
+        return value
+
+    async def run_maintenance_once(self) -> object:
+        """Детерминированно выполнить один полный maintenance-проход.
+
+        Returns:
+            Сводка прохода engine.
+        """
+        _ = self.maintenance()
+        return await self._engine.run_maintenance_once()
+
+    def on_finalized(self, kind: str) -> Callable[[FinalizedT], FinalizedT]:
+        """Зарегистрировать хук финализации.
+
+        Returns:
+            Типосохраняющий декоратор.
+        """
+        return self.hooks.on_finalized(kind)
+
+    def on_progress(self, kind: str, *, every: timedelta) -> Callable[[ProgressT], ProgressT]:
+        """Зарегистрировать хук снимков прогресса.
+
+        Returns:
+            Типосохраняющий декоратор.
+        """
+        return self.hooks.on_progress(kind, every)
+
+    def on_policy_breach(self, kind: str) -> Callable[[PolicyBreachT], PolicyBreachT]:
+        """Зарегистрировать хук политики ошибок.
+
+        Returns:
+            Типосохраняющий декоратор.
+        """
+        return self.hooks.on_policy_breach(kind)
