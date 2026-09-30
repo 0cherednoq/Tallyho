@@ -6,8 +6,8 @@
 ## Текущее состояние
 
 * **Ветка:** `impl/v1`
-* **Текущая волна:** T4.9
-* **Последний зелёный коммит:** ba9ed0f
+* **Текущая волна:** T4.10
+* **Последний зелёный коммит:** 237bdee
 
 ## Задачи
 
@@ -35,8 +35,8 @@
 | T4.6 | Политики ошибок, on_policy_breach | T4.4 | done | ea67545 |
 | T4.7 | Операции над деревом | T4.6 | done | 5ae8fc1 |
 | T4.8 | Sweeper | T4.7 | done | ba9ed0f |
-| T4.9 | Snapshotter | T4.8 | in_progress | |
-| T4.10 | Maintenance, лидерство, watch | T4.9 | todo | |
+| T4.9 | Snapshotter | T4.8 | done | 237bdee |
+| T4.10 | Maintenance, лидерство, watch | T4.9 | in_progress | |
 | T4.11 | Чтение: view, in_flight, items, find | T4.4 | done | 8b45a88 |
 | T5.1 | Runtime: ItemContext, th.item, tracked | T4.5, T4.7 | todo | |
 | T6.1 | Tallyho, Settings, install, migrate | T5.1, T4.10, T4.11 | todo | |
@@ -72,6 +72,16 @@
 - Отклонения от плана/доков: … (или «нет»)
 - Узнали / на что обратить внимание дальше: …
 -->
+
+### 2026-09-30 · T4.10 · in_progress · —
+- Начата реализация Maintenance, лидерства и watch после зелёной T4.9.
+
+### 2026-09-30 · T4.9 · done · 237bdee
+- Сделано: `engine.snapshotter.Snapshotter.tick()` ведёт расписание `on_progress` в памяти, одним statement читает несколько деревьев, пропускает неизменный прогресс и коммитит tx-хук только вместе с CAS `snap_seq/state`.
+- EMA скорости ведётся для всех узлов прочитанных деревьев и передаётся общей математике прогресса для ETA; `summary.seq` растёт строго, отсутствующий/падающий хук не останавливает maintenance.
+- Проверка: два конкурентных Snapshotter коммитят ровно один seq; финализация между hook и CAS откатывает доменную запись снимка; до `every` раннего снимка нет; без изменений — 0 записей; после изменения ETA появляется. `poe check` зелёный; `poe test-all` — 881 passed, покрытие 96,39% (`snapshotter.py` 97%, `reads.py` 96%); pre-commit зелёный.
+- Отклонения от плана/доков: нет.
+- Дальше: T4.10 Maintenance, лидерство и watch.
 
 ### 2026-09-30 · T4.9 · in_progress · —
 - Начата реализация Snapshotter после зелёной T4.8.
