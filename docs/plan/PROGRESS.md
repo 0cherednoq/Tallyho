@@ -6,8 +6,8 @@
 ## Текущее состояние
 
 * **Ветка:** `impl/v1`
-* **Текущая волна:** T4.10
-* **Последний зелёный коммит:** 237bdee
+* **Текущая волна:** T5.1
+* **Последний зелёный коммит:** 2d9f6bd
 
 ## Задачи
 
@@ -36,7 +36,7 @@
 | T4.7 | Операции над деревом | T4.6 | done | 5ae8fc1 |
 | T4.8 | Sweeper | T4.7 | done | ba9ed0f |
 | T4.9 | Snapshotter | T4.8 | done | 237bdee |
-| T4.10 | Maintenance, лидерство, watch | T4.9 | in_progress | |
+| T4.10 | Maintenance, лидерство, watch | T4.9 | done | 2d9f6bd |
 | T4.11 | Чтение: view, in_flight, items, find | T4.4 | done | 8b45a88 |
 | T5.1 | Runtime: ItemContext, th.item, tracked | T4.5, T4.7 | todo | |
 | T6.1 | Tallyho, Settings, install, migrate | T5.1, T4.10, T4.11 | todo | |
@@ -72,6 +72,17 @@
 - Отклонения от плана/доков: … (или «нет»)
 - Узнали / на что обратить внимание дальше: …
 -->
+
+### 2026-09-30 · T5.1 · in_progress · —
+- Начата реализация runtime (`ItemContext`, `th.item.*`, `tracked`, `callback.current`) после завершения engine-фазы.
+
+### 2026-09-30 · T4.10 · done · 2d9f6bd
+- Сделано: `Maintenance` держит session-level advisory lock на выделенном соединении, явно снимает его при штатной остановке, инвалидирует потерянный backend и запускает relay scan / Sweeper / Snapshotter с разной частотой; `run_maintenance_once()` даёт детерминированный полный проход.
+- `ProgressNotifier` публикует транзакционные `NOTIFY th_progress` с per-batch throttle и обязательным финальным сигналом; Completer, операции и Finalizer подключены к нему после commit. `ProgressWatcher` регистрирует `LISTEN` до первого чтения, ограничивает частоту выдачи и страхует потерю уведомления периодическим перечитыванием до финального состояния. Поддержаны asyncpg и psycopg (psycopg-интеграция пропускается на Windows Proactor, покрыта driver-independent тестом).
+- Проверка: два экземпляра дают ровно одного лидера; после `pg_terminate_backend` второй становится лидером не позже `2 × sweep_interval`; штатный stop освобождает lock даже при pooled connection; watch не выдаёт чаще throttle и всегда заканчивает терминальным view. `poe check` зелёный; `poe test-all` — 903 passed, 1 platform skip, покрытие 96,14% (`maintenance.py` 95%); pre-commit зелёный.
+- Дополнительно устранён флейк теста backoff Sweeper: условие «ещё рано» больше не зависит от того, успел ли медленный commit занять больше одной секунды.
+- Отклонения от плана/доков: нет.
+- Дальше: T5.1 runtime.
 
 ### 2026-09-30 · T4.10 · in_progress · —
 - Начата реализация Maintenance, лидерства и watch после зелёной T4.9.
