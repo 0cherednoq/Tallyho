@@ -74,9 +74,23 @@ from tallyho.model.errors import (
 )
 from tallyho.model.states import BatchState, ItemState, OutboxKind, ResultClass
 from tallyho.protocols.observer import NullObserver
-from tallyho.storage.counters import CounterDelta, read_counters, upsert_metrics, upsert_slots
+from tallyho.storage.counters import (
+    CounterDelta,
+    fold_delta_ids,
+    fold_deltas,
+    insert_delta,
+    read_counters,
+    upsert_metrics,
+    upsert_slots,
+)
 from tallyho.storage.now import sql_now
-from tallyho.storage.tx import RetryPolicy, TxSettings, run_transaction
+from tallyho.storage.tx import (
+    RetryPolicy,
+    TxSettings,
+    after_commit,
+    resolve_connection,
+    run_transaction,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Mapping, Sequence
@@ -84,7 +98,7 @@ if TYPE_CHECKING:
     from uuid import UUID
 
     from sqlalchemy import ColumnElement
-    from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
+    from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, AsyncSession
 
     from tallyho.engine.producer import Producer, SubBatchSpec
     from tallyho.engine.spawn import SpawnRoute, TreeCache
@@ -785,51 +799,86 @@ class _Tx:
 
     # --- finish -------------------------------------------------------------------
 
-    async def finish(self, values: dict[UUID, tuple[ItemRef, FinishResult]]) -> None:
+    async def finish(
+        self,
+        values: dict[UUID, tuple[ItemRef, FinishResult]],
+        *,
+        scalar: bool = False,
+    ) -> None:
         """CAS ``active -> terminal`` и учёт только действительно изменённых Items."""
         if not values:
             return
         item = self.tables.item
         ids = sorted(values)
-        rows = (
-            func.unnest(
-                _uuids(ids),
-                literal([values[item_id][0].batch_id for item_id in ids], ARRAY(Uuid())),
-                literal(
-                    [int(values[item_id][1].result_class) for item_id in ids],
-                    ARRAY(SmallInteger()),
-                ),
-                literal([values[item_id][1].effective_label for item_id in ids], ARRAY(Text())),
-                literal([values[item_id][1].result for item_id in ids], ARRAY(JSONB())),
-                literal([values[item_id][1].error for item_id in ids], ARRAY(JSONB())),
+        if scalar:
+            item_id = ids[0]
+            ref, value = values[item_id]
+            statement = (
+                update(item)
+                .where(
+                    item.c.id == item_id,
+                    item.c.batch_id == ref.batch_id,
+                    item.c.state == _ACTIVE,
+                )
+                .values(
+                    state=int(value.result_class),
+                    label=value.effective_label,
+                    result=value.result,
+                    error=value.error,
+                    finished_at=self.now,
+                )
             )
-            .table_valued("id", "batch_id", "state", "label", "result", "error")
-            .render_derived("u")
-        )
-        state: ColumnElement[int] = rows.c.state
-        label: ColumnElement[str] = rows.c.label
-        stored_result: ColumnElement[object] = rows.c.result
-        stored_error: ColumnElement[object] = rows.c.error
+        else:
+            rows = (
+                func.unnest(
+                    _uuids(ids),
+                    literal([values[item_id][0].batch_id for item_id in ids], ARRAY(Uuid())),
+                    literal(
+                        [int(values[item_id][1].result_class) for item_id in ids],
+                        ARRAY(SmallInteger()),
+                    ),
+                    literal([values[item_id][1].effective_label for item_id in ids], ARRAY(Text())),
+                    literal([values[item_id][1].result for item_id in ids], ARRAY(JSONB())),
+                    literal([values[item_id][1].error for item_id in ids], ARRAY(JSONB())),
+                )
+                .table_valued("id", "batch_id", "state", "label", "result", "error")
+                .render_derived("u")
+            )
+            statement = (
+                update(item)
+                .where(
+                    item.c.id == rows.c.id,
+                    item.c.batch_id == rows.c.batch_id,
+                    item.c.state == _ACTIVE,
+                )
+                .values(
+                    state=rows.c.state,
+                    label=rows.c.label,
+                    result=rows.c.result,
+                    error=rows.c.error,
+                    finished_at=self.now,
+                )
+            )
         changed = await self.conn.execute(
-            update(item)
-            .where(
-                item.c.id == rows.c.id,
-                item.c.batch_id == rows.c.batch_id,
-                item.c.state == _ACTIVE,
+            statement.returning(
+                item.c.id,
+                item.c.batch_id,
+                item.c.weight,
+                item.c.attempt,
+                item.c.depth,
             )
-            .values(
-                state=state,
-                label=label,
-                result=stored_result,
-                error=stored_error,
-                finished_at=self.now,
-            )
-            .returning(item.c.id, item.c.batch_id, item.c.weight, item.c.attempt)
         )
         successful: list[UUID] = []
         plain_values = {item_id: value for item_id, (_, value) in values.items()}
-        for finished_id, batch_id, weight, attempt in changed:
+        for finished_id, batch_id, weight, attempt, depth in changed:
             value = plain_values[finished_id]
+            self.items[finished_id] = _ItemRow(
+                batch_id=batch_id,
+                state=ItemState(value.result_class),
+                attempt=attempt,
+                depth=depth,
+                weight=weight,
+            )
             successful.append(finished_id)
             counter = value.result_class.name.lower()
             self.deltas[batch_id] += CounterDelta(**{counter: 1, "w_done": weight})
@@ -1134,6 +1183,7 @@ class Completer:
         self._capacity = asyncio.Semaphore(settings.backpressure)
         self._closing = False
         self._held: dict[UUID, ItemRef] = {}
+        self._background: set[asyncio.Task[None]] = set()
 
     # --- публичные операции ------------------------------------------------------------
 
@@ -1218,6 +1268,93 @@ class Completer:
         future = self._new_future(bool)
         return await self._submit(_Finish(item, value, future), future)
 
+    async def complete_in(
+        self,
+        target: AsyncSession | AsyncConnection,
+        item: ItemRef,
+        value: FinishResult,
+    ) -> bool:
+        """Завершить Item внутри внешней транзакции пользователя (путь B).
+
+        Внешняя транзакция меняет Item и добавляет append-only дельты, но не
+        касается горячих строк ``th_counter``. После её commit Completer
+        сворачивает дельты в своей короткой транзакции и проверяет
+        финализацию. Откат транзакции или savepoint отменяет и записи, и
+        зарегистрированное действие после commit.
+
+        Args:
+            target: Открытая пользовательская сессия или соединение.
+            item: Завершаемый Item.
+            value: Итог и накопленные динамические операции.
+
+        Returns:
+            ``True``, если CAS завершил Item; ``False``, если он уже был
+            терминальным. Это флаг для middleware, чтобы не писать finish
+            повторно после возврата задачи.
+
+        Raises:
+            ConfigurationError: Нужен spawn, но Completer создан без Producer.
+        """
+        if (value.spawns or value.sub_batches) and self.triggers.producer is None:
+            raise ConfigurationError(_SPAWN_SERVICES)
+        conn = await resolve_connection(target)
+        tx = _Tx(self, conn)
+        batch_ids: list[UUID] = []
+        writes_structure = bool(value.sub_batches)
+        for spawn_request in value.spawns:
+            batch_ids.extend(
+                [
+                    spawn_request.route.source_id,
+                    spawn_request.route.target_id,
+                    spawn_request.route.root_id,
+                ]
+            )
+        for expect_request in value.expects:
+            batch_ids.extend(
+                [
+                    expect_request.route.source_id,
+                    expect_request.route.target_id,
+                    expect_request.route.root_id,
+                ]
+            )
+        for sub_batch in value.sub_batches:
+            batch_ids.extend(sub_batch.spec.fed_by)
+        if batch_ids:
+            await tx.lock_batches(batch_ids, write=writes_structure)
+        values = {item.id: (item, value)}
+        await tx.finish(values, scalar=True)
+        await tx.expand(values)
+        inserted = await insert_delta(conn, self.tables, tx.deltas)
+        await upsert_metrics(conn, self.tables, tx.metrics)
+        changed = item.id in tx.applied.finished
+        if changed:
+            delta_ids = {delta_id for ids in inserted.values() for delta_id in ids}
+            await after_commit(
+                target,
+                lambda: self._schedule_external(tx.applied, delta_ids),
+            )
+        return changed
+
+    async def fold(self, batch_id: UUID) -> bool:
+        """Свернуть закоммиченные дельты батча и проверить финализацию.
+
+        Args:
+            batch_id: Батч, чьи append-only дельты надо перенести в слот
+                процесса Completer.
+
+        Returns:
+            ``True``, если была перенесена хотя бы одна ненулевая дельта.
+        """
+        folded = await run_transaction(
+            self.engine,
+            lambda conn: self._fold_in(conn, [batch_id]),
+            settings=self.settings.tx,
+            policy=self.settings.retry,
+        )
+        if self.triggers.finalizer is not None:
+            await self.triggers.finalizer.try_finalize(batch_id)
+        return batch_id in folded
+
     async def close(self, *, requeue_held: bool = False) -> None:
         """Мягкая остановка: дослать буфер и остановить задачу сброса.
 
@@ -1239,6 +1376,8 @@ class Completer:
         self._full.set()
         if self._task is not None:
             await self._task
+        if self._background:
+            await asyncio.gather(*tuple(self._background))
         if not (requeue_held and self._held):
             return
         refs = list(self._held.values())
@@ -1257,6 +1396,50 @@ class Completer:
         tx = _Tx(self, conn)
         await tx.requeue(refs)
         await tx.write_counters()
+
+    async def _fold_in(
+        self, conn: AsyncConnection, batch_ids: Iterable[UUID]
+    ) -> dict[UUID, CounterDelta]:
+        folded = await fold_deltas(conn, self.tables, batch_ids)
+        await upsert_slots(
+            conn,
+            self.tables,
+            {(batch_id, self.settings.slot): delta for batch_id, delta in folded.items()},
+        )
+        return folded
+
+    def _schedule_external(self, applied: _Applied, delta_ids: set[int]) -> None:
+        loop = self._bind()
+        task = loop.create_task(
+            self._after_external_commit(applied, delta_ids),
+            name="tallyho-complete-in",
+        )
+        self._background.add(task)
+        task.add_done_callback(self._background.discard)
+
+    async def _after_external_commit(self, applied: _Applied, delta_ids: set[int]) -> None:
+        try:
+            _ = await run_transaction(
+                self.engine,
+                lambda conn: self._fold_ids_in(conn, delta_ids),
+                settings=self.settings.tx,
+                policy=self.settings.retry,
+            )
+            self._notify(len(applied.finished), 0.0, applied)
+            await self._after_commit(applied)
+        except Exception:  # ruff: ignore[blind-except]  # commit уже состоялся; sweeper повторит fold/finalize
+            _log.exception("обработка complete_in после commit упала")
+
+    async def _fold_ids_in(
+        self, conn: AsyncConnection, delta_ids: Iterable[int]
+    ) -> dict[UUID, CounterDelta]:
+        folded = await fold_delta_ids(conn, self.tables, delta_ids)
+        await upsert_slots(
+            conn,
+            self.tables,
+            {(batch_id, self.settings.slot): delta for batch_id, delta in folded.items()},
+        )
+        return folded
 
     # --- буфер -------------------------------------------------------------------------
 

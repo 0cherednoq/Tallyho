@@ -18,6 +18,7 @@
 
 from __future__ import annotations
 
+from collections import defaultdict
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Final, TypeVar
 
@@ -55,6 +56,7 @@ __all__ = [
     "CounterTotals",
     "MetricKey",
     "SlotKey",
+    "fold_delta_ids",
     "fold_deltas",
     "insert_delta",
     "read_counters",
@@ -342,7 +344,7 @@ async def _upsert_rows(
 
 async def insert_delta(
     conn: AsyncConnection, tables: Tables, deltas: Mapping[UUID, CounterDelta]
-) -> None:
+) -> dict[UUID, list[int]]:
     """Записать дельты в ``th_counter_delta`` (путь B, транзакция пользователя).
 
     Только ``INSERT``: горячие строки ``th_counter`` не блокируются, поэтому
@@ -353,6 +355,9 @@ async def insert_delta(
         conn: Соединение транзакции пользователя.
         tables: Таблицы установки.
         deltas: Приращения по батчам.
+
+    Returns:
+        Идентификаторы вставленных строк по батчам.
     """
     rows: list[dict[str, object]] = []
     for batch_id in sorted(deltas):
@@ -363,8 +368,16 @@ async def insert_delta(
         row: dict[str, object] = {f"d_{n}": values[n] for n in DELTA_FIELDS}
         row["batch_id"] = batch_id
         rows.append(row)
+    inserted: defaultdict[UUID, list[int]] = defaultdict(list)
     for chunk in _chunks(rows):
-        _ = await conn.execute(insert(tables.counter_delta).values(chunk))
+        result = await conn.execute(
+            insert(tables.counter_delta)
+            .values(chunk)
+            .returning(tables.counter_delta.c.id, tables.counter_delta.c.batch_id)
+        )
+        for delta_id, batch_id in result:
+            inserted[batch_id].append(delta_id)
+    return dict(inserted)
 
 
 async def upsert_metrics(
@@ -422,15 +435,39 @@ async def fold_deltas(
     ids = sorted(set(batch_ids))
     if not ids:
         return {}
+    return await _fold_where(
+        conn,
+        tables,
+        tables.counter_delta.c.batch_id == any_(literal(ids, ARRAY(Uuid()))),
+    )
+
+
+async def fold_delta_ids(
+    conn: AsyncConnection, tables: Tables, delta_ids: Iterable[int]
+) -> dict[UUID, CounterDelta]:
+    """Свернуть точно известные дельты после ``complete_in``.
+
+    Условие по первичному ключу не ставит predicate-lock на диапазон
+    ``batch_id`` и поэтому не конфликтует с последующими append-only INSERT
+    транзакций ``SERIALIZABLE`` того же батча. Sweeper использует более общий
+    :func:`fold_deltas` как страховку.
+
+    Returns:
+        Суммы удалённых дельт по батчам.
+    """
+    ids = sorted(set(delta_ids))
+    if not ids:
+        return {}
+    return await _fold_where(conn, tables, tables.counter_delta.c.id.in_(ids))
+
+
+async def _fold_where(
+    conn: AsyncConnection, tables: Tables, where: ColumnElement[bool]
+) -> dict[UUID, CounterDelta]:
     delta = tables.counter_delta
     returned: list[ColumnElement[UUID] | ColumnElement[int]] = [delta.c.batch_id]
     returned.extend(delta.c[f"d_{name}"] for name in DELTA_FIELDS)
-    gone = (
-        delete(delta)
-        .where(delta.c.batch_id == any_(literal(ids, ARRAY(Uuid()))))
-        .returning(*returned)
-        .cte("gone")
-    )
+    gone = delete(delta).where(where).returning(*returned).cte("gone")
     sums = [_sum(gone.c[f"d_{name}"]).label(name) for name in DELTA_FIELDS]
     columns: list[ColumnElement[UUID] | ColumnElement[int]] = [gone.c.batch_id, *sums]
     stmt = select(*columns).group_by(gone.c.batch_id)

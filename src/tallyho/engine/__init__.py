@@ -2,4 +2,6 @@
 
 from __future__ import annotations
 
-__all__: list[str] = []
+from tallyho.engine.completion import complete_in
+
+__all__ = ["complete_in"]
