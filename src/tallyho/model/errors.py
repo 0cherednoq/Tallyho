@@ -16,6 +16,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "BatchPurged",
+    "CompleterError",
     "ConcurrentModification",
     "ConfigurationError",
     "DownstreamFinalized",
@@ -48,6 +49,14 @@ class InvalidStateError(TallyhoError):
 
 class ConcurrentModification(TallyhoError):  # ruff: ignore[error-suffix-on-exception-name]  # имя из публичного API
     """Строку батча одновременно изменила другая транзакция, повтор не помог."""
+
+
+class CompleterError(TallyhoError):
+    """Групповая транзакция Completer не прошла (БД недоступна, ошибка запроса).
+
+    Операции этой транзакции не выполнены: задача не подтверждается брокеру,
+    и он повторит её по своим правилам. Исходная ошибка — в ``__cause__``.
+    """
 
 
 class HookTransactionError(TallyhoError):

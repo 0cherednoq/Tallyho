@@ -5,6 +5,7 @@ from __future__ import annotations
 from tallyho.model.calls import TaskCall
 from tallyho.model.errors import (
     BatchPurged,
+    CompleterError,
     ConcurrentModification,
     ConfigurationError,
     DownstreamFinalized,
@@ -55,6 +56,7 @@ __all__ = [
     "BatchSummary",
     "BatchView",
     "CancelReason",
+    "CompleterError",
     "ConcurrentModification",
     "ConfigurationError",
     "DownstreamFinalized",
