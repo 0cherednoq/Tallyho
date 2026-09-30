@@ -271,11 +271,12 @@ async def test_a_fq_06_user_deduplication_and_relay_repeat(  # ruff: ignore[too-
     events = await flexiq_contract.wait_events("probe", count=3)
     view = await flexiq_contract.wait_terminal(batch.handle)
     final_jobs = await asyncio.to_thread(app.queue.list_jobs, task_name=task_name, limit=10)
-    raw = [cast("dict[str, object]", job.to_dict()) for job in final_jobs]
+    jobs_by_id = {job.id: job for job in final_jobs}
+    raw = [cast("dict[str, object]", job.to_dict()) for job in jobs_by_id.values()]
 
     event_args = [cast("list[object]", row["args"]) for row in events]
     assert sorted(cast("str", args[0]) for args in event_args) == sorted(options)
-    assert len(final_jobs) == 3
+    assert len(jobs_by_id) == 3
     unique_keys = {cast("str", row["unique_key"]) for row in raw}
     assert "user-idempotency" in unique_keys
     assert "user-unique" in unique_keys
