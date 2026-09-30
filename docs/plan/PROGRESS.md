@@ -6,8 +6,8 @@
 ## Текущее состояние
 
 * **Ветка:** `impl/v1`
-* **Текущая волна:** T8.1
-* **Последний зелёный коммит:** fa2b5df
+* **Текущая волна:** T8.2
+* **Последний зелёный коммит:** b41073a
 
 ## Задачи
 
@@ -44,8 +44,8 @@
 | T6.3 | th.call с ParamSpec, типовые тесты | T6.1 | done | eb6633a |
 | T7.1 | tallyho.testing: InlineBroker, FakeClock | T6.2 | done | fa2b5df |
 | T8.0 | Спайк flexiq | T0.1 | done | 4d318d0..f4155a6 (3), merge 9395ea6, b41b30d, 2a781c2 |
-| T8.1 | FlexiqAdapter | T8.0, T7.1 | in_progress | |
-| T8.2 | Контрактные тесты A-FQ | T8.1 | todo | |
+| T8.1 | FlexiqAdapter | T8.0, T7.1 | done | b41073a |
+| T8.2 | Контрактные тесты A-FQ | T8.1 | in_progress | |
 | T9.1 | Пример «рассылки» (§12) как тесты | T7.1 | todo | |
 | T9.2 | Пример «конвейер парсинга» (§13) как тесты | T7.1 | todo | |
 | T9.3 | Исполняемые примеры из документации | T9.1, T9.2 | todo | |
@@ -72,6 +72,17 @@
 - Отклонения от плана/доков: … (или «нет»)
 - Узнали / на что обратить внимание дальше: …
 -->
+### 2026-09-30 · T8.2 · in_progress · —
+- Начат перенос A-FQ-01…17 из приёмки в исполняемые контрактные тесты с настоящим flexiq worker.
+
+### 2026-09-30 · T8.1 · done · b41073a
+- Сделано: `FlexiqAdapter` регистрирует только async tracked-задачи, сохраняет task options flexiq, отправляет outbox через сгруппированные `enqueue_many` чанками по 1 000 в собственном executor и при атомарном конфликте idempotency безопасно откатывается к одиночным enqueue.
+- Все call options отображаются без изменения `metadata`/`notes`; служебный `_th` несёт Item/batch и эффективный лимит ретраев; пользовательские idempotency/unique keys сохраняются, иначе используется `th:{item_id}`. Запрещённые `depends_on`, `debounce*` и `batch` дают `UnsupportedOption` с подсказкой.
+- Worker runtime передаётся адаптеру через protocol-owned `WorkerServices`, поэтому архитектурный контракт слоёв сохранён. `retry_verdict` учитывает номер попытки и фильтры, `JOB_DEAD` возвращается в worker loop через `call_soon_threadsafe`, DLQ сверяется постранично по исходному payload.
+- Проверка: 53 точечных unit-теста; smoke с настоящей SQLite `flexiq.Queue`; `poe check` — 802 passed; `poe test-all` — 1099 passed, 1 Windows skip, покрытие 96,28% (`adapter.py` 99%); pre-commit all-files зелёный.
+- Отклонения от плана/доков: нет. ARCHITECTURE уточнён фактически необходимым полем `r=effective_max_retries` в служебном маркере: flexiq `current_job` не раскрывает effective max retries.
+- Дальше: T8.2, все A-FQ-01…17 на живом PostgreSQL worker в отдельном процессе.
+
 ### 2026-09-30 · T8.1 · in_progress · —
 - Начата реализация production-адаптера flexiq по подтверждённым контрактам спайка.
 
