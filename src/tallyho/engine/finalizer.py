@@ -72,6 +72,12 @@ class _Relay(Protocol):
         ...
 
 
+class _Progress(Protocol):
+    async def notify(self, batch_ids: Iterable[UUID], *, final: bool = False) -> int:
+        """Опубликовать изменившиеся батчи для ``watch()``."""
+        ...
+
+
 class _RollbackError(TallyhoError):
     """Внутренний сигнал: транзакцию нужно откатить без ошибки наружу."""
 
@@ -164,6 +170,7 @@ class Finalizer:
     settings: FinalizerSettings = field(default_factory=FinalizerSettings)
     observer: Observer = field(default_factory=NullObserver)
     relay: _Relay | None = None
+    progress: _Progress | None = None
 
     async def try_finalize(self, batch_id: UUID) -> bool:
         """Финализировать готовый батч, если условие всё ещё истинно.
@@ -192,7 +199,7 @@ class Finalizer:
                 attempt = await self._record_hook_failure(exc)
                 self._notify_failed(exc, attempt)
                 return False
-            self._after_commit(committed)
+            await self._after_commit(committed)
             for candidate in committed.cascade:
                 _ = await self.try_finalize(candidate)
             return True
@@ -599,7 +606,7 @@ class Finalizer:
             attempt = result.scalar_one_or_none()
         return int(attempt or 0)
 
-    def _after_commit(self, committed: _Committed) -> None:
+    async def _after_commit(self, committed: _Committed) -> None:
         try:
             self.observer.batch_finalized(
                 batch_id=committed.batch_id,
@@ -613,6 +620,11 @@ class Finalizer:
                 self.relay.kick([committed.batch_id])
             except Exception:  # ruff: ignore[blind-except]  # relay scan страхует fast-path
                 _log.exception("Relay.kick после финализации упал")
+        if self.progress is not None:
+            try:
+                _ = await self.progress.notify([committed.batch_id], final=True)
+            except Exception:  # ruff: ignore[blind-except]  # watch перечитает финал по таймауту
+                _log.exception("Публикация финального прогресса упала")
 
     def _notify_missing(self, batch_id: UUID, exc: HookMissingError) -> None:
         _log.error("Батч %s не финализирован: %s", batch_id, exc)

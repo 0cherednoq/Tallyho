@@ -36,6 +36,7 @@ __all__ = [
     "CommitCounter",
     "Finalized",
     "MovableClock",
+    "RecordingProgress",
     "RecordingRelay",
     "Seeded",
     "lease_row",
@@ -82,6 +83,18 @@ class RecordingRelay:
 
     def kick(self, batch_ids: Iterable[UUID]) -> None:
         self.calls.append(list(batch_ids))
+
+
+@dataclass
+class RecordingProgress:
+    """Получатель подсказок ``watch`` после commit."""
+
+    calls: list[tuple[list[UUID], bool]] = field(default_factory=list[tuple[list["UUID"], bool]])
+
+    async def notify(self, batch_ids: Iterable[UUID], *, final: bool = False) -> int:
+        ids = list(batch_ids)
+        self.calls.append((ids, final))
+        return len(ids)
 
 
 @dataclass(eq=False)
@@ -141,12 +154,13 @@ async def lease_row(env: Env, item_id: UUID) -> RowMapping | None:
 
 
 @contextlib.asynccontextmanager
-async def open_completer(
+async def open_completer(  # ruff: ignore[too-many-arguments]  # integration helper exposes independent optional triggers
     env: Env,
     *,
     clock: Clock | None = None,
     finalizer: Finalized | None = None,
     relay: RecordingRelay | None = None,
+    progress: RecordingProgress | None = None,
     counter: CommitCounter | None = None,
     settings: CompleterSettings = SETTINGS,
 ) -> AsyncGenerator[Completer]:
@@ -163,6 +177,7 @@ async def open_completer(
             finalizer=finalizer,
             relay=relay,
             producer=env.producer,
+            progress=progress,
         ),
     )
     try:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Protocol, cast
@@ -38,6 +39,8 @@ if TYPE_CHECKING:
 
 __all__ = ["OperationTriggers", "Operations"]
 
+_log = logging.getLogger(__name__)
+
 _ACTIVE = literal_column(str(int(ItemState.ACTIVE)), SmallInteger())
 _ERROR = literal_column(str(int(ItemState.ERROR)), SmallInteger())
 _ITEM = literal_column(str(int(OutboxKind.ITEM)), SmallInteger())
@@ -54,6 +57,10 @@ class _Relay(Protocol):
 
 class _Finalizer(Protocol):
     async def try_finalize(self, batch_id: UUID) -> bool: ...
+
+
+class _Progress(Protocol):
+    async def notify(self, batch_ids: Iterable[UUID], *, final: bool = False) -> int: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -96,6 +103,7 @@ class OperationTriggers:
 
     relay: _Relay | None = None
     finalizer: _Finalizer | None = None
+    progress: _Progress | None = None
 
 
 @dataclass(eq=False, kw_only=True)
@@ -624,19 +632,35 @@ class Operations:
     ) -> None:
         relay_ids = tuple(sorted(set(relay)))
         finalize_ids = tuple(sorted(set(finalize)))
+        progress_ids = tuple(sorted({*relay_ids, *finalize_ids}))
 
         def callback() -> None:
             if self.triggers.relay is not None and relay_ids:
                 self.triggers.relay.kick(relay_ids)
-            if self.triggers.finalizer is not None and finalize_ids:
+            if (self.triggers.progress is not None and progress_ids) or (
+                self.triggers.finalizer is not None and finalize_ids
+            ):
                 task = asyncio.get_running_loop().create_task(
-                    self._finalize(self.triggers.finalizer, finalize_ids),
-                    name="tallyho-operation-finalize",
+                    self._post_commit(progress_ids, finalize_ids),
+                    name="tallyho-operation-post-commit",
                 )
                 self._background.add(task)
                 task.add_done_callback(self._background.discard)
 
         await after_commit(target, callback)
+
+    async def _post_commit(
+        self,
+        progress_ids: Sequence[UUID],
+        finalize_ids: Sequence[UUID],
+    ) -> None:
+        if self.triggers.progress is not None and progress_ids:
+            try:
+                _ = await self.triggers.progress.notify(progress_ids)
+            except Exception:  # ruff: ignore[blind-except]  # watch перечитает состояние по таймауту
+                _log.exception("Публикация прогресса операции упала")
+        if self.triggers.finalizer is not None and finalize_ids:
+            await self._finalize(self.triggers.finalizer, finalize_ids)
 
     @staticmethod
     async def _finalize(finalizer: _Finalizer, ids: Sequence[UUID]) -> None:

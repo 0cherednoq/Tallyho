@@ -120,6 +120,7 @@ __all__ = [
     "FinishResult",
     "ItemRef",
     "PolicyTrigger",
+    "ProgressTrigger",
     "RelayTrigger",
     "SpawnRequest",
     "SubBatchRequest",
@@ -267,6 +268,14 @@ class RelayTrigger(Protocol):
         ...
 
 
+class ProgressTrigger(Protocol):
+    """Минимальный интерфейс публикации изменений для ``watch()``."""
+
+    async def notify(self, batch_ids: Iterable[UUID], *, final: bool = False) -> int:
+        """Опубликовать изменившиеся батчи с троттлингом."""
+        ...
+
+
 @dataclass(frozen=True, slots=True, kw_only=True)
 class CompleterTriggers:
     """Получатели действий Completer после успешного commit."""
@@ -276,6 +285,7 @@ class CompleterTriggers:
     relay: RelayTrigger | None = None
     producer: Producer | None = None
     tree_cache: TreeCache | None = None
+    progress: ProgressTrigger | None = None
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -432,6 +442,7 @@ class _Applied:
     finalize: set[UUID] = field(default_factory=set["UUID"])
     kick: set[UUID] = field(default_factory=set["UUID"])
     invalidate_trees: set[UUID] = field(default_factory=set["UUID"])
+    progress: set[UUID] = field(default_factory=set["UUID"])
     finished: dict[UUID, tuple[UUID, FinishResult, int]] = field(
         default_factory=dict["UUID", tuple["UUID", FinishResult, int]]
     )
@@ -1326,6 +1337,7 @@ class Completer:
         await tx.expand(values)
         inserted = await insert_delta(conn, self.tables, tx.deltas, created_at=tx.now)
         await upsert_metrics(conn, self.tables, tx.metrics)
+        tx.applied.progress.update(tx.deltas)
         changed = item.id in tx.applied.finished
         if changed:
             delta_ids = {delta_id for ids in inserted.values() for delta_id in ids}
@@ -1566,6 +1578,7 @@ class Completer:
         await tx.finish(finishes)
         await tx.expand(finishes)
         await tx.write_counters()
+        tx.applied.progress.update(tx.deltas)
         return tx.applied
 
     def _resolve(self, ops: Sequence[_Op], applied: _Applied) -> None:
@@ -1631,6 +1644,7 @@ class Completer:
                 self.triggers.tree_cache.invalidate(root_id)
         if self.triggers.relay is not None and applied.kick:
             self.triggers.relay.kick(sorted(applied.kick))
+        await self._publish_progress(applied.progress)
         candidates = set(applied.finalize)
         if self.triggers.policy is not None and candidates:
             try:
@@ -1644,3 +1658,14 @@ class Completer:
                 _ = await self.triggers.finalizer.try_finalize(batch_id)
             except Exception:  # ruff: ignore[blind-except]  # финализацию подхватит sweeper
                 _log.exception("try_finalize(%s) после flush упал", batch_id)
+
+    async def _publish_progress(self, batch_ids: Iterable[UUID]) -> None:
+        if self.triggers.progress is None:
+            return
+        ids = tuple(batch_ids)
+        if not ids:
+            return
+        try:
+            _ = await self.triggers.progress.notify(ids)
+        except Exception:  # ruff: ignore[blind-except]  # polling watch страхует потерянную подсказку
+            _log.exception("Публикация прогресса после flush упала")

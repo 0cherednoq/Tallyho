@@ -194,7 +194,11 @@ async def test_finalize_stuck_and_deadline(env: Env) -> None:
         _ = await conn.execute(
             update(env.tables.batch)
             .where(env.tables.batch.c.id == backing_off.id)
-            .values(hook_attempts=1, hook_error="boom", updated_at=func.now())
+            .values(
+                hook_attempts=1,
+                hook_error="boom",
+                updated_at=func.now() + timedelta(minutes=1),
+            )
         )
         pending = await env.producer.create_root(conn, RootSpec(kind="pending"))
         _ = await env.producer.add_items(

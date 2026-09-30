@@ -19,7 +19,7 @@ from tallyho.model.states import BatchState, ItemState
 from tallyho.protocols.clock import SystemClock
 from tallyho.storage.counters import CounterDelta, upsert_metrics, upsert_slots
 from tests.helpers.probe import create_probe, insert_id
-from tests.integration.engine.completer_env import WORKER, schema_engine
+from tests.integration.engine.completer_env import WORKER, RecordingProgress, schema_engine
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
@@ -371,10 +371,11 @@ async def test_retry_finalize_release_triggers_and_invalid_states(env: Env) -> N
     root_id, child_id = await tree(env)
     relay = _RelaySpy()
     finalizer = _FinalizerSpy()
+    progress = RecordingProgress()
     subject = Operations(
         tables=env.tables,
         clock=SystemClock(),
-        triggers=OperationTriggers(relay=relay, finalizer=finalizer),
+        triggers=OperationTriggers(relay=relay, finalizer=finalizer, progress=progress),
     )
     async with env.transaction() as conn:
         _ = await conn.execute(
@@ -387,6 +388,10 @@ async def test_retry_finalize_release_triggers_and_invalid_states(env: Env) -> N
     await subject.close()
     assert set(relay.kicked) == {root_id, child_id}
     assert set(finalizer.tried) == {root_id, child_id}
+    assert {batch_id for ids, _final in progress.calls for batch_id in ids} == {
+        root_id,
+        child_id,
+    }
     assert (await env.batch(root_id))["hook_attempts"] == 0
     async with env.transaction() as conn:
         with pytest.raises(InvalidStateError):

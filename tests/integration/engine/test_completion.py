@@ -20,6 +20,7 @@ from tests.helpers.probe import committed_ids, create_probe, insert_id
 from tests.integration.engine.completer_env import (
     COMPLETER_SLOT,
     Finalized,
+    RecordingProgress,
     open_completer,
     schema_engine,
     seed,
@@ -47,8 +48,9 @@ async def test_complete_in_commits_domain_item_delta_and_then_folds(env: Env) ->
     ref = seeded.refs[0]
     probe = await create_probe(env.engine, env.schema)
     finalizer = Finalized()
+    progress = RecordingProgress()
     async with (
-        open_completer(env, finalizer=finalizer) as completer,
+        open_completer(env, finalizer=finalizer, progress=progress) as completer,
         AsyncSession(schema_engine(env)) as session,
     ):
         await insert_id(await resolve_connection(session), probe, 1)
@@ -83,6 +85,7 @@ async def test_complete_in_commits_domain_item_delta_and_then_folds(env: Env) ->
     assert delta_count == 0
     assert metrics == [("bytes", COMPLETER_SLOT, 42), ("ok", COMPLETER_SLOT, 1)]
     assert finalizer.calls == [seeded.batch_id]
+    assert progress.calls == [([seeded.batch_id], False)]
 
 
 async def test_complete_in_outer_rollback_removes_domain_and_completion(env: Env) -> None:

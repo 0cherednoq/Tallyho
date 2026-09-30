@@ -22,7 +22,12 @@ from tallyho.protocols.clock import SystemClock
 from tallyho.protocols.observer import NullObserver
 from tallyho.storage.counters import CounterDelta, upsert_slots
 from tests.helpers.probe import committed_ids, create_probe, insert_id
-from tests.integration.engine.completer_env import NOW, schema_engine, set_batch
+from tests.integration.engine.completer_env import (
+    NOW,
+    RecordingProgress,
+    schema_engine,
+    set_batch,
+)
 
 if TYPE_CHECKING:
     from uuid import UUID
@@ -46,7 +51,12 @@ class RecordingObserver(NullObserver):
         self.missing.append((batch_id, kind, hook))
 
 
-def finalizer(env: Env, registry: HookRegistry) -> Finalizer:
+def finalizer(
+    env: Env,
+    registry: HookRegistry,
+    *,
+    progress: RecordingProgress | None = None,
+) -> Finalizer:
     """Finalizer над схемой конкретного интеграционного теста."""
     return Finalizer(
         tables=env.tables,
@@ -54,6 +64,7 @@ def finalizer(env: Env, registry: HookRegistry) -> Finalizer:
         clock=SystemClock(),
         ids=env.producer.ids,
         hooks=registry,
+        progress=progress,
     )
 
 
@@ -71,13 +82,15 @@ async def test_empty_batch_finalizes_once_and_writes_callbacks(
         root = await env.producer.create_root(conn, RootSpec(kind="empty", callbacks=calls))
         assert await env.producer.seal(conn, root.id)
 
-    subject = finalizer(env, registry)
+    progress = RecordingProgress()
+    subject = finalizer(env, registry, progress=progress)
     assert await subject.try_finalize(root.id)
     assert not await subject.try_finalize(root.id)
 
     row = await env.batch(root.id)
     assert row["state"] == BatchState.SUCCEEDED
     assert row["snap_seq"] == 1
+    assert progress.calls == [([root.id], True)]
     outbox = env.tables.outbox
     async with env.connection() as conn:
         records = (
