@@ -6,8 +6,8 @@
 ## Текущее состояние
 
 * **Ветка:** `impl/v1`
-* **Текущая волна:** T6.1
-* **Последний зелёный коммит:** 8160725
+* **Текущая волна:** T6.2
+* **Последний зелёный коммит:** 5d9a433
 
 ## Задачи
 
@@ -39,7 +39,7 @@
 | T4.10 | Maintenance, лидерство, watch | T4.9 | done | 2d9f6bd |
 | T4.11 | Чтение: view, in_flight, items, find | T4.4 | done | 8b45a88 |
 | T5.1 | Runtime: ItemContext, th.item, tracked | T4.5, T4.7 | done | 8160725 |
-| T6.1 | Tallyho, Settings, install, migrate | T5.1, T4.10, T4.11 | todo | |
+| T6.1 | Tallyho, Settings, install, migrate | T5.1, T4.10, T4.11 | done | 5d9a433 |
 | T6.2 | th.batch → BatchBuilder, BatchHandle | T6.1 | todo | |
 | T6.3 | th.call с ParamSpec, типовые тесты | T6.1 | todo | |
 | T7.1 | tallyho.testing: InlineBroker, FakeClock | T6.2 | todo | |
@@ -72,6 +72,16 @@
 - Отклонения от плана/доков: … (или «нет»)
 - Узнали / на что обратить внимание дальше: …
 -->
+### 2026-09-30 · T6.2 · in_progress · —
+- Начата реализация `th.batch(...)`, `BatchBuilder` и `BatchHandle` поверх собранного Tallyho API.
+
+### 2026-09-30 · T6.1 · done · 5d9a433
+- Сделано: frozen `Settings` со всеми значениями §15 и полной runtime-валидацией; `Tallyho` с schema/prefix, зависимостями, hook modules и декораторами; `install` собирает producer/completer/finalizer/policy/reads/maintenance и передаёт адаптеру worker bundle; публичные `migrate`, `maintenance`, `run_maintenance_once` и реэкспорты пакета.
+- Архитектурная связка выполнена через чистый `engine.public`: `api` не имеет даже транзитивной зависимости от `runtime`/`storage`; конкретная композиция остаётся в engine-owned реализации. Конфигурация import-linter не менялась.
+- Проверка: табличный тест всех defaults §15, неверные диапазоны/идентификаторы, однократный install, runtime bundle, hook decorator и идемпотентная миграция в выбранной схеме; `poe check` зелёный; `poe test-all` — 972 passed, 1 platform skip, покрытие 96,15%; pre-commit зелёный.
+- Отклонения от плана/доков: нет.
+- Дальше: T6.2 `BatchBuilder`/`BatchHandle`.
+
 ### 2026-09-30 · T6.1 · in_progress · —
 - Начата сборка публичного `Tallyho`, конфигурации и install/migrate поверх завершённых engine/runtime-компонентов.
 
