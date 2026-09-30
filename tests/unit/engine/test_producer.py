@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+from uuid import UUID
+
 import pytest
 
-from tallyho.engine.producer import CallbackName, RootSpec, StoredCallback
+from tallyho.engine.producer import CallbackName, RootSpec, StoredCallback, SubBatchSpec
 from tallyho.model.errors import ConfigurationError
 
 
@@ -77,3 +79,21 @@ def test_root_spec_rejects_bad_limits() -> None:
 def test_root_spec_accepts_limits() -> None:
     spec = RootSpec(kind="k", max_in_flight=1, expected_total=0, max_items=1)
     assert (spec.max_in_flight, spec.expected_total, spec.max_items) == (1, 0, 1)
+
+
+def test_sub_batch_spec_validation() -> None:
+    with pytest.raises(ConfigurationError, match="key"):
+        _ = SubBatchSpec(key="")
+    with pytest.raises(ConfigurationError, match="kind"):
+        _ = SubBatchSpec(key="pages", kind="")
+    with pytest.raises(ConfigurationError, match="max_depth"):
+        _ = SubBatchSpec(key="pages", max_depth=-1)
+    with pytest.raises(ConfigurationError, match="max_in_flight"):
+        _ = SubBatchSpec(key="pages", max_in_flight=0)
+
+
+def test_sub_batch_spec_freezes_fed_by() -> None:
+    feeder = UUID(int=1)
+    spec = SubBatchSpec(key="cards", fed_by=[feeder])
+    assert spec.fed_by == (feeder,)
+    assert SubBatchSpec(key="pages", max_depth=0).max_depth == 0

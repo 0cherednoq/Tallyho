@@ -20,21 +20,28 @@ import json
 from dataclasses import dataclass, field
 from datetime import timedelta
 from enum import StrEnum
-from typing import TYPE_CHECKING, Final, cast
+from typing import TYPE_CHECKING, Final, TypeVar, cast
 
-from sqlalchemy import BigInteger, DateTime, Interval, func, literal, select, update
+from sqlalchemy import BigInteger, DateTime, Interval, exists, func, literal, select, update
 from sqlalchemy.dialects.postgresql import insert
 
-from tallyho.model.errors import ConfigurationError, NotFoundError
-from tallyho.model.states import BatchState
+from tallyho.model.errors import (
+    ConfigurationError,
+    InvalidStateError,
+    NotFoundError,
+    SealError,
+    SpawnTargetError,
+)
+from tallyho.model.states import BatchState, ItemState, OnFeederFailed
+from tallyho.storage.counters import CounterDelta, upsert_slots
 from tallyho.storage.now import sql_now
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Iterable, Mapping, Sequence
     from datetime import datetime
     from uuid import UUID
 
-    from sqlalchemy import ColumnElement
+    from sqlalchemy import ColumnElement, ScalarSelect
     from sqlalchemy.ext.asyncio import AsyncConnection
 
     from tallyho.hooks.registry import HookRegistry
@@ -47,15 +54,29 @@ if TYPE_CHECKING:
 
 __all__ = [
     "MAX_PAYLOAD_BYTES",
+    "VIRTUAL_TASK",
     "BatchRef",
     "CallbackName",
     "Producer",
     "RootSpec",
     "StoredCallback",
+    "SubBatchSpec",
 ]
+
+_V = TypeVar("_V")
 
 MAX_PAYLOAD_BYTES: Final = 1024 * 1024
 """Предел закодированного payload по умолчанию: ``max_payload_bytes`` flexiq (1 MiB)."""
+
+VIRTUAL_TASK: Final = "tallyho.sub_batch"
+"""``task_name`` виртуального Item под-батча: он не отправляется брокеру."""
+
+_PRODUCER_INTO_STAGE = "в этап с fed_by пишут только его задачи и задачи источников (into=)"
+_NOT_OPEN = "батч уже закрыт (seal), финализирован или отменяется: добавлять нельзя"
+_FEED_CYCLE = "fed_by образует цикл"
+_FEED_SIBLINGS = "fed_by: источник и этап должны быть под-батчами одного родителя"
+_FEED_CLOSED = "fed_by: этап уже закрыт или отменяется"
+_FEEDER_FINALIZED = "fed_by: источник уже финализирован"
 
 
 class CallbackName(StrEnum):
@@ -192,6 +213,62 @@ class RootSpec(_BatchSpec):
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
+class SubBatchSpec(_BatchSpec):
+    """Параметры под-батча или этапа: ``builder.sub_batch(key, fed_by=[...], ...)``.
+
+    ``retention``, ``release_required`` и ``max_items`` копируются от
+    родителя (то есть от корня). ``start_at`` по умолчанию — родителя,
+    пауза родителя тоже наследуется.
+
+    Attributes:
+        key: Ключ под-батча, уникальный в дереве.
+        kind: Тип под-батча для tx-хуков; по умолчанию ``"<kind родителя>.<key>"``,
+            чтобы хуки корня не срабатывали на этапах.
+        fed_by: Источники этапа — под-батчи того же родителя (§8.1).
+        on_feeder_failed: Реакция этапа на упавший источник.
+        max_depth: Глубина самоподпитки (spawn в свой батч).
+    """
+
+    key: str
+    kind: str | None = None
+    fed_by: Sequence[UUID] = ()
+    on_feeder_failed: OnFeederFailed = OnFeederFailed.SEAL
+    max_depth: int | None = None
+
+    def __post_init__(self) -> None:
+        """Проверить параметры.
+
+        Raises:
+            ConfigurationError: пустой ``key`` или ``kind``, недопустимый лимит.
+        """
+        if not self.key:
+            message = "key под-батча не может быть пустым"
+            raise ConfigurationError(message)
+        if self.kind is not None and not self.kind:
+            message = "kind не может быть пустым"
+            raise ConfigurationError(message)
+        self._check()
+        _check_optional("max_depth", self.max_depth, 0)
+        object.__setattr__(self, "fed_by", tuple(self.fed_by))
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class _BatchRow:
+    """Поля ``th_batch``, нужные продюсеру для проверок и наследования."""
+
+    id: UUID
+    root_id: UUID
+    parent_id: UUID | None
+    kind: str
+    state: BatchState
+    paused_at: datetime | None
+    cancel_requested_at: datetime | None
+    start_at: datetime | None
+    is_stage: bool
+    """Батч — этап с источниками ``th_feed``: продюсер в него не пишет."""
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
 class BatchRef:
     """Созданный или найденный батч.
 
@@ -282,6 +359,177 @@ class Producer:
         existing = found.scalar_one()
         return BatchRef(id=existing, root_id=existing, created=False)
 
+    # --- под-батч и этапы --------------------------------------------------
+
+    async def create_sub_batch(
+        self, conn: AsyncConnection, parent_id: UUID, spec: SubBatchSpec
+    ) -> BatchRef:
+        """Создать под-батч или вернуть существующий с тем же ключом (UC-06, §8.1).
+
+        Идемпотентно по ``(root_id, key)``. Родитель получает виртуальный
+        Item с ``child_batch_id`` и ``weight=0`` (D-024): для родителя это
+        ``pending`` 1 до финализации ребёнка, но на ``ratio`` он не влияет.
+        Виртуальный Item не попадает в outbox и не считается в ``tree_total``.
+        Источники ``spec.fed_by`` связываются через :meth:`add_feed` только
+        при создании.
+
+        Args:
+            conn: Соединение в открытой транзакции.
+            parent_id: Родитель (корень или другой под-батч).
+            spec: Параметры под-батча.
+
+        Returns:
+            Ссылка на под-батч; ``created=False`` для существующего.
+
+        Raises:
+            ConfigurationError: ключ в дереве уже занят под-батчем другого
+                родителя.
+        """
+        parent = (await self._lock_batches(conn, [parent_id]))[parent_id]
+        existing = await self._find_child(conn, parent, spec.key)
+        if existing is not None:
+            return existing
+        self._check_producer_target(parent)
+        child_id = self.ids.new_id()
+        virtual_id = self.ids.new_id()
+        now = sql_now(self.clock)
+        kind = spec.kind or f"{parent.kind}.{spec.key}"
+        batch = self.tables.batch
+
+        def inherited(column: ColumnElement[_V]) -> ScalarSelect[_V]:
+            # Параметры корня копируются из строки родителя в том же INSERT.
+            return select(column).where(batch.c.id == parent.id).scalar_subquery()
+
+        values: dict[str, object] = {
+            **self._common_values(spec),
+            "id": child_id,
+            "root_id": parent.root_id,
+            "parent_id": parent.id,
+            "parent_item_id": virtual_id,
+            "kind": kind,
+            "key": spec.key,
+            "hooks": list(self.hooks.required_hooks(kind)),
+            "start_at": spec.start_at or parent.start_at,
+            "paused_at": parent.paused_at,
+            "max_items": inherited(batch.c.max_items),
+            "max_depth": spec.max_depth,
+            "on_feeder_failed": int(spec.on_feeder_failed),
+            "retention": inherited(batch.c.retention),
+            "release_required": inherited(batch.c.release_required),
+            "created_at": now,
+            "updated_at": now,
+            "deadline_at": self._deadline(spec.deadline),
+        }
+        stmt = (
+            insert(batch)
+            .values(values)
+            .on_conflict_do_nothing(
+                index_elements=[batch.c.root_id, batch.c.key],
+                index_where=batch.c.parent_id.is_not(None),
+            )
+            .returning(batch.c.id)
+        )
+        if await conn.scalar(stmt) is None:
+            # Ключ занят под-батчем другого родителя, созданным параллельно.
+            raise ConfigurationError(_key_taken(spec.key))
+        item = self.tables.item
+        _ = await conn.execute(
+            insert(item).values(
+                id=virtual_id,
+                batch_id=parent.id,
+                state=int(ItemState.ACTIVE),
+                task_name=VIRTUAL_TASK,
+                payload=b"",
+                child_batch_id=child_id,
+                weight=0,
+                created_at=now,
+            )
+        )
+        await upsert_slots(conn, self.tables, {(parent.id, self.slot): CounterDelta(total=1)})
+        if spec.fed_by:
+            await self.add_feed(conn, child_id, spec.fed_by)
+        return BatchRef(id=child_id, root_id=parent.root_id, created=True)
+
+    async def _find_child(
+        self, conn: AsyncConnection, parent: _BatchRow, key: str
+    ) -> BatchRef | None:
+        batch = self.tables.batch
+        found = await conn.execute(
+            select(batch.c.id, batch.c.parent_id).where(
+                batch.c.root_id == parent.root_id,
+                batch.c.key == key,
+                batch.c.parent_id.is_not(None),
+            )
+        )
+        row = found.one_or_none()
+        if row is None:
+            return None
+        child_id, child_parent = row
+        if child_parent != parent.id:
+            raise ConfigurationError(_key_taken(key))
+        return BatchRef(id=child_id, root_id=parent.root_id, created=False)
+
+    async def add_feed(
+        self, conn: AsyncConnection, fed_id: UUID, feeder_ids: Iterable[UUID]
+    ) -> None:
+        """Связать этап ``fed_id`` с источниками ``feeder_ids`` в ``th_feed`` (§8.1 п.1).
+
+        Источники — под-батчи того же родителя, граф ``fed_by`` ацикличен.
+        Строки батчей блокируются ``FOR UPDATE`` в порядке id: финализация
+        источника (CAS его строки) ждёт commit, а потом видит новую связь и
+        закрывает этап. Уже существующие связи пропускаются.
+
+        Args:
+            conn: Соединение в открытой транзакции.
+            fed_id: Этап.
+            feeder_ids: Источники.
+
+        Raises:
+            ConfigurationError: источник — сам этап, другой родитель, цикл.
+            SealError: этап уже закрыт или отменяется.
+            InvalidStateError: источник уже финализирован.
+        """
+        feeders = sorted(set(feeder_ids))
+        if fed_id in feeders:
+            raise ConfigurationError(_FEED_CYCLE)
+        rows = await self._lock_batches(conn, [fed_id, *feeders])
+        fed = rows[fed_id]
+        for feeder_id in feeders:
+            if fed.parent_id is None or rows[feeder_id].parent_id != fed.parent_id:
+                raise ConfigurationError(_FEED_SIBLINGS)
+        feed = self.tables.feed
+        linked = set(
+            await conn.scalars(
+                select(feed.c.feeder_id).where(
+                    feed.c.fed_id == fed_id, feed.c.feeder_id.in_(feeders)
+                )
+            )
+        )
+        new = [feeder_id for feeder_id in feeders if feeder_id not in linked]
+        if not new:
+            return
+        if fed.state is not BatchState.OPEN or fed.cancel_requested_at is not None:
+            raise SealError(_FEED_CLOSED)
+        if any(rows[feeder_id].state.is_terminal for feeder_id in new):
+            raise InvalidStateError(_FEEDER_FINALIZED)
+        if await self._reaches(conn, fed_id, new):
+            raise ConfigurationError(_FEED_CYCLE)
+        _ = await conn.execute(
+            insert(feed)
+            .values([{"feeder_id": feeder_id, "fed_id": fed_id} for feeder_id in new])
+            .on_conflict_do_nothing()
+        )
+
+    async def _reaches(self, conn: AsyncConnection, start: UUID, targets: list[UUID]) -> bool:
+        # Этапы ниже start по th_feed (feeder → fed); источник среди них — цикл.
+        feed = self.tables.feed
+        down = (
+            select(feed.c.fed_id.label("id")).where(feed.c.feeder_id == start).cte(recursive=True)
+        )
+        down = down.union(select(feed.c.fed_id).where(feed.c.feeder_id == down.c.id))
+        found = await conn.scalar(select(down.c.id).where(down.c.id.in_(targets)).limit(1))
+        return found is not None
+
     # --- expect ------------------------------------------------------------
 
     async def expect(self, conn: AsyncConnection, batch_id: UUID, n: int) -> None:
@@ -310,6 +558,67 @@ class Producer:
             raise NotFoundError(str(batch_id))
 
     # --- общее -------------------------------------------------------------
+
+    async def _lock_batches(
+        self, conn: AsyncConnection, batch_ids: Iterable[UUID]
+    ) -> dict[UUID, _BatchRow]:
+        # FOR UPDATE в порядке id: глобальный порядок блокировок th_batch.
+        ids = sorted(set(batch_ids))
+        batch = self.tables.batch
+        feed = self.tables.feed
+        is_stage = exists().where(feed.c.fed_id == batch.c.id).label("is_stage")
+        result = await conn.execute(
+            select(
+                batch.c.id,
+                batch.c.root_id,
+                batch.c.parent_id,
+                batch.c.kind,
+                batch.c.state,
+                batch.c.paused_at,
+                batch.c.cancel_requested_at,
+                batch.c.start_at,
+                is_stage,
+            )
+            .where(batch.c.id.in_(ids))
+            .order_by(batch.c.id)
+            .with_for_update(of=batch)
+        )
+        rows: dict[UUID, _BatchRow] = {}
+        for (
+            batch_id,
+            root_id,
+            parent_id,
+            kind,
+            state,
+            paused_at,
+            cancel_requested_at,
+            start_at,
+            stage,
+        ) in result:
+            rows[batch_id] = _BatchRow(
+                id=batch_id,
+                root_id=root_id,
+                parent_id=parent_id,
+                kind=kind,
+                state=BatchState(state),
+                paused_at=paused_at,
+                cancel_requested_at=cancel_requested_at,
+                start_at=start_at,
+                is_stage=stage,
+            )
+        missing = [batch_id for batch_id in ids if batch_id not in rows]
+        if missing:
+            message = f"батч не найден: {missing[0]}"
+            raise NotFoundError(message)
+        return rows
+
+    @staticmethod
+    def _check_producer_target(target: _BatchRow) -> None:
+        # Продюсер пишет только в открытый батч без запроса отмены и не в этап (§6.1, §8.1 п.2).
+        if target.is_stage:
+            raise SpawnTargetError(_PRODUCER_INTO_STAGE)
+        if target.state is not BatchState.OPEN or target.cancel_requested_at is not None:
+            raise SealError(_NOT_OPEN)
 
     def _common_values(self, spec: _BatchSpec) -> dict[str, object]:
         return {
@@ -355,6 +664,10 @@ class Producer:
         if isinstance(deadline, timedelta):
             return sql_now(self.clock) + literal(deadline, Interval())
         return literal(deadline, DateTime(timezone=True))
+
+
+def _key_taken(key: str) -> str:
+    return f"ключ под-батча {key!r} в дереве уже занят под-батчем другого родителя"
 
 
 def _greatest(column: ColumnElement[int], value: int) -> ColumnElement[int]:
