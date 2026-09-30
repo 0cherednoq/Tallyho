@@ -6,8 +6,8 @@
 ## Текущее состояние
 
 * **Ветка:** `impl/v1`
-* **Текущая волна:** T6.3
-* **Последний зелёный коммит:** 3c5f331
+* **Текущая волна:** T7.1
+* **Последний зелёный коммит:** eb6633a
 
 ## Задачи
 
@@ -41,8 +41,8 @@
 | T5.1 | Runtime: ItemContext, th.item, tracked | T4.5, T4.7 | done | 8160725 |
 | T6.1 | Tallyho, Settings, install, migrate | T5.1, T4.10, T4.11 | done | 5d9a433 |
 | T6.2 | th.batch → BatchBuilder, BatchHandle | T6.1 | done | 3c5f331 |
-| T6.3 | th.call с ParamSpec, типовые тесты | T6.1 | todo | |
-| T7.1 | tallyho.testing: InlineBroker, FakeClock | T6.2 | todo | |
+| T6.3 | th.call с ParamSpec, типовые тесты | T6.1 | done | eb6633a |
+| T7.1 | tallyho.testing: InlineBroker, FakeClock | T6.2 | in_progress | |
 | T8.0 | Спайк flexiq | T0.1 | done | 4d318d0..f4155a6 (3), merge 9395ea6, b41b30d, 2a781c2 |
 | T8.1 | FlexiqAdapter | T8.0, T7.1 | todo | |
 | T8.2 | Контрактные тесты A-FQ | T8.1 | todo | |
@@ -72,6 +72,16 @@
 - Отклонения от плана/доков: … (или «нет»)
 - Узнали / на что обратить внимание дальше: …
 -->
+### 2026-09-30 · T7.1 · in_progress · —
+- Начата реализация публичного тестового контура: `InlineBroker`, управляемые доставка/дубли/kill, `FakeClock` и pytest-фикстуры.
+
+### 2026-09-30 · T6.3 · done · eb6633a
+- Сделано: типизированный `Call[P, R]`, `Tallyho.call(...)` и сохраняющий тип результата `.opts(...)`; `ParamSpec` протянут через `BatchBuilder.add/map` и `th.item.spawn`, включая маршрутизацию `into`/`key`.
+- Типовые контракты вынесены в `tests/typing/cases.py`: позитивные `assert_type` проверяются штатными mypy/basedpyright, а тест снимает подавления с пяти негативных строк и требует ошибок обоих checker'ов ровно на них.
+- Проверка: `poe check` зелёный; `poe test-all` — 1000 passed, 1 platform skip, покрытие 95,68%; pre-commit зелёный.
+- Отклонения от плана/доков: нет.
+- Дальше: T7.1 `InlineBroker`, `FakeClock` и тестовые фикстуры.
+
 ### 2026-09-30 · T6.3 · in_progress · —
 - Начата реализация типизированного `th.call(...)`, `.opts(...)` и compile-time тестов публичных вызовов.
 
