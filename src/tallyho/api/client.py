@@ -12,6 +12,7 @@ from tallyho.engine.public import (
     BatchDefinition,
     EngineSettings,
     create_engine_facade,
+    load_worker_factory,
 )
 from tallyho.hooks.registry import HookRegistry, import_hook_modules
 from tallyho.model.errors import ConfigurationError
@@ -240,7 +241,7 @@ class Tallyho:
         """
         if self._adapter is not None:
             raise ConfigurationError(_ALREADY_INSTALLED)
-        self._engine.install(adapter)
+        self._engine.install(adapter, load_worker_factory())
         self._adapter = adapter
 
     async def migrate(self) -> int:

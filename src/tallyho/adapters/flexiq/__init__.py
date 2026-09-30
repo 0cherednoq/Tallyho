@@ -2,4 +2,6 @@
 
 from __future__ import annotations
 
-__all__: list[str] = []
+from tallyho.adapters.flexiq.adapter import FlexiqAdapter
+
+__all__ = ["FlexiqAdapter"]

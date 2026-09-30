@@ -27,7 +27,7 @@ if TYPE_CHECKING:
 
     from tallyho.engine.public import MaintenanceRunner
     from tallyho.model.views import BatchView, InFlightItem, ItemView
-    from tallyho.protocols.broker import Message
+    from tallyho.protocols.broker import Message, WorkerFactory
 
 __all__: list[str] = []
 
@@ -153,8 +153,9 @@ class Facade(EngineFacade):
         self.context = WriterContext(self.writer_value)
 
     @override
-    def install(self, adapter: Dispatcher) -> None:
+    def install(self, adapter: Dispatcher, worker_factory: WorkerFactory) -> None:
         _ = adapter
+        _ = worker_factory
 
     @override
     async def migrate(self) -> int:

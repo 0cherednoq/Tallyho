@@ -19,13 +19,13 @@ from tallyho.model.errors import ConfigurationError
 from tallyho.model.states import OutboxKind
 from tallyho.protocols.broker import DeadLetters, Dispatcher, Runtime, Verdict
 from tallyho.protocols.serialization import JsonSerializer, PayloadCodec, SerializerCodec
-from tallyho.runtime.tracked import TaskRuntime, bind_runtime
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Mapping, Sequence
 
     from tallyho.protocols.broker import Message
     from tallyho.protocols.serialization import CallArgs, Serializer
+    from tallyho.runtime.tracked import TaskRuntime
 
 __all__ = ["InlineBroker"]
 
@@ -228,15 +228,7 @@ class InlineBroker(Dispatcher, Runtime, PayloadCodec):
         if not isinstance(services, RuntimeServices):
             message = "InlineBroker получил несовместимый набор runtime-сервисов"
             raise ConfigurationError(message)
-        runtime = TaskRuntime(
-            completer=services.completer,
-            broker=self,
-            dispatcher=self,
-            tree_cache=services.tree_cache,
-            heartbeat_every=services.heartbeat_every,
-        )
-        self._runtime = runtime
-        bind_runtime(runtime)
+        self._runtime = cast("TaskRuntime", services.runtime)
 
     def kill_worker_after(self, deliveries: int) -> None:
         """Убить воркер на N-й следующей доставке, оставив взятый lease."""

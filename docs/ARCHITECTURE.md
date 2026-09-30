@@ -1428,7 +1428,7 @@ await th.migrate()                          # или ревизии Alembic: upg
 
 | Факт о flexiq | Следствие | Решение в адаптере |
 |---|---|---|
-| Нет своего job id при enqueue: id генерирует Rust (`Uuid::now_v7()`) | `item.id` ≠ id джобы flexiq | Relay добавляет в kwargs служебный `_th={"i": item_id, "b": batch_id}`, обёртка `th.tracked` вынимает его до вызова функции. Kwargs переносятся в DLQ, по ним идёт сверка. **`metadata` и `notes` пользователя не трогаем** (§11.4) |
+| Нет своего job id при enqueue: id генерирует Rust (`Uuid::now_v7()`) | `item.id` ≠ id джобы flexiq | Relay добавляет в kwargs служебный `_th={"i": item_id, "b": batch_id, "r": effective_max_retries}` (`r` нужен runtime, потому что `current_job` лимит не показывает), обёртка `th.tracked` вынимает его до вызова функции. Kwargs переносятся в DLQ, по ним идёт сверка. **`metadata` и `notes` пользователя не трогаем** (§11.4) |
 | Middleware только синхронные `before/after`, around-хука нет; `on_retry/on_dead_letter` вызываются вне задачи с `SimpleNamespace(id, task_name)` | На sync-хуках нельзя `await` Completer | **`@fq.task(...)` = `queue.task(...)(th.tracked(fn))`**: обёртка — `async def` в том же event loop, что и задача, то есть настоящий around. `functools.wraps` сохраняет `module.qualname`, имя задачи не меняется |
 | Async-задачи идут в одном event loop на процесс (поток `flexiq-async-executor`, семафор `async_concurrency=100`) | Completer должен жить в этом loop | Completer создаётся лениво в loop первой задачи. Отслеживаемые задачи — только `async def` (проверка при декорировании) |
 | Prefork-пул исполняет async-задачу через `asyncio.run` в новом event loop на каждую джобу, на Windows — `NotImplementedError` (спайк T8.0) | Completer и lease не переживают джобу | v1 поддерживает только `pool="thread"`. Prefork — ошибка при `install` |
@@ -1452,7 +1452,7 @@ sequenceDiagram
     participant F as Функция пользователя
     participant H as on_dead_letter (sync)
 
-    R->>Q: enqueue_many(task, kwargs_list с _th, metadata, idempotency_key=th:item)
+    R->>Q: enqueue_many(task, kwargs_list с _th={i,b,r}, metadata, idempotency_key=th:item)
     Q->>X: run_coroutine_threadsafe(job)
     X->>W: await wrapper(*args, _th=...)
     W->>C: claim(item)

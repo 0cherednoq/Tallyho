@@ -29,7 +29,7 @@ from tallyho.engine.spawn import TreeCache
 from tallyho.engine.sweeper import Sweeper, SweeperSettings
 from tallyho.model.errors import ConfigurationError
 from tallyho.model.progress import ProgressSettings
-from tallyho.protocols.broker import RuntimeInstaller
+from tallyho.protocols.broker import Runtime, RuntimeInstaller
 from tallyho.protocols.serialization import PayloadCodec, SerializerCodec
 from tallyho.storage.tx import after_commit, resolve_connection
 
@@ -50,7 +50,7 @@ if TYPE_CHECKING:
     from tallyho.hooks.registry import HookRegistry
     from tallyho.model.calls import TaskCall
     from tallyho.model.views import BatchView, InFlightItem, ItemView
-    from tallyho.protocols.broker import Dispatcher
+    from tallyho.protocols.broker import Dispatcher, WorkerFactory
     from tallyho.protocols.clock import Clock
     from tallyho.protocols.ids import IdFactory
     from tallyho.protocols.observer import Observer
@@ -146,7 +146,7 @@ class _Facade:
     _finalizer: Finalizer | None = None
     _background: set[asyncio.Task[None]] = field(default_factory=set, init=False)
 
-    def install(self, adapter: Dispatcher) -> None:
+    def install(self, adapter: Dispatcher, worker_factory: WorkerFactory) -> None:
         value = self.installation
         settings = self.settings
         progress_settings = ProgressSettings(
@@ -279,10 +279,35 @@ class _Facade:
                 watch_throttle=settings.watch_throttle,
             ),
         )
-        if isinstance(adapter, RuntimeInstaller):
-            adapter.install_runtime(
-                RuntimeServices(completer, tree_cache, settings.heartbeat_every)
-            )
+        self._install_worker(
+            adapter,
+            worker_factory=worker_factory,
+            completer=completer,
+            tree_cache=tree_cache,
+        )
+
+    def _install_worker(
+        self,
+        adapter: Dispatcher,
+        *,
+        worker_factory: WorkerFactory,
+        completer: Completer,
+        tree_cache: TreeCache,
+    ) -> None:
+        if not isinstance(adapter, RuntimeInstaller):
+            return
+        if not isinstance(adapter, Runtime):
+            message = "runtime installer должен реализовывать Runtime"
+            raise ConfigurationError(message)
+        heartbeat = self.settings.heartbeat_every
+        runtime = worker_factory(
+            completer=completer,
+            broker=adapter,
+            dispatcher=adapter,
+            tree_cache=tree_cache,
+            heartbeat_every=heartbeat,
+        )
+        adapter.install_runtime(RuntimeServices(completer, tree_cache, heartbeat, runtime))
 
     async def migrate(self) -> int:
         return await migrate_installation(

@@ -16,11 +16,22 @@ from typing import TYPE_CHECKING, ParamSpec, Protocol, TypeVar, runtime_checkabl
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Mapping, Sequence
+    from datetime import timedelta
     from uuid import UUID
 
     from tallyho.model.states import OutboxKind
 
-__all__ = ["DeadLetters", "Dispatcher", "Message", "Runtime", "RuntimeInstaller", "Verdict"]
+__all__ = [
+    "DeadLetters",
+    "Dispatcher",
+    "Message",
+    "Runtime",
+    "RuntimeInstaller",
+    "Verdict",
+    "WorkerFactory",
+    "WorkerRuntime",
+    "WorkerServices",
+]
 
 P = ParamSpec("P")
 R = TypeVar("R")
@@ -145,6 +156,47 @@ class Runtime(Protocol):
         Returns:
             Items из DLQ и курсор для следующего вызова.
         """
+        ...
+
+
+@runtime_checkable
+class WorkerRuntime(Protocol):
+    """Собранный engine-owned around-runtime, безопасный для слоя адаптеров."""
+
+    def wrap(self, fn: Callable[P, Awaitable[R]]) -> Callable[P, Awaitable[R | None]]:
+        """Обернуть tracked-задачу, не раскрывая engine-типы адаптеру."""
+        ...
+
+
+class WorkerFactory(Protocol):
+    """Композиционная фабрика runtime без зависимости engine от верхнего слоя."""
+
+    def __call__(
+        self,
+        *,
+        completer: object,
+        broker: Runtime,
+        dispatcher: Dispatcher,
+        tree_cache: object,
+        heartbeat_every: timedelta,
+    ) -> WorkerRuntime:
+        """Собрать runtime из непрозрачных engine-сервисов."""
+        ...
+
+
+@runtime_checkable
+class WorkerServices(Protocol):
+    """Узкая граница engine → adapter для сборки runtime и обработки DLQ."""
+
+    @property
+    def runtime(self) -> WorkerRuntime:
+        """Уже собранный around-runtime этой установки."""
+        ...
+
+    async def finish_dead(
+        self, item_id: UUID, batch_id: UUID, *, error_type: str, detail: str
+    ) -> None:
+        """Завершить Item, окончательно убитый внешним брокером."""
         ...
 
 

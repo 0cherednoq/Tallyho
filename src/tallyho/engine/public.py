@@ -20,7 +20,7 @@ if TYPE_CHECKING:
     from tallyho.model.calls import TaskCall
     from tallyho.model.policy import FailurePolicy
     from tallyho.model.views import BatchView, InFlightItem, ItemView
-    from tallyho.protocols.broker import Dispatcher
+    from tallyho.protocols.broker import Dispatcher, WorkerFactory
     from tallyho.protocols.clock import Clock
     from tallyho.protocols.ids import IdFactory
     from tallyho.protocols.observer import Observer
@@ -34,6 +34,7 @@ __all__ = [
     "EngineSettings",
     "MaintenanceRunner",
     "create_engine_facade",
+    "load_worker_factory",
 ]
 
 
@@ -133,7 +134,7 @@ class MaintenanceRunner(Protocol):
 class EngineFacade(Protocol):
     """Операции T6.1, реализованные внутри engine-слоя."""
 
-    def install(self, adapter: Dispatcher) -> None:
+    def install(self, adapter: Dispatcher, worker_factory: WorkerFactory) -> None:
         """Собрать producer, worker и maintenance вокруг адаптера."""
         ...
 
@@ -266,3 +267,13 @@ def create_engine_facade(  # ruff: ignore[too-many-arguments]  # dependency boun
         hooks=hooks,
         settings=settings,
     )
+
+
+def load_worker_factory() -> WorkerFactory:
+    """Загрузить runtime-композицию, не связывая API/engine статическим импортом.
+
+    Returns:
+        Типизированная фабрика worker runtime.
+    """
+    loaded = importlib.import_module("tallyho.runtime.tracked")
+    return cast("WorkerFactory", vars(loaded)["build_runtime"])

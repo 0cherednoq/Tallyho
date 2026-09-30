@@ -36,7 +36,7 @@ if TYPE_CHECKING:
 P = ParamSpec("P")
 R = TypeVar("R")
 
-__all__ = ["TaskRuntime", "bind_runtime", "current_runtime", "tracked"]
+__all__ = ["TaskRuntime", "bind_runtime", "build_runtime", "current_runtime", "tracked"]
 
 _runtime: ContextVar[TaskRuntime | None] = ContextVar("tallyho_runtime", default=None)
 _installed: list[TaskRuntime] = []
@@ -224,6 +224,30 @@ def bind_runtime(runtime: TaskRuntime) -> None:
     """Установить runtime для последующих вызовов модульного ``tracked``."""
     _installed.clear()
     _installed.append(runtime)
+
+
+def build_runtime(
+    *,
+    completer: object,
+    broker: Runtime,
+    dispatcher: Dispatcher,
+    tree_cache: object,
+    heartbeat_every: timedelta,
+) -> TaskRuntime:
+    """Собрать и активировать runtime из непрозрачных engine-зависимостей.
+
+    Returns:
+        Runtime, готовый для передачи broker adapter через ``WorkerServices``.
+    """
+    runtime = TaskRuntime(
+        completer=cast("Completer", completer),
+        broker=broker,
+        dispatcher=dispatcher,
+        tree_cache=cast("TreeCache", tree_cache),
+        heartbeat_every=heartbeat_every,
+    )
+    bind_runtime(runtime)
+    return runtime
 
 
 def current_runtime() -> TaskRuntime:

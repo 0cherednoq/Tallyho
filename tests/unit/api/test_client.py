@@ -5,16 +5,17 @@ from __future__ import annotations
 import asyncio
 from dataclasses import fields
 from datetime import timedelta
-from typing import TYPE_CHECKING, ParamSpec, Self, cast
+from typing import TYPE_CHECKING, ParamSpec, Self, TypeVar, cast
 
 import pytest
 
 from tallyho import Call, Settings, Tallyho
 from tallyho.engine import RuntimeServices
 from tallyho.model.errors import ConfigurationError
+from tallyho.protocols.broker import DeadLetters, Verdict
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Sequence
+    from collections.abc import Awaitable, Callable, Sequence
 
     from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
@@ -24,6 +25,7 @@ if TYPE_CHECKING:
 __all__: list[str] = []
 
 P = ParamSpec("P")
+R = TypeVar("R")
 
 
 class FakeEngine:
@@ -43,6 +45,16 @@ class Adapter:
 
     async def dispatch(self, messages: Sequence[Message]) -> None:
         _ = messages
+
+    def wrap(self, fn: Callable[P, Awaitable[R]]) -> Callable[P, Awaitable[R]]:
+        return fn
+
+    def retry_verdict(self, exc: BaseException) -> Verdict:
+        _ = exc
+        return Verdict.FINAL
+
+    async def reconcile_dead(self, since: str | None) -> DeadLetters:
+        return DeadLetters((), since)
 
     def install_runtime(self, services: object) -> None:
         self.services = services

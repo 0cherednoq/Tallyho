@@ -9,6 +9,9 @@ from tallyho.protocols.broker import (
     Runtime,
     RuntimeInstaller,
     Verdict,
+    WorkerFactory,
+    WorkerRuntime,
+    WorkerServices,
 )
 from tallyho.protocols.clock import Clock, SystemClock
 from tallyho.protocols.ids import IdFactory, UuidV7Factory
@@ -41,4 +44,7 @@ __all__ = [
     "SystemClock",
     "UuidV7Factory",
     "Verdict",
+    "WorkerFactory",
+    "WorkerRuntime",
+    "WorkerServices",
 ]
