@@ -25,7 +25,9 @@ __all__ = [
     "LockRow",
     "deadlock_count",
     "held_locks",
+    "schema_connection",
     "schema_exists",
+    "schema_transaction",
     "temporary_schema",
     "unique_schema_name",
 ]
@@ -55,6 +57,20 @@ async def temporary_schema(engine: AsyncEngine) -> AsyncGenerator[str]:
     finally:
         async with engine.begin() as conn:
             await conn.execute(text(f"DROP SCHEMA IF EXISTS {_quoted(schema)} CASCADE"))
+
+
+@contextlib.asynccontextmanager
+async def schema_transaction(engine: AsyncEngine, schema: str) -> AsyncGenerator[AsyncConnection]:
+    """Транзакция, где таблицы без схемы попадают в ``schema``; commit на выходе."""
+    async with engine.begin() as raw:
+        yield await raw.execution_options(schema_translate_map={None: schema})
+
+
+@contextlib.asynccontextmanager
+async def schema_connection(engine: AsyncEngine, schema: str) -> AsyncGenerator[AsyncConnection]:
+    """Соединение в ``schema`` без commit: незакоммиченное откатится при закрытии."""
+    async with engine.connect() as raw:
+        yield await raw.execution_options(schema_translate_map={None: schema})
 
 
 async def schema_exists(conn: AsyncConnection, schema: str) -> bool:
