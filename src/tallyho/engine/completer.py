@@ -1204,8 +1204,22 @@ class Completer:
         self._closing = False
         self._held: dict[UUID, ItemRef] = {}
         self._background: set[asyncio.Task[None]] = set()
+        self._flushing = False
+        self._idle = asyncio.Event()
+        self._idle.set()
 
     # --- публичные операции ------------------------------------------------------------
+
+    async def settled(self) -> None:
+        """Дождаться простоя: буфер пуст, flush и после-коммитная работа завершены.
+
+        Результат операции возвращается задаче сразу после commit, а оценка
+        политики, финализация и её каскад идут следом — в цикле Completer или
+        в фоновой задаче пути ``complete_in``. Метод нужен тому, кто должен
+        увидеть их итог детерминированно: тестовому брокеру и остановке.
+        """
+        while not self._idle.is_set():
+            _ = await self._idle.wait()
 
     @property
     def buffered(self) -> int:
@@ -1436,7 +1450,16 @@ class Completer:
             name="tallyho-complete-in",
         )
         self._background.add(task)
-        task.add_done_callback(self._background.discard)
+        self._idle.clear()
+        task.add_done_callback(self._background_done)
+
+    def _background_done(self, task: asyncio.Task[None]) -> None:
+        self._background.discard(task)
+        self._mark_idle()
+
+    def _mark_idle(self) -> None:
+        if not self._buffer and not self._flushing and not self._background:
+            self._idle.set()
 
     async def _after_external_commit(self, applied: _Applied, delta_ids: set[int]) -> None:
         try:
@@ -1485,6 +1508,7 @@ class Completer:
             future.cancel()
             raise InvalidStateError(_CLOSED)
         self._buffer.append(op)
+        self._idle.clear()
         self._notify_buffer()
         self._wakeup.set()
         if len(self._buffer) >= self.settings.max_batch:
@@ -1495,6 +1519,8 @@ class Completer:
         tick = self.settings.tick.total_seconds()
         while True:
             if not self._buffer:
+                self._flushing = False
+                self._mark_idle()
                 if self._closing:
                     return
                 self._wakeup.clear()
@@ -1505,6 +1531,7 @@ class Completer:
                 with contextlib.suppress(TimeoutError):
                     async with asyncio.timeout(tick):
                         _ = await self._full.wait()
+            self._flushing = True
             ops = self._buffer[: self.settings.max_batch]
             del self._buffer[: self.settings.max_batch]
             self._notify_buffer()

@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from tallyho import Tallyho, callback
+from tallyho import Tallyho, callback, item
 from tallyho.model.states import BatchState
 from tallyho.testing import FakeClock, InlineBroker
 
@@ -19,6 +19,7 @@ if TYPE_CHECKING:
 
     from sqlalchemy.ext.asyncio import AsyncEngine
 
+    from tallyho import BatchHandle
     from tallyho.testing import TallyhoTestEnv
 
 __all__: list[str] = []
@@ -258,3 +259,43 @@ async def test_pytest_fixture_is_installed_and_ready(tallyho_env: TallyhoTestEnv
     assert await tallyho_env.drain() == 0
     assert seen == ["plain", "ok"]
     assert (await batch.handle.view()).state is BatchState.SUCCEEDED
+
+
+async def test_drain_waits_for_post_commit_finalization_and_callback(
+    engine: AsyncEngine, schema: str
+) -> None:
+    """Один drain доводит дерево до колбэка, даже если итог пишет ``complete_in``."""
+    settled: list[int] = []
+    async with make_client(engine, schema) as (th, broker, _clock):
+        scoped = engine.execution_options(schema_translate_map={None: schema})
+
+        async def in_user_transaction(value: int) -> None:
+            async with scoped.begin() as connection:
+                item.ok("done", result={"value": value})
+                await item.complete_in(connection)
+
+        async def boom(value: int) -> None:
+            await asyncio.sleep(0)
+            raise RetryableError(value)
+
+        async def on_done(index: int) -> None:
+            await asyncio.sleep(0)
+            settled.append(index)
+
+        handles: list[BatchHandle] = []
+        for index in range(12):
+            async with th.batch(
+                "inline-settled",
+                key=f"tree:{index}",
+                on_finalized_task=th.call(on_done, index),
+            ) as batch:
+                stage = batch.sub_batch("stage")
+                await stage.add(in_user_transaction, index)
+                await stage.add_calls([th.call(boom, index).opts(max_retries=1)])
+            handles.append(batch.handle)
+
+        _ = await broker.drain()
+
+        states = [(await handle.view()).state for handle in handles]
+    assert states == [BatchState.COMPLETED_WITH_ERRORS] * 12
+    assert sorted(settled) == list(range(12))

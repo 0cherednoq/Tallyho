@@ -334,6 +334,9 @@ class InlineBroker(Dispatcher, Runtime, PayloadCodec):
             _ = await finalizer.try_finalize(message.batch_id)
 
     async def _pump(self, *, scan: bool = False) -> None:
+        # Финализация и её каскад идут после возврата результата задаче: без
+        # ожидания drain мог вернуться раньше, чем колбэк попадёт в outbox.
+        await self._require_runtime().completer.settled()
         await self._recover_crashed()
         relay = self._relay()
         _ = await relay.flush_kicked()
