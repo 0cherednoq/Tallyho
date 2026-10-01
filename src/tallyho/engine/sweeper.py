@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import timedelta
@@ -31,6 +32,7 @@ from tallyho.model.states import (
     OnFeederFailed,
     OutboxKind,
 )
+from tallyho.protocols.observer import NullObserver
 from tallyho.storage.counters import (
     CounterDelta,
     fold_delta_ids,
@@ -50,6 +52,7 @@ if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
     from tallyho.protocols.clock import Clock
+    from tallyho.protocols.observer import Observer
     from tallyho.storage.tables import Tables
 
 __all__ = ["SweepResult", "Sweeper", "SweeperSettings"]
@@ -63,6 +66,7 @@ _NO_DATABASE_TIME = "БД не вернула текущее время"
 _PARENT_CYCLE = "цикл parent_id в дереве батчей"
 
 T = TypeVar("T")
+_log = logging.getLogger(__name__)
 
 
 def _pending(tables: Tables, batch_id: ColumnElement[UUID]) -> ColumnElement[int]:
@@ -124,6 +128,7 @@ class SweeperSettings:
     slot: int = 0
     finalize_grace: timedelta = timedelta(seconds=30)
     hook_backoff_max: timedelta = timedelta(minutes=5)
+    lease_ttl: timedelta = timedelta(seconds=60)
     tx: TxSettings = field(default_factory=TxSettings)
     retry: RetryPolicy = field(default_factory=RetryPolicy)
 
@@ -138,7 +143,11 @@ class SweeperSettings:
         if self.slot < 0:
             message = "sweeper slot должен быть >= 0"
             raise ConfigurationError(message)
-        if self.finalize_grace < timedelta(0) or self.hook_backoff_max <= timedelta(0):
+        if (
+            self.finalize_grace < timedelta(0)
+            or self.hook_backoff_max <= timedelta(0)
+            or self.lease_ttl <= timedelta(0)
+        ):
             raise ConfigurationError(_POSITIVE_GRACE)
 
 
@@ -188,6 +197,7 @@ class Sweeper:
     finalizer: _Finalizer
     relay: _Relay | None = None
     settings: SweeperSettings = field(default_factory=SweeperSettings)
+    observer: Observer = field(default_factory=NullObserver)
 
     async def sweep(self) -> SweepResult:
         """Выполнить по одному ограниченному проходу каждого вида.
@@ -195,6 +205,7 @@ class Sweeper:
         Returns:
             Сводка числа исправлений.
         """
+        self._notify_oldest_lease(await self._run(self._oldest_lease_age))
         leases = await self.expire_leases()
         finalized = await self.finalize_stuck()
         deadlines = await self.enforce_deadlines()
@@ -319,6 +330,20 @@ class Sweeper:
             settings=self.settings.tx,
             policy=self.settings.retry,
         )
+
+    async def _oldest_lease_age(self, conn: AsyncConnection) -> float:
+        lease_until = await conn.scalar(select(func.min(self.tables.lease.c.lease_until)))
+        if lease_until is None:
+            return 0.0
+        now = await self._now(conn)
+        acquired_at = lease_until - self.settings.lease_ttl
+        return float(max(0.0, (now - acquired_at).total_seconds()))
+
+    def _notify_oldest_lease(self, seconds: float) -> None:
+        try:
+            self.observer.oldest_lease(seconds=seconds)
+        except Exception:  # ruff: ignore[blind-except]  # observer must not affect recovery
+            _log.exception("Observer.oldest_lease failed")
 
     async def _expire_leases_in(  # ruff: ignore[too-many-locals]  # один атомарный проход классифицирует lease по четырём исходам
         self, conn: AsyncConnection

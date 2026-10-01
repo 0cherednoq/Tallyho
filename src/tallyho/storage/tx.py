@@ -101,6 +101,7 @@ class RetryPolicy:
     attempts: int = 5
     base_delay: float = 0.05
     max_delay: float = 2.0
+    on_retry: Callable[[str], None] | None = None
 
     def delay(self, retry: int, rng: random.Random) -> float:
         """Пауза перед повтором номер ``retry`` (с нуля).
@@ -256,6 +257,12 @@ async def run_transaction(
                 raise
             if retry + 1 >= policy.attempts:
                 raise ConcurrentModification(_RETRIES_EXHAUSTED) from exc
+            state = sqlstate_of(exc)
+            if state is not None and policy.on_retry is not None:
+                try:
+                    policy.on_retry(state)
+                except Exception:  # ruff: ignore[blind-except]  # telemetry cannot change retry semantics
+                    _log.exception("transaction retry observer failed for SQLSTATE %s", state)
         _ = await sleep(policy.delay(retry, rng))
         retry += 1
 

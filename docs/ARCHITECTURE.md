@@ -2382,7 +2382,11 @@ xychart-beta
 * tx-хуки `on_finalized / on_progress / on_policy_breach`, retention + release;
 * миграции, адаптер flexiq, `tallyho.testing`, бенчмарк-стенд.
 
-**v1.x**: `watch()` + SSE-хелпер, OpenTelemetry, CLI `inspect`, admin read-only эндпоинты.
+**v1.x**: `watch()` + SSE-хелпер, CLI `inspect`, admin read-only эндпоинты.
+
+OpenTelemetry поставляется отдельным верхнеуровневым пакетом
+`tallyho.observability` (extra `otel`): он реализует `Observer`, не участвует в
+транзакциях и не передаёт в телеметрию payload/аргументы задач.
 
 **v2**:
 * SQLite (сниппеты из COUNTERS.md §3.7 как отправная точка);

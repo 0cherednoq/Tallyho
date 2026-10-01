@@ -37,7 +37,13 @@ from tallyho.storage.counters import (
     upsert_slots,
 )
 from tallyho.storage.now import sql_now
-from tallyho.storage.tx import TxSettings, hook_session, own_transaction, run_transaction
+from tallyho.storage.tx import (
+    RetryPolicy,
+    TxSettings,
+    hook_session,
+    own_transaction,
+    run_transaction,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Mapping
@@ -114,6 +120,7 @@ class FinalizerSettings:
 
     slot: int = 0
     hook_timeout: timedelta = timedelta(seconds=10)
+    retry: RetryPolicy = field(default_factory=RetryPolicy)
 
     def __post_init__(self) -> None:
         """Проверить диапазоны настроек.
@@ -187,6 +194,7 @@ class Finalizer:
                     self.engine,
                     lambda conn: self._attempt(conn, batch_id),
                     settings=settings,
+                    policy=self.settings.retry,
                 )
             except _SnapshotChangedError:
                 continue
@@ -656,14 +664,26 @@ class Finalizer:
                 _log.exception("Публикация финального прогресса упала")
 
     def _notify_missing(self, batch_id: UUID, exc: HookMissingError) -> None:
-        _log.error("Батч %s не финализирован: %s", batch_id, exc)
+        _log.error(
+            "Tx hook missing batch_id=%s kind=%s hook=%s attempt=0",
+            batch_id,
+            exc.kind,
+            exc.hook,
+        )
         try:
             self.observer.hook_missing(batch_id=batch_id, kind=exc.kind, hook=exc.hook)
         except Exception:  # ruff: ignore[blind-except]  # наблюдаемость не влияет на учёт
             _log.exception("Observer.hook_missing упал")
 
     def _notify_failed(self, failure: _HookCallError, attempt: int) -> None:
-        _log.error("Tx-хук финализации батча %s упал: %s", failure.batch_id, failure.error)
+        _log.error(
+            "Tx hook failed batch_id=%s kind=%s hook=%s attempt=%d error_type=%s",
+            failure.batch_id,
+            failure.kind,
+            _HOOK_FAILED,
+            attempt,
+            type(failure.error).__name__,
+        )
         try:
             self.observer.hook_failed(
                 batch_id=failure.batch_id,

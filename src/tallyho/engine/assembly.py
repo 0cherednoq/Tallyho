@@ -31,7 +31,7 @@ from tallyho.model.errors import ConfigurationError
 from tallyho.model.progress import ProgressSettings
 from tallyho.protocols.broker import CallOptionsValidator, Runtime, RuntimeInstaller
 from tallyho.protocols.serialization import PayloadCodec, SerializerCodec
-from tallyho.storage.tx import after_commit, resolve_connection
+from tallyho.storage.tx import RetryPolicy, after_commit, resolve_connection
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, AsyncIterator, Callable, Sequence
@@ -72,6 +72,7 @@ class _Writer:
     target: AsyncSession | AsyncConnection
     notify: Callable[[UUID], None]
     finalize: Callable[[UUID], None]
+    observer: Observer
 
     async def create_root(self, spec: BatchDefinition) -> BatchReference:
         if spec.kind is None:
@@ -92,6 +93,11 @@ class _Writer:
                 release_required=spec.release_required,
             ),
         )
+        if value.created:
+            await after_commit(
+                self.target,
+                lambda: self._created(value.id, value.kind),
+            )
         return BatchReference(value.id, value.root_id, value.created)
 
     async def create_child(self, parent_id: UUID, spec: BatchDefinition) -> BatchReference:
@@ -114,7 +120,18 @@ class _Writer:
                 max_depth=spec.max_depth,
             ),
         )
+        if value.created:
+            await after_commit(
+                self.target,
+                lambda: self._created(value.id, value.kind),
+            )
         return BatchReference(value.id, value.root_id, value.created)
+
+    def _created(self, batch_id: UUID, kind: str) -> None:
+        try:
+            self.observer.batch_created(batch_id=batch_id, kind=kind)
+        except Exception:  # ruff: ignore[blind-except]  # observer must not affect committed accounting
+            _log.exception("Observer.batch_created failed for batch_id=%s kind=%s", batch_id, kind)
 
     async def add(self, batch_id: UUID, calls: Sequence[TaskCall]) -> None:
         _ = await self.producer.add_items(self.conn, batch_id, calls)
@@ -146,7 +163,9 @@ class _Facade:
     _finalizer: Finalizer | None = None
     _background: set[asyncio.Task[None]] = field(default_factory=set, init=False)
 
-    def install(self, adapter: Dispatcher, worker_factory: WorkerFactory) -> None:
+    def install(  # ruff: ignore[too-many-locals]  # composition root names each service explicitly
+        self, adapter: Dispatcher, worker_factory: WorkerFactory
+    ) -> None:
         value = self.installation
         settings = self.settings
         progress_settings = ProgressSettings(
@@ -156,6 +175,7 @@ class _Facade:
         )
         worker_id = self.ids.new_id()
         slot = worker_id.int % settings.counter_slots
+        retry = RetryPolicy(on_retry=self._notify_retry)
         notifier = ProgressNotifier(
             engine=value.engine,
             throttle=settings.watch_throttle,
@@ -172,6 +192,7 @@ class _Facade:
                 grace=settings.relay_grace,
                 slot=slot,
             ),
+            retry=retry,
         )
         self._relay = relay
         finalizer = Finalizer(
@@ -180,7 +201,11 @@ class _Facade:
             clock=self.clock,
             ids=self.ids,
             hooks=self.hooks,
-            settings=FinalizerSettings(slot=slot, hook_timeout=settings.hook_timeout),
+            settings=FinalizerSettings(
+                slot=slot,
+                hook_timeout=settings.hook_timeout,
+                retry=retry,
+            ),
             observer=self.observer,
             relay=relay,
             progress=notifier,
@@ -191,7 +216,11 @@ class _Facade:
             engine=value.engine,
             clock=self.clock,
             hooks=self.hooks,
-            settings=PolicyEnforcerSettings(slot=slot, hook_timeout=settings.hook_timeout),
+            settings=PolicyEnforcerSettings(
+                slot=slot,
+                hook_timeout=settings.hook_timeout,
+                retry=retry,
+            ),
             observer=self.observer,
         )
         codec = adapter if isinstance(adapter, PayloadCodec) else SerializerCodec(self.serializer)
@@ -217,6 +246,7 @@ class _Facade:
                 max_batch=settings.completer_max_batch,
                 backpressure=settings.completer_backpressure,
                 lease_ttl=settings.lease_ttl,
+                retry=retry,
             ),
             observer=self.observer,
             triggers=CompleterTriggers(
@@ -254,6 +284,7 @@ class _Facade:
             settings=SnapshotterSettings(
                 hook_timeout=settings.hook_timeout,
                 progress=progress_settings,
+                retry=retry,
             ),
             observer=self.observer,
         )
@@ -267,7 +298,10 @@ class _Facade:
                 slot=slot,
                 finalize_grace=settings.finalize_grace,
                 hook_backoff_max=settings.hook_backoff_max,
+                lease_ttl=settings.lease_ttl,
+                retry=retry,
             ),
+            observer=self.observer,
         )
         self._maintenance = Maintenance(
             engine=value.engine,
@@ -337,14 +371,28 @@ class _Facade:
                 target,
                 self._notify_commit,
                 self._finalize_commit,
+                self.observer,
             )
             return
         async with self.installation.engine.begin() as conn:
-            yield _Writer(producer, conn, conn, self._notify_commit, self._finalize_commit)
+            yield _Writer(
+                producer,
+                conn,
+                conn,
+                self._notify_commit,
+                self._finalize_commit,
+                self.observer,
+            )
 
     def _notify_commit(self, batch_id: UUID) -> None:
         relay = self._require(self._relay)
         relay.kick([batch_id])
+
+    def _notify_retry(self, sqlstate: str) -> None:
+        try:
+            self.observer.transaction_retry(sqlstate=sqlstate)
+        except Exception:  # ruff: ignore[blind-except]  # observer must not affect retries
+            _log.exception("Observer.transaction_retry failed for SQLSTATE %s", sqlstate)
 
     def _finalize_commit(self, batch_id: UUID) -> None:
         self._notify_commit(batch_id)

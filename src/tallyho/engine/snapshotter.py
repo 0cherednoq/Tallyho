@@ -291,7 +291,14 @@ class Snapshotter:
             _log.exception("Observer.hook_missing упал")
 
     def _notify_failed(self, summary: BatchSummary, error: Exception, attempt: int) -> None:
-        _log.error("Tx-хук снимка батча %s упал: %s", summary.id, error)
+        _log.error(
+            "Tx hook failed batch_id=%s kind=%s hook=%s attempt=%d error_type=%s",
+            summary.id,
+            summary.kind,
+            _HOOK_NAME,
+            attempt,
+            type(error).__name__,
+        )
         try:
             self.observer.hook_failed(
                 batch_id=summary.id,

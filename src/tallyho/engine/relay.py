@@ -48,6 +48,7 @@ from sqlalchemy import (
     SmallInteger,
     Uuid,
     any_,
+    case,
     delete,
     func,
     literal,
@@ -63,7 +64,7 @@ from tallyho.protocols.broker import Message
 from tallyho.protocols.observer import NullObserver
 from tallyho.storage.counters import CounterDelta, upsert_slots
 from tallyho.storage.now import sql_now
-from tallyho.storage.tx import run_transaction
+from tallyho.storage.tx import RetryPolicy, run_transaction
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Mapping, Sequence
@@ -86,6 +87,18 @@ _MAX_ATTEMPTS: Final = 32767
 """Предел ``th_outbox.attempts`` (smallint): счётчик захватов не переполняется."""
 
 _LOCK_PERSON: Final = b"tallyho.window"
+_SelectedRow = tuple[
+    UUID,
+    int,
+    UUID,
+    str | None,
+    bytes | None,
+    object,
+    bool,
+    int | None,
+    int | None,
+    float,
+]
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -140,6 +153,7 @@ class _Row:
     paused: bool
     max_in_flight: int | None
     item_state: int | None
+    lag: float
 
     @property
     def broken(self) -> bool:
@@ -171,6 +185,7 @@ class _Claim:
     changed: int
     """Сколько из них захвачено, запарковано или удалено."""
     messages: tuple[Message, ...]
+    lag: float
 
 
 def _uuids(ids: Iterable[UUID]) -> ColumnElement[Sequence[UUID]]:
@@ -229,6 +244,7 @@ class Relay:
     observer: Observer = field(default_factory=NullObserver)
     settings: RelaySettings = field(default_factory=RelaySettings)
     tx_settings: TxSettings | None = None
+    retry: RetryPolicy = field(default_factory=RetryPolicy)
     _kicked: set[UUID] = field(init=False, default_factory=set[UUID])
     _wakeup: asyncio.Event = field(init=False, default_factory=asyncio.Event)
 
@@ -287,7 +303,7 @@ class Relay:
         async def refill(conn: AsyncConnection) -> None:
             _ = await refill_window(conn, self.tables)
 
-        await run_transaction(self.engine, refill, settings=self.tx_settings)
+        await run_transaction(self.engine, refill, settings=self.tx_settings, policy=self.retry)
         return await self._drain(None)
 
     # --- раунд -------------------------------------------------------------
@@ -296,11 +312,16 @@ class Relay:
         total = 0
         claim = functools.partial(self._claim, batch_ids=batch_ids)
         while True:
-            claimed = await run_transaction(self.engine, claim, settings=self.tx_settings)
+            claimed = await run_transaction(
+                self.engine, claim, settings=self.tx_settings, policy=self.retry
+            )
+            self._notify_lag(claimed.lag)
             sent, failed = await self._dispatch(claimed.messages)
             if sent:
                 confirm = functools.partial(self._confirm, sent=sent)
-                await run_transaction(self.engine, confirm, settings=self.tx_settings)
+                await run_transaction(
+                    self.engine, confirm, settings=self.tx_settings, policy=self.retry
+                )
             total += len(sent)
             if failed or claimed.selected < self.settings.chunk or not claimed.changed:
                 return total
@@ -347,6 +368,10 @@ class Relay:
             selected=len(rows),
             changed=len(send) + len(park) + len(drop),
             messages=tuple(row.message() for row in send),
+            lag=max(
+                (row.lag for row in rows),
+                default=0.0,
+            ),
         )
 
     async def _select_due(
@@ -356,6 +381,16 @@ class Relay:
         item = self.tables.item
         batch = self.tables.batch
         now = sql_now(self.clock)
+        lag = cast(
+            "ColumnElement[float]",
+            case(
+                (
+                    outbox.c.available_at > _infinity(negative=True),
+                    func.extract("epoch", now - outbox.c.available_at),
+                ),
+                else_=literal(0.0),
+            ),
+        )
         cutoff = now if batch_ids is not None else now - literal(self.settings.grace, Interval())
         stmt = (
             select(
@@ -368,6 +403,7 @@ class Relay:
                 batch.c.paused_at.is_not(None),
                 batch.c.max_in_flight,
                 item.c.state,
+                lag,
             )
             .select_from(
                 outbox.outerjoin(item, item.c.id == outbox.c.item_id).outerjoin(
@@ -382,6 +418,7 @@ class Relay:
         if batch_ids is not None:
             stmt = stmt.where(outbox.c.batch_id == any_(_uuids(sorted(batch_ids))))
         result = await conn.execute(stmt)
+        typed_rows = cast("Iterable[_SelectedRow]", result)
         return [
             _Row(
                 id=row_id,
@@ -393,6 +430,7 @@ class Relay:
                 paused=bool(paused),
                 max_in_flight=max_in_flight,
                 item_state=item_state,
+                lag=max(0.0, float(lag_seconds)),
             )
             for (
                 row_id,
@@ -404,7 +442,8 @@ class Relay:
                 paused,
                 max_in_flight,
                 item_state,
-            ) in result
+                lag_seconds,
+            ) in typed_rows
         ]
 
     async def _fit_window(
@@ -489,6 +528,12 @@ class Relay:
             self.observer.relay_dispatched(messages=messages, duration=duration)
         except Exception:  # ruff: ignore[blind-except]  # наблюдатель не влияет на учёт
             _log.exception("relay: Observer.relay_dispatched упал")
+
+    def _notify_lag(self, seconds: float) -> None:
+        try:
+            self.observer.relay_lag(seconds=seconds)
+        except Exception:  # ruff: ignore[blind-except]  # observer must not affect delivery
+            _log.exception("relay: Observer.relay_lag failed")
 
     async def _confirm(self, conn: AsyncConnection, sent: Sequence[Message]) -> None:
         outbox = self.tables.outbox

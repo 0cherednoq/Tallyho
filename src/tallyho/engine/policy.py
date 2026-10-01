@@ -25,7 +25,13 @@ from tallyho.model.views import BatchSummary
 from tallyho.protocols.observer import NullObserver
 from tallyho.storage.counters import CounterDelta, read_counters, upsert_metrics, upsert_slots
 from tallyho.storage.now import sql_now
-from tallyho.storage.tx import TxSettings, hook_session, own_transaction, run_transaction
+from tallyho.storage.tx import (
+    RetryPolicy,
+    TxSettings,
+    hook_session,
+    own_transaction,
+    run_transaction,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Mapping
@@ -71,6 +77,7 @@ class PolicyEnforcerSettings:
 
     slot: int = 0
     hook_timeout: timedelta = timedelta(seconds=10)
+    retry: RetryPolicy = field(default_factory=RetryPolicy)
 
     def __post_init__(self) -> None:
         """Проверить слот и таймаут.
@@ -131,7 +138,10 @@ class PolicyEnforcer:
         for batch_id in sorted(set(batch_ids)):
             try:
                 applied = await run_transaction(
-                    self.engine, partial(self._attempt, batch_id=batch_id), settings=settings
+                    self.engine,
+                    partial(self._attempt, batch_id=batch_id),
+                    settings=settings,
+                    policy=self.settings.retry,
                 )
             except (_NoBreachError, HookMissingError):
                 continue
@@ -446,6 +456,14 @@ class PolicyEnforcer:
         return int(attempt or 0)
 
     def _notify_failed(self, failure: _HookCallError, attempt: int) -> None:
+        _log.error(
+            "Tx hook failed batch_id=%s kind=%s hook=%s attempt=%d error_type=%s",
+            failure.batch_id,
+            failure.kind,
+            _HOOK,
+            attempt,
+            type(failure.error).__name__,
+        )
         try:
             self.observer.hook_failed(
                 batch_id=failure.batch_id,

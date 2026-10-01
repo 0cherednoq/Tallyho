@@ -46,6 +46,7 @@ psycopg = ["psycopg[binary]>=3.1"]
 flexiq = ["flexiq>=2.0,<3"]
 alembic = ["alembic>=1.13"]
 testing = ["pytest-asyncio>=1.4"]
+otel = ["opentelemetry-api>=1.25"]
 
 [project.scripts]
 tallyho = "tallyho.cli:main"
@@ -77,6 +78,7 @@ test = [
   "pydantic>=2.12",
   "testcontainers[postgres]>=4.9",
   "asyncpg>=0.29",
+  "opentelemetry-sdk>=1.25",
 ]
 dev = [
   { include-group = "lint" },
@@ -314,7 +316,7 @@ name = "Layers (docs/ARCHITECTURE.md section 3.3): upper may import lower, never
 type = "layers"
 containers = ["tallyho"]
 layers = [
-  "cli | adapters | testing",
+  "cli | adapters | testing | observability",
   "api | runtime",
   "engine",
   "hooks | storage",

@@ -436,6 +436,8 @@ class _Applied:
     """Результат транзакции: что вернуть в futures и что сделать после commit."""
 
     claims: dict[UUID, ClaimResult] = field(default_factory=dict["UUID", ClaimResult])
+    claimed: list[tuple[UUID, UUID, int]] = field(default_factory=list[tuple["UUID", "UUID", int]])
+    created: list[tuple[UUID, str]] = field(default_factory=list[tuple["UUID", str]])
     beating: set[UUID] = field(default_factory=set["UUID"])
     """Items, чей lease продлён heartbeat'ом: lease всё ещё у этого процесса."""
     released: set[UUID] = field(default_factory=set["UUID"])
@@ -698,6 +700,8 @@ class _Tx:
         for item_id in item_ids:
             self.leases[item_id] = _LeaseRow(worker_id=self.c.settings.worker_id, live=True)
             self._result(item_id, ClaimOutcome.CLAIMED)
+            row = self.items[item_id]
+            self.applied.claimed.append((row.batch_id, item_id, row.attempt))
 
     async def _park(self, item_ids: list[UUID]) -> None:
         # Пауза (UC-11): Item обратно в outbox до resume; relay его снова отправит.
@@ -962,6 +966,7 @@ class _Tx:
         if ref.created:
             self.deltas[parent_id] += CounterDelta(total=1)
             self.applied.invalidate_trees.add(ref.root_id)
+            self.applied.created.append((ref.id, ref.kind))
         calls = list(request.calls)
         over_items = parent.max_items is not None and total.tree_total >= parent.max_items
         accepted = [] if over_items else calls
@@ -1476,6 +1481,7 @@ class Completer:
             future.cancel()
             raise InvalidStateError(_CLOSED)
         self._buffer.append(op)
+        self._notify_buffer()
         self._wakeup.set()
         if len(self._buffer) >= self.settings.max_batch:
             self._full.set()
@@ -1497,6 +1503,7 @@ class Completer:
                         _ = await self._full.wait()
             ops = self._buffer[: self.settings.max_batch]
             del self._buffer[: self.settings.max_batch]
+            self._notify_buffer()
             await self._flush(ops)
 
     # --- транзакция --------------------------------------------------------------------
@@ -1619,6 +1626,14 @@ class Completer:
         # Исключение наблюдателя не должно ломать учёт: только лог.
         try:
             self.observer.completer_flush(items=items, duration=duration)
+            for batch_id, kind in applied.created:
+                self.observer.batch_created(batch_id=batch_id, kind=kind)
+            for batch_id, item_id, attempt in applied.claimed:
+                self.observer.item_claimed(
+                    batch_id=batch_id,
+                    item_id=item_id,
+                    attempt=attempt,
+                )
             for batch_id, item_id, attempt in applied.cancelled:
                 self.observer.item_finished(
                     batch_id=batch_id,
@@ -1637,6 +1652,12 @@ class Completer:
                 )
         except Exception:  # ruff: ignore[blind-except]  # сбой наблюдателя не влияет на учёт
             _log.exception("Observer упал на событии Completer")
+
+    def _notify_buffer(self) -> None:
+        try:
+            self.observer.completer_buffer(items=len(self._buffer))
+        except Exception:  # ruff: ignore[blind-except]  # observer must not affect accounting
+            _log.exception("Observer.completer_buffer failed")
 
     async def _after_commit(self, applied: _Applied) -> None:
         if self.triggers.tree_cache is not None:

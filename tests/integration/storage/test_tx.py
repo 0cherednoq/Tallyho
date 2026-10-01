@@ -155,6 +155,7 @@ async def test_own_transaction_rolls_back_on_error(engine: AsyncEngine, probe: P
 
 async def test_retries_on_artificial_deadlock(engine: AsyncEngine, probe: Probe) -> None:
     attempts: list[int] = []
+    retried: list[str] = []
     sleeps = Sleeps()
 
     async def work(conn: AsyncConnection) -> str:
@@ -164,11 +165,18 @@ async def test_retries_on_artificial_deadlock(engine: AsyncEngine, probe: Probe)
             _ = await conn.execute(text(_raise_sql("40P01")))
         return "done"
 
-    result = await run_transaction(engine, work, policy=FAST, rng=seeded(3), sleep=sleeps)
+    policy = RetryPolicy(
+        attempts=FAST.attempts,
+        base_delay=FAST.base_delay,
+        max_delay=FAST.max_delay,
+        on_retry=retried.append,
+    )
+    result = await run_transaction(engine, work, policy=policy, rng=seeded(3), sleep=sleeps)
 
     assert result == "done"
     assert attempts == [0, 1, 2]
     assert len(sleeps.delays) == 2
+    assert retried == ["40P01", "40P01"]
     # Упавшие попытки откатились целиком.
     assert await committed_ids(engine, probe) == [3]
 

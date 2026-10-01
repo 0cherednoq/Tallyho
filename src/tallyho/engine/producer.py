@@ -328,6 +328,7 @@ class BatchRef:
     id: UUID
     root_id: UUID
     created: bool
+    kind: str = ""
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -397,7 +398,7 @@ class Producer:
         )
         inserted = await conn.scalar(stmt)
         if inserted is not None:
-            return BatchRef(id=inserted, root_id=inserted, created=True)
+            return BatchRef(id=inserted, root_id=inserted, created=True, kind=spec.kind)
         # Конфликт возможен только при заданном key: партиальный индекс его требует.
         found = await conn.execute(
             select(batch.c.id).where(
@@ -405,7 +406,7 @@ class Producer:
             )
         )
         existing = found.scalar_one()
-        return BatchRef(id=existing, root_id=existing, created=False)
+        return BatchRef(id=existing, root_id=existing, created=False, kind=spec.kind)
 
     # --- под-батч и этапы --------------------------------------------------
 
@@ -523,7 +524,7 @@ class Producer:
         )
         if spec.fed_by:
             await self.add_feed(conn, child_id, spec.fed_by)
-        return BatchRef(id=child_id, root_id=parent.root_id, created=True)
+        return BatchRef(id=child_id, root_id=parent.root_id, created=True, kind=kind)
 
     async def _find_child(
         self, conn: AsyncConnection, parent: _BatchRow, key: str

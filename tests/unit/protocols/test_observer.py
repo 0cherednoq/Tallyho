@@ -14,6 +14,8 @@ ITEM = UUID("01920000-0000-7000-8000-000000000001")
 
 
 def _emit_all(observer: Observer) -> None:
+    observer.batch_created(batch_id=BATCH, kind="mailing")
+    observer.item_claimed(batch_id=BATCH, item_id=ITEM, attempt=1)
     observer.item_finished(
         batch_id=BATCH, item_id=ITEM, result=ResultClass.OK, label="sent", attempt=1
     )
@@ -24,6 +26,10 @@ def _emit_all(observer: Observer) -> None:
     observer.hook_missing(batch_id=BATCH, kind="mailing", hook="on_finalized")
     observer.relay_dispatched(messages=10, duration=0.5)
     observer.completer_flush(items=3, duration=0.01)
+    observer.relay_lag(seconds=0.25)
+    observer.completer_buffer(items=2)
+    observer.oldest_lease(seconds=4.0)
+    observer.transaction_retry(sqlstate="40P01")
 
 
 class _FlushCounter(NullObserver):

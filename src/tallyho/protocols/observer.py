@@ -25,7 +25,15 @@ __all__ = ["NullObserver", "Observer"]
 
 @runtime_checkable
 class Observer(Protocol):
-    """Получатель событий движка."""
+    """Receive synchronous, fire-and-forget engine lifecycle events."""
+
+    def batch_created(self, *, batch_id: UUID, kind: str) -> None:
+        """A batch was created and its transaction committed."""
+        ...
+
+    def item_claimed(self, *, batch_id: UUID, item_id: UUID, attempt: int) -> None:
+        """An Item lease was acquired and its transaction committed."""
+        ...
 
     def item_finished(
         self,
@@ -99,6 +107,22 @@ class Observer(Protocol):
         """
         ...
 
+    def relay_lag(self, *, seconds: float) -> None:
+        """Age of the oldest outbox record selected by relay."""
+        ...
+
+    def completer_buffer(self, *, items: int) -> None:
+        """Current number of operations waiting in Completer."""
+        ...
+
+    def oldest_lease(self, *, seconds: float) -> None:
+        """Age of the oldest active lease since its latest acquisition/heartbeat."""
+        ...
+
+    def transaction_retry(self, *, sqlstate: str) -> None:
+        """An internal transaction will be retried for a retryable SQLSTATE."""
+        ...
+
 
 class NullObserver(Observer):
     """Наблюдатель по умолчанию: игнорирует все события."""
@@ -135,4 +159,28 @@ class NullObserver(Observer):
 
     @override
     def completer_flush(self, *, items: int, duration: float) -> None:
+        return None
+
+    @override
+    def relay_lag(self, *, seconds: float) -> None:
+        return None
+
+    @override
+    def completer_buffer(self, *, items: int) -> None:
+        return None
+
+    @override
+    def oldest_lease(self, *, seconds: float) -> None:
+        return None
+
+    @override
+    def transaction_retry(self, *, sqlstate: str) -> None:
+        return None
+
+    @override
+    def batch_created(self, *, batch_id: UUID, kind: str) -> None:
+        return None
+
+    @override
+    def item_claimed(self, *, batch_id: UUID, item_id: UUID, attempt: int) -> None:
         return None
