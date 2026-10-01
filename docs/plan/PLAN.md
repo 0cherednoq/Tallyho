@@ -150,6 +150,7 @@
                                            Ф10 надёжность, наблюдаемость, CLI ◄───────────────────┤
                                            Ф11 приёмочный стенд ACCEPTANCE ◄──────────────────────┘
                                            Ф12 документация и релиз
+                                           Ф13 расширения перед релизом (атрибуты, экспорт исходов) — до Ф11 и Ф12
 ```
 
 Слои пакета заданы import-linter в `pyproject.toml` (ARCHITECTURE §3.3):
@@ -467,8 +468,8 @@
 * **Сделать:** контроллер (kill -9 воркеров, `docker kill`/`pg_ctl stop -m immediate`, toxiproxy toxics, libfaketime, SIGTERM, `requeue/replay/retry_dead`, долгая транзакция), расписание от seed, `make acceptance SEED=... SCENARIO=... CHAOS=...` (или `poe acceptance`), журнал хаоса.
 * **DoD:** каждый A-CH на S1/S2/S3 по 2 минуты локально зелёный. Длинные прогоны (10/60 мин, 2 ч) — `human`.
 
-#### T11.4 — Сценарии A-UC-01…20 на стенде
-* **Зависит:** T11.2
+#### T11.4 — Сценарии A-UC-01…22 на стенде
+* **Зависит:** T11.2, T13.6
 * **Док:** ACCEPTANCE §7
 * **Сделать:** по сценарию на каждый A-UC поверх стенда с оракулом.
 * **DoD:** все A-UC зелёные на функциональном объёме.
@@ -482,7 +483,7 @@
 ### Ф12. Документация и релиз
 
 #### T12.1 — Пользовательская документация
-* **Зависит:** T9.3
+* **Зависит:** T9.3, T13.6
 * **Док:** ACCEPTANCE чек-лист §11 (ограничения v1), COUNTERS §3.6 (эксплуатация), §2 P10 (pgbouncer)
 * **Сделать:** README (быстрый старт), `docs/guide/`: установка и миграции, батчи и конвейеры, хуки, эксплуатация PG (autovacuum, `backend_xmin`, pgbouncer), ограничения v1 (только PG, `pool="thread"`, несовместимые опции flexiq, мягкий `max_items`), CHANGELOG.
 * **DoD:** примеры исполняются (T9.3).
@@ -495,5 +496,59 @@
 
 #### T12.3 — Подписание релиза
 * **Зависит:** всё
-* **Сделать:** чек-лист ACCEPTANCE §11: pre-release прогон, 3 зелёных nightly, замеры на эталонном стенде, решение владельца о целевых числах.
+* **Сделать:** чек-лист ACCEPTANCE §11: pre-release прогон, 3 зелёных nightly, замеры на эталонном стенде, решение владельца о целевых числах; решение о слиянии миграций v1…vN в одну базовую (D-042).
 * **Статус изначально:** `human`.
+
+### Ф13. Расширения перед релизом: атрибуты и экспорт исходов Items
+
+Обоснование, обзор библиотек и отложенные варианты — [V1_EXTENSIONS_PLAN.md](V1_EXTENSIONS_PLAN.md); решения — D-038…D-042. Фаза выполняется **до** Ф11 и Ф12: стенд, оракул и гайды должны сразу покрывать расширения.
+
+Волны: T13.0 → {Fix-2, T13.1, T13.2, T13.5} → T13.3 → T13.4 → T13.6.
+
+#### T13.0 — Зафиксировать решения в документах
+* **Зависит:** —
+* **Док:** V1_EXTENSIONS_PLAN.md
+* **Сделать:** ARCHITECTURE §1, §2, §3.4, §5.1–§5.2, §7.6, UC-14, UC-16, §11.2, §12.9, §15, §16; ACCEPTANCE I-14, A-UC-21/22, A-AT-01…12; DECISIONS D-038…D-042; карточки и строки Ф13.
+* **DoD:** в ARCHITECTURE нет API, отсутствующего в карточках Ф13.
+
+#### Fix-2 — `retry_failed()` сбрасывает `released_at`
+* **Зависит:** T13.0
+* **Док:** ARCHITECTURE §7.6, UC-14, UC-16; ACCEPTANCE I-14, A-UC-22
+* **Сделать:** при переоткрытии дерева `released_at = NULL` у корня; `release()` нужно вызвать заново после новой финализации. Функции мутационного gate (D-037) не менять.
+* **DoD:** интеграционный тест: финализация → `release()` → `retry_failed()` → финализация → retention не удаляет дерево до второго `release()`, после него удаляет.
+
+#### T13.1 — model: атрибуты и `memo`
+* **Зависит:** T13.0
+* **Док:** ARCHITECTURE §2, §5.1 (правила атрибутов), §11.2, §15; ACCEPTANCE A-AT-02, A-AT-03
+* **Сделать:** `model/attributes.py`: одна функция нормализации для записи и фильтра (`str | int | bool`, `UUID → str`, `int` в пределах `bigint`), запрет префикса `tallyho.` и пустого ключа, лимиты через неизменяемый `AttributeLimits`, проверка `memo` (JSON-объект, размер); `InvalidAttributesError(ConfigurationError)` в `model/errors.py`. DTO `BatchInfo`, `BatchPage` и поля `attributes`/`memo` в `BatchView`, `attributes` в `BatchSummary` (замороженные словари, по умолчанию пустые).
+* **DoD:** юнит-тесты границы каждого лимита и каждого запрещённого типа; `bool` не принимается за `int` и наоборот.
+
+#### T13.2 — storage: схема v3
+* **Зависит:** T13.0
+* **Док:** ARCHITECTURE §5.1, §5.2; ACCEPTANCE A-AT-12; D-042
+* **Сделать:** таблица `th_batch_attr(batch_id PK, attributes jsonb NOT NULL, memo jsonb NULL)` + GIN `jsonb_path_ops` по `attributes`; индекс `th_batch (kind, id) WHERE parent_id IS NULL`; встроенная миграция v3 и Alembic `upgrade(..., version=3)`; golden-DDL; `SCHEMA_VERSION = 3`.
+* **DoD:** каталог после `migrate` совпадает с `create_all`; путь v2 → v3 на непустой БД; исторические golden v1 и v2 не изменились.
+
+#### T13.3 — engine + api: запись и чтение атрибутов
+* **Зависит:** T13.1, T13.2
+* **Док:** ARCHITECTURE §5.1, §11.2; ACCEPTANCE A-AT-01, 04, 05, 10, 11
+* **Сделать:** `th.batch(..., attributes=, memo=)` только для корня; лимиты — в `Settings` (§15); запись строки `th_batch_attr` в транзакции создания, только если есть атрибуты или `memo`, и только когда корень действительно создан (повтор `(kind, key)` — первый выигрывает); чтение — в том же statement дерева (`Reads._forest_statement`), значения корня раздаются всем узлам `BatchView`/`BatchSummary`; retention удаляет side-строку; атрибуты и `memo` не передаются в `Observer` и логи.
+* **DoD:** rollback транзакции пользователя не оставляет строки; `on_finalized` и `on_progress` под-батча видят атрибуты корня; тест с секретом в атрибуте и `caplog`; число SQL-запросов `view()` и тика Snapshotter не выросло.
+
+#### T13.4 — Листинг батчей
+* **Зависит:** T13.3
+* **Док:** ARCHITECTURE §11.2 («Листинг батчей»), §5.2; ACCEPTANCE A-AT-06, A-AT-07
+* **Сделать:** `Reads.list_batches` и `th.list_batches(kinds=, states=, attributes=, created_after=, created_before=, limit=, cursor=)` → `BatchPage`; только корни, keyset по `id DESC`; непрозрачный курсор (испорченный — `ConfigurationError`); запросы зарегистрированы в `storage.hot_queries`.
+* **DoD:** пагинация без пропусков и дублей при параллельном создании батчей; `{"n": 1}` не находит `{"n": "1"}`; EXPLAIN-гард зелёный (листинг по `kind` и по `attributes`).
+
+#### T13.5 — `handle.items(states=, labels=)`
+* **Зависит:** T13.0
+* **Док:** ARCHITECTURE §11.2 («Чтение Items»), §15 (`items_scan_window`); ACCEPTANCE A-AT-08, A-AT-09; D-041
+* **Сделать:** сигнатура `items(*, states: Collection[ItemState] | None = None, labels: Collection[str] | None = None)` в `Reads`, фасаде engine и `BatchHandle`; без фильтров — `ConfigurationError`; `labels=` — через `th_item_mark`; `states=` — окнами по `(batch_id, id)`, курсор сдвигается на последнюю строку окна и без совпадений; оба фильтра — пересечение; настройка `items_scan_window`. Обновить все вызовы `items(label=)` в коде, тестах и примерах.
+* **DoD:** отменённые Items перечисляются; запрос окна в `storage.hot_queries`, EXPLAIN-гард без `Seq Scan`; `slow`-замер на батче в 1 млн Items с 0,1% совпадений: найдены все, ни один statement не читает больше окна, время — в журнал PROGRESS; `BatchPurged` для удалённого батча, как раньше.
+
+#### T13.6 — Рецепт финального экспорта: пример, тесты, документация
+* **Зависит:** Fix-2, T13.4, T13.5
+* **Док:** ARCHITECTURE §12.9; ACCEPTANCE A-UC-21, A-UC-22
+* **Сделать:** в `tests/examples/mailing` — отдельный сценарий на малом объёме (до 1 000 контактов) с таблицей `mailing_delivery`: задача пишет строку и вызывает `complete_in`; `on_finalized` ставит счётчики и `settling`; `settle_campaign` экспортирует `ERROR`/`CANCELLED` этапа `send`, закрывает остаток, ставит итоговый статус и вызывает `release()` корня одной транзакцией. Атрибуты и листинг — в том же сценарии. Маркированный smoke-блок в ARCHITECTURE §12.9 и упоминание в README.
+* **DoD:** эталонный сценарий `(9100, 600, 300, 40)` не изменился; случаи: `exhausted`, отмена посреди разворачивания (строки без Items закрыты запросом по остатку), падение колбэка посередине и повтор, `retry_failed()` после settle с повторным экспортом; retention не удаляет дерево до `release()`; документационные тесты зелёные.
