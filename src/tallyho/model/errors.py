@@ -22,6 +22,7 @@ __all__ = [
     "DownstreamFinalized",
     "HookMissingError",
     "HookTransactionError",
+    "InvalidAttributesError",
     "InvalidStateError",
     "NotFoundError",
     "SealError",
@@ -112,6 +113,14 @@ class HookMissingError(ConfigurationError):
         super().__init__(f"для kind={kind!r} не зарегистрирован tx-хук {hook!r}; {hint}")
         self.kind = kind
         self.hook = hook
+
+
+class InvalidAttributesError(ConfigurationError):
+    """``attributes`` или ``memo`` батча нарушают правила ARCHITECTURE §5.1, §15.
+
+    Сообщение называет ключ и нарушенное правило, но не содержит значения:
+    значения атрибутов могут быть секретами.
+    """
 
 
 class UnsupportedOption(ConfigurationError):  # ruff: ignore[error-suffix-on-exception-name]  # имя из ARCHITECTURE §11.4

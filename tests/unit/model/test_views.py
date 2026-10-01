@@ -10,7 +10,15 @@ from uuid import UUID
 import pytest
 
 from tallyho.model.states import BatchState, CancelReason, ItemState
-from tallyho.model.views import BatchSummary, BatchView, InFlightItem, ItemView, Progress
+from tallyho.model.views import (
+    BatchInfo,
+    BatchPage,
+    BatchSummary,
+    BatchView,
+    InFlightItem,
+    ItemView,
+    Progress,
+)
 
 BATCH_ID = UUID(int=1)
 CHILD_ID = UUID(int=2)
@@ -127,3 +135,50 @@ def test_in_flight_item_fields() -> None:
     assert item.progress_done is None
     assert item.progress_total is None
     assert dataclasses.replace(item, progress_done=3, progress_total=10).progress_done == 3
+
+
+def test_attributes_default_to_empty_and_memo_to_none() -> None:
+    assert _summary().attributes == {}
+    view = _view()
+    assert view.attributes == {}
+    assert view.memo is None
+
+
+def test_attributes_and_memo_are_read_only_copies() -> None:
+    attributes: dict[str, str | int | bool] = {
+        "tenant": "acme",
+        "campaign_id": 42,
+        "dry_run": False,
+    }
+    memo: dict[str, object] = {"note": "x"}
+    summary = dataclasses.replace(_summary(), attributes=attributes)
+    view = dataclasses.replace(_view(), attributes=attributes, memo=memo)
+    attributes["tenant"] = "other"
+    memo["note"] = "y"
+    assert summary.attributes == {"tenant": "acme", "campaign_id": 42, "dry_run": False}
+    assert view.attributes["tenant"] == "acme"
+    assert view.memo == {"note": "x"}
+    with pytest.raises(TypeError):
+        cast("dict[str, object]", summary.attributes)["tenant"] = "z"
+    with pytest.raises(TypeError):
+        cast("dict[str, object]", view.memo)["note"] = "z"
+
+
+def test_batch_info_and_page() -> None:
+    attributes: dict[str, str | int | bool] = {"tenant": "acme"}
+    info = BatchInfo(
+        id=BATCH_ID,
+        kind="k",
+        key="k:1",
+        state=BatchState.SUCCEEDED,
+        attributes=attributes,
+        created_at=NOW,
+    )
+    attributes["tenant"] = "other"
+    assert info.attributes == {"tenant": "acme"}
+    assert info.finished_at is None
+    with pytest.raises(TypeError):
+        cast("dict[str, object]", info.attributes)["tenant"] = "z"
+    page = BatchPage(items=(info,))
+    assert page.next_cursor is None
+    assert dataclasses.replace(page, next_cursor="c").items == (info,)

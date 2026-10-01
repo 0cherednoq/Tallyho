@@ -8,7 +8,7 @@ import pytest
 
 import tallyho
 import tallyho.model
-from tallyho.model import calls, errors, policy, progress, states, views
+from tallyho.model import attributes, calls, errors, policy, progress, states, views
 
 # Снимок родителей: пользователи ловят ошибки по базовым классам.
 PARENTS: dict[type[errors.TallyhoError], type[errors.TallyhoError]] = {
@@ -23,6 +23,7 @@ PARENTS: dict[type[errors.TallyhoError], type[errors.TallyhoError]] = {
     errors.DownstreamFinalized: errors.InvalidStateError,
     errors.BatchPurged: errors.NotFoundError,
     errors.HookMissingError: errors.ConfigurationError,
+    errors.InvalidAttributesError: errors.ConfigurationError,
     errors.UnsupportedOption: errors.ConfigurationError,
 }
 
@@ -66,6 +67,7 @@ def test_model_package_reexports_public_names() -> None:
     sources |= {name: getattr(policy, name) for name in policy.__all__}
     sources |= {name: getattr(calls, name) for name in calls.__all__}
     sources |= {name: getattr(progress, name) for name in progress.__all__}
+    sources |= {name: getattr(attributes, name) for name in attributes.__all__}
     for constant in (
         "TERMINAL_THRESHOLD",
         "DEFAULT_ESTIMATE_MIN_BASIS",

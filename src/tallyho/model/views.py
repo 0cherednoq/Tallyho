@@ -1,13 +1,14 @@
 """Value-объекты чтения: прогресс, сводка для хуков, представления батча и Item.
 
 Все классы — неизменяемые ``dataclass(frozen=True, slots=True)`` (ARCHITECTURE §3.4).
-Словари (``labels``, ``metrics``, ``children``) при создании копируются
-в ``MappingProxyType``: сводку, переданную в tx-хук, нельзя поменять на месте.
+Словари (``labels``, ``metrics``, ``children``, ``attributes``, верхний уровень
+``memo``) при создании копируются в ``MappingProxyType``: сводку, переданную
+в tx-хук, нельзя поменять на месте.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import TYPE_CHECKING, TypeVar
 
@@ -16,9 +17,12 @@ if TYPE_CHECKING:
     from datetime import datetime, timedelta
     from uuid import UUID
 
+    from tallyho.model.attributes import AttributeValue
     from tallyho.model.states import BatchState, CancelReason, ItemState
 
 __all__ = [
+    "BatchInfo",
+    "BatchPage",
     "BatchSummary",
     "BatchView",
     "InFlightItem",
@@ -36,6 +40,15 @@ def _freeze(mapping: Mapping[str, _V]) -> Mapping[str, _V]:
         ``MappingProxyType`` над копией ``mapping``.
     """
     return MappingProxyType(dict(mapping))
+
+
+def _no_attributes() -> Mapping[str, AttributeValue]:
+    """Значение по умолчанию для ``attributes``: у батча их нет.
+
+    Returns:
+        Пустой неизменяемый словарь.
+    """
+    return MappingProxyType({})
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -86,6 +99,7 @@ class BatchSummary:
     разбивка итогов по меткам, ``metrics`` — пользовательские счётчики
     (``th.item.incr``). ``seq`` монотонно растёт в пределах батча (снимки и
     финализация). ``reason`` — причина запроса отмены, если он был.
+    ``attributes`` — атрибуты корня дерева, одинаковые у любого его узла (§5.1).
     """
 
     id: UUID
@@ -99,12 +113,14 @@ class BatchSummary:
     seq: int
     reason: CancelReason | None = None
     finished_at: datetime | None = None
+    attributes: Mapping[str, AttributeValue] = field(default_factory=_no_attributes)
 
     def __post_init__(self) -> None:
         """Заморозить словари."""
         object.__setattr__(self, "labels", _freeze(self.labels))
         object.__setattr__(self, "metrics", _freeze(self.metrics))
         object.__setattr__(self, "children", _freeze(self.children))
+        object.__setattr__(self, "attributes", _freeze(self.attributes))
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -112,7 +128,9 @@ class BatchView:
     """Состояние батча и его поддерева для ``handle.view()`` / ``watch()`` (UC-13).
 
     В отличие от :class:`BatchSummary` содержит технические флаги: пауза,
-    запрос отмены, отложенный старт, дедлайн, ошибка tx-хука.
+    запрос отмены, отложенный старт, дедлайн, ошибка tx-хука. ``attributes``
+    и ``memo`` — значения корня дерева, одинаковые у любого его узла (§11.2);
+    у батча без них — пустой словарь и ``None``.
     """
 
     id: UUID
@@ -132,12 +150,17 @@ class BatchView:
     finished_at: datetime | None = None
     hook_attempts: int = 0
     hook_error: str | None = None
+    attributes: Mapping[str, AttributeValue] = field(default_factory=_no_attributes)
+    memo: Mapping[str, object] | None = None
 
     def __post_init__(self) -> None:
-        """Заморозить словари."""
+        """Заморозить словари (у ``memo`` — верхний уровень)."""
         object.__setattr__(self, "labels", _freeze(self.labels))
         object.__setattr__(self, "metrics", _freeze(self.metrics))
         object.__setattr__(self, "children", _freeze(self.children))
+        object.__setattr__(self, "attributes", _freeze(self.attributes))
+        if self.memo is not None:
+            object.__setattr__(self, "memo", _freeze(self.memo))
 
     @property
     def paused(self) -> bool:
@@ -151,8 +174,41 @@ class BatchView:
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
+class BatchInfo:
+    """Корневой батч в листинге ``th.list_batches(...)`` (ARCHITECTURE §11.2).
+
+    Лёгкий DTO без прогресса: счётчики листинг не читает, за ними —
+    ``th.handle(info.id).view()``.
+    """
+
+    id: UUID
+    kind: str
+    key: str | None
+    state: BatchState
+    attributes: Mapping[str, AttributeValue]
+    created_at: datetime
+    finished_at: datetime | None = None
+
+    def __post_init__(self) -> None:
+        """Заморозить атрибуты."""
+        object.__setattr__(self, "attributes", _freeze(self.attributes))
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class BatchPage:
+    """Страница листинга батчей (ARCHITECTURE §11.2).
+
+    ``next_cursor`` — непрозрачная строка для следующей страницы; ``None`` —
+    страниц больше нет.
+    """
+
+    items: tuple[BatchInfo, ...]
+    next_cursor: str | None = None
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
 class ItemView:
-    """Item батча для ``handle.items(label=)`` (ARCHITECTURE §5.1, §6.2).
+    """Item батча для ``handle.items(states=, labels=)`` (ARCHITECTURE §5.1, §6.2).
 
     ``child_batch_id`` задан у виртуального Item под-батча. ``result`` и
     ``error`` — JSON-значения из ``ok(result=)`` / ``error(detail=)``.

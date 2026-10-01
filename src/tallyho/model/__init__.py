@@ -2,6 +2,12 @@
 
 from __future__ import annotations
 
+from tallyho.model.attributes import (
+    AttributeLimits,
+    AttributeValue,
+    normalize_attributes,
+    normalize_memo,
+)
 from tallyho.model.calls import TaskCall
 from tallyho.model.errors import (
     BatchPurged,
@@ -11,6 +17,7 @@ from tallyho.model.errors import (
     DownstreamFinalized,
     HookMissingError,
     HookTransactionError,
+    InvalidAttributesError,
     InvalidStateError,
     NotFoundError,
     SealError,
@@ -43,6 +50,8 @@ from tallyho.model.states import (
     ResultClass,
 )
 from tallyho.model.views import (
+    BatchInfo,
+    BatchPage,
     BatchSummary,
     BatchView,
     InFlightItem,
@@ -51,6 +60,10 @@ from tallyho.model.views import (
 )
 
 __all__ = [
+    "AttributeLimits",
+    "AttributeValue",
+    "BatchInfo",
+    "BatchPage",
     "BatchPurged",
     "BatchState",
     "BatchSummary",
@@ -64,6 +77,7 @@ __all__ = [
     "HookMissingError",
     "HookTransactionError",
     "InFlightItem",
+    "InvalidAttributesError",
     "InvalidStateError",
     "ItemState",
     "ItemView",
@@ -88,4 +102,6 @@ __all__ = [
     "ema_rate",
     "estimate_eta",
     "estimate_threshold",
+    "normalize_attributes",
+    "normalize_memo",
 ]
