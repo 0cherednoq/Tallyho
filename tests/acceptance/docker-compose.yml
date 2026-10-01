@@ -1,0 +1,161 @@
+name: tallyho-acceptance
+
+x-app: &app
+  image: tallyho-acceptance-app:latest
+  environment:
+    PYTHONUNBUFFERED: "1"
+  restart: unless-stopped
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    command:
+      - postgres
+      - -c
+      - fsync=on
+      - -c
+      - synchronous_commit=on
+      - -c
+      - full_page_writes=on
+    environment:
+      POSTGRES_DB: tallyho
+      POSTGRES_USER: tallyho
+      POSTGRES_PASSWORD: tallyho
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U tallyho -d tallyho"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+    volumes:
+      - ./init.sql:/docker-entrypoint-initdb.d/10-acceptance.sql:ro
+
+  toxiproxy:
+    image: ghcr.io/shopify/toxiproxy:2.12.0
+    ports:
+      - "8474:8474"
+
+  toxiproxy-init:
+    image: curlimages/curl:8.16.0
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      toxiproxy:
+        condition: service_started
+    command:
+      - /bin/sh
+      - -ec
+      - |
+        until curl -fsS http://toxiproxy:8474/version; do sleep 1; done
+        curl -fsS -X POST http://toxiproxy:8474/proxies \
+          -H 'Content-Type: application/json' \
+          -d '{"name":"postgres","listen":"0.0.0.0:8666","upstream":"postgres:5432"}'
+
+  external-services:
+    <<: *app
+    build:
+      context: ../..
+      dockerfile: tests/acceptance/Dockerfile
+    command:
+      - python
+      - -m
+      - tests.acceptance.app.services
+      - --seed
+      - ${SEED:-1}
+      - --pages
+      - ${PAGES:-50}
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://localhost:8081/pages/1').read()"
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  migrate:
+    <<: *app
+    restart: "no"
+    depends_on:
+      toxiproxy-init:
+        condition: service_completed_successfully
+      external-services:
+        condition: service_healthy
+    command:
+      - python
+      - -m
+      - tests.acceptance.app.migrate
+      - --dsn
+      - postgresql+asyncpg://tallyho:tallyho@toxiproxy:8666/tallyho
+      - --tallyho-schema
+      - th
+      - --flexiq-schema
+      - flexiq
+      - --domain-schema
+      - app
+      - --site-url
+      - http://external-services:8081
+      - --mail-url
+      - http://external-services:8082
+      - --seed
+      - ${SEED:-1}
+
+  worker:
+    <<: *app
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    deploy:
+      replicas: ${WORKERS:-4}
+    command:
+      - python
+      - -m
+      - tests.acceptance.app.worker
+      - --dsn
+      - postgresql+asyncpg://tallyho:tallyho@toxiproxy:8666/tallyho
+      - --tallyho-schema
+      - th
+      - --flexiq-schema
+      - flexiq
+      - --domain-schema
+      - app
+      - --site-url
+      - http://external-services:8081
+      - --mail-url
+      - http://external-services:8082
+      - --seed
+      - ${SEED:-1}
+      - --workers
+      - ${THREADS_PER_WORKER:-4}
+
+  api-1:
+    <<: *app
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    command: &api-command
+      - python
+      - -m
+      - tests.acceptance.app.api
+      - --dsn
+      - postgresql+asyncpg://tallyho:tallyho@toxiproxy:8666/tallyho
+      - --tallyho-schema
+      - th
+      - --flexiq-schema
+      - flexiq
+      - --domain-schema
+      - app
+      - --site-url
+      - http://external-services:8081
+      - --mail-url
+      - http://external-services:8082
+      - --seed
+      - ${SEED:-1}
+
+  api-2:
+    <<: *app
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    command: *api-command
