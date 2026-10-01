@@ -6,8 +6,8 @@
 ## Текущее состояние
 
 * **Ветка:** `impl/v1`
-* **Текущая волна:** T10.6
-* **Последний зелёный коммит:** d377dd7
+* **Текущая волна:** T11.1
+* **Последний зелёный коммит:** 66b1083
 
 ## Задачи
 
@@ -54,7 +54,7 @@
 | T10.3 | EXPLAIN-гард | T10.2 | done | f861d82 |
 | T10.4 | Наблюдаемость и логи | T6.1 | done | 9839ec9 |
 | T10.5 | CLI | T6.1 | done | d377dd7 |
-| T10.6 | Мутационное тестирование | T10.2 | todo | |
+| T10.6 | Мутационное тестирование | T10.2 | done | 66b1083 |
 | T11.1 | Эталонное приложение и генераторы | T8.2, T9.2 | todo | |
 | T11.2 | Оракул инвариантов | T11.1 | todo | |
 | T11.3 | Хаос-контроллер, A-CH | T11.2 | todo | |
@@ -72,6 +72,13 @@
 - Отклонения от плана/доков: … (или «нет»)
 - Узнали / на что обратить внимание дальше: …
 -->
+### 2026-10-01 · T10.6 · done · 66b1083
+- Сделано: добавлен Linux/WSL gate `poe mutation-cas` на `mutmut 3.8.0` для `_Tx.claim`, `_Tx.finish`, `Finalizer._cas`, `Snapshotter._attempt` и `Operations._retry_items`; CI запускает его с PostgreSQL 16 и запрещает `survived`, `suspicious`, `no tests`. Интеграционные тесты усилены проверками CAS-границ, rollback/race, полей result/error, observer attempt, expiry/lease/window, накопления метрик, retry scope, порядка snapshot и timeout hook.
+- Mutation DoD: чистый прогон из копии без `mutants/` завершился кодом 0 за 11:56, выживших мутантов нет. Эквивалентные/не-CAS исключения ограничены точными шаблонами и обоснованы в D-037; избыточные предикаты retry удалены, пакетный finish переиспользует уже заблокированную cache-строку.
+- Покрытие A-NF-06: `engine/storage` — 4408/4529 строк (97,33%) и 861/948 ветвей (90,82%). Полный `poe test-all`: 1249 passed, 1 документированный Windows skip, 97,19%, seed 839705306, 42:33; `poe fmt`, `poe check` (869 быстрых тестов) и pre-commit all-files зелёные.
+- Отклонения от плана/доков: функциональных нет. `mutmut 3.x` требует fork, поэтому локальный gate заявлен Linux/WSL-only и в CI работает на Ubuntu; timeout мутанта считается убитым, а критерий запрещает только survivor/suspicious/no-tests.
+- Дальше: T11.1, эталонное acceptance-приложение и генераторы S1/S2/S3.
+
 ### 2026-10-01 · T10.5 · done · d377dd7
 - Сделано: CLI получил подкоманды `migrate --dsn --schema`, `inspect <uuid|kind:key> --dsn --schema` и `maintenance --dsn --schema [--hook-module ...]`. `inspect` печатает детерминированное дерево с состоянием, done/expected, found, queued, in-flight, errors, cancellations и ratio; maintenance регистрирует graceful SIGINT/SIGTERM и поддерживает детерминированный `--once`.
 - Безопасность maintenance: поскольку T10.5 не задаёт CLI-конфигурацию брокера, встроенный Dispatcher никогда не подтверждает сообщения. Relay сохраняет outbox для процесса с настоящим адаптером, при этом sweeper/finalizer/snapshotter и tx-хуки могут продолжать recovery. Это закреплено в ARCHITECTURE.
