@@ -10,6 +10,7 @@ from alembic.runtime.migration import MigrationContext
 
 from tallyho.model.errors import ConfigurationError
 from tallyho.storage.alembic import upgrade
+from tallyho.storage.migrations import SCHEMA_VERSION
 
 
 def offline_sql(*, version: int = 1, schema: str | None = "app", prefix: str = "th_") -> str:
@@ -40,7 +41,7 @@ def test_offline_script_quotes_schema_and_uses_prefix() -> None:
 
 def test_unknown_version_rejected() -> None:
     with pytest.raises(ConfigurationError):
-        offline_sql(version=3)
+        offline_sql(version=SCHEMA_VERSION + 1)
 
 
 def test_version_two_offline_script_is_safe_and_complete() -> None:
@@ -51,3 +52,22 @@ def test_version_two_offline_script_is_safe_and_complete() -> None:
     ) in sql
     assert "CREATE INDEX acme_counter_delta_created_idx" in sql
     assert "VALUES ('schema_version', '2')" in sql
+
+
+def test_version_three_offline_script_is_safe_and_complete() -> None:
+    sql = offline_sql(version=3, schema='we"ird', prefix="acme_")
+    assert sql.startswith("SET LOCAL lock_timeout = '5000ms';")
+    assert 'CREATE TABLE "we""ird".acme_batch_attr (' in sql
+    assert (
+        'CREATE INDEX acme_batch_attr_attributes_idx ON "we""ird".acme_batch_attr '
+        "USING gin (attributes jsonb_path_ops);"
+    ) in sql
+    assert (
+        'CREATE INDEX acme_batch_kind_idx ON "we""ird".acme_batch (kind, id) '
+        "WHERE parent_id IS NULL;"
+    ) in sql
+    assert "VALUES ('schema_version', '3')" in sql
+    assert "%(" not in sql
+    # "th_" встречается внутри jsonb_path_ops, поэтому проверяются имена объектов.
+    assert ".th_" not in sql
+    assert " th_" not in sql

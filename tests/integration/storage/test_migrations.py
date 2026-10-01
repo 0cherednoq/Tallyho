@@ -162,6 +162,32 @@ async def test_upgrade_from_v1_backfills_counter_delta_timestamp(
     assert await stored_version(engine, schema) == str(SCHEMA_VERSION)
 
 
+async def test_upgrade_from_v2_keeps_data_and_adds_attributes(
+    engine: AsyncEngine, schema: str
+) -> None:
+    tables = build_metadata()
+    async with engine.begin() as raw:
+        for version in (1, 2):
+            for statement in migration_statements(version, schema=schema):
+                await raw.execute(statement)
+    assert await stored_version(engine, schema) == "2"
+    await add_batch(engine, schema, "mailing")
+    await add_batch(engine, schema, "catalog")
+
+    assert await migrate(engine, schema) == SCHEMA_VERSION
+
+    assert await batch_kinds(engine, schema) == ["catalog", "mailing"]
+    async with engine.connect() as raw:
+        conn = await raw.execution_options(schema_translate_map={None: schema})
+        attr_rows = await conn.scalar(select(func.count()).select_from(tables.batch_attr))
+    assert attr_rows == 0
+    async with temporary_schema(engine) as reference:
+        await create_all(engine, reference, tables)
+        async with engine.connect() as conn:
+            assert await catalog(conn, schema) == await catalog(conn, reference)
+    assert await stored_version(engine, schema) == str(SCHEMA_VERSION)
+
+
 async def test_migrate_creates_missing_schema(engine: AsyncEngine) -> None:
     async with dropped_after(engine, unique_schema_name()) as schema:
         await migrate(engine, schema)

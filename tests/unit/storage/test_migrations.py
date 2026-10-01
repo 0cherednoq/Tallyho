@@ -1,4 +1,4 @@
-"""Миграции без БД: проверка имён и DDL версии 1 против golden-снимка схемы."""
+"""Миграции без БД: проверка имён, DDL версии 1 против golden-снимка, операции версий 2 и 3."""
 
 from __future__ import annotations
 
@@ -59,6 +59,47 @@ def test_version_two_adds_timestamp_and_index() -> None:
         "CREATE INDEX th_counter_delta_created_idx ON app.th_counter_delta (created_at, id)"
     )
     assert "VALUES ('schema_version', '2')" in sql[-1]
+
+
+def test_version_three_adds_batch_attr_and_listing_index() -> None:
+    statements = migration_statements(3, schema="app")
+    sql = [compiled(statement).strip() for statement in statements]
+    assert sql[0] == "SET LOCAL lock_timeout = '5000ms'"
+    assert sql[1] == (
+        "CREATE TABLE app.th_batch_attr (\n"
+        "\tbatch_id UUID NOT NULL, \n"
+        "\tattributes JSONB DEFAULT '{}'::jsonb NOT NULL, \n"
+        "\tmemo JSONB, \n"
+        "\tPRIMARY KEY (batch_id)\n"
+        ")"
+    )
+    assert sql[2] == (
+        "CREATE INDEX th_batch_attr_attributes_idx ON app.th_batch_attr "
+        "USING gin (attributes jsonb_path_ops)"
+    )
+    assert sql[3] == (
+        "CREATE INDEX th_batch_kind_idx ON app.th_batch (kind, id) WHERE parent_id IS NULL"
+    )
+    assert "VALUES ('schema_version', '3')" in sql[4]
+    assert len(sql) == 5
+
+
+@pytest.mark.parametrize("version", [1, 2])
+def test_earlier_versions_do_not_create_version_three_objects(version: int) -> None:
+    # Версии 1 и 2 заморожены: объекты версии 3 создаёт только миграция 3.
+    sql = "\n".join(compiled(s) for s in migration_statements(version, schema="app"))
+    assert "th_batch_attr" not in sql
+    assert "th_batch_kind_idx" not in sql
+
+
+def test_version_three_uses_prefix_and_quotes_schema() -> None:
+    statements = migration_statements(3, schema='we"ird; DROP', prefix="acme_")
+    sql = "\n".join(compiled(statement) for statement in statements)
+    assert 'CREATE TABLE "we""ird; DROP".acme_batch_attr (' in sql
+    assert 'CREATE INDEX acme_batch_kind_idx ON "we""ird; DROP".acme_batch (kind, id)' in sql
+    # "th_" встречается внутри jsonb_path_ops, поэтому проверяются имена объектов.
+    assert ".th_" not in sql
+    assert " th_" not in sql
 
 
 def test_statements_order() -> None:

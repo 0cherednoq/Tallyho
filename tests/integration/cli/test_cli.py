@@ -23,7 +23,7 @@ async def test_migrate_and_inspect_by_uuid_or_kind_key(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     assert await app.run(["migrate", "--dsn", postgres_dsn, "--schema", schema]) == 0
-    assert capsys.readouterr().out == f"schema={schema} version=2\n"
+    assert capsys.readouterr().out == f"schema={schema} version=3\n"
 
     engine = create_async_engine(postgres_dsn)
     broker = InlineBroker()

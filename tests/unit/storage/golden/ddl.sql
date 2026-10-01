@@ -34,6 +34,8 @@ CREATE INDEX th_batch_active_updated_idx ON th_batch (updated_at) WHERE state < 
 
 CREATE INDEX th_batch_deadline_idx ON th_batch (deadline_at) WHERE deadline_at IS NOT NULL AND state IN (0, 1);
 
+CREATE INDEX th_batch_kind_idx ON th_batch (kind, id) WHERE parent_id IS NULL;
+
 CREATE UNIQUE INDEX th_batch_kind_key_uq ON th_batch (kind, key) WHERE parent_id IS NULL AND key IS NOT NULL;
 
 CREATE INDEX th_batch_parent_idx ON th_batch (parent_id) WHERE parent_id IS NOT NULL;
@@ -43,6 +45,15 @@ CREATE INDEX th_batch_progress_idx ON th_batch (id) WHERE state IN (0, 1) AND 'p
 CREATE INDEX th_batch_retention_idx ON th_batch (finished_at) WHERE id = root_id AND finished_at IS NOT NULL AND retention IS NOT NULL AND (NOT release_required OR released_at IS NOT NULL);
 
 CREATE UNIQUE INDEX th_batch_root_key_uq ON th_batch (root_id, key) WHERE parent_id IS NOT NULL;
+
+CREATE TABLE th_batch_attr (
+	batch_id UUID NOT NULL,
+	attributes JSONB DEFAULT '{}'::jsonb NOT NULL,
+	memo JSONB,
+	PRIMARY KEY (batch_id)
+);
+
+CREATE INDEX th_batch_attr_attributes_idx ON th_batch_attr USING gin (attributes jsonb_path_ops);
 
 CREATE TABLE th_counter (
 	batch_id UUID NOT NULL,

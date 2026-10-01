@@ -15,7 +15,9 @@
 
 Схема версии 1 заморожена без ``th_counter_delta.created_at``. Версия 2
 добавляет timestamp и индекс для ограниченной по возрасту свёртки Sweeper;
-``build_metadata`` всегда описывает итоговую актуальную схему.
+Версия 3 создаёт ``th_batch_attr`` с GIN-индексом по ``attributes`` и индекс
+листинга корней ``th_batch (kind, id)``; в операции версии 1 эти объекты не
+попадают. ``build_metadata`` всегда описывает итоговую актуальную схему.
 """
 
 from __future__ import annotations
@@ -37,7 +39,7 @@ from tallyho.storage.tables import DEFAULT_PREFIX, build_metadata
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
 
-    from sqlalchemy import Table, TypedColumns
+    from sqlalchemy import Index, Table, TypedColumns
     from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
     from sqlalchemy.sql.base import Executable
     from sqlalchemy.sql.compiler import DDLCompiler
@@ -54,7 +56,7 @@ __all__ = [
     "validate_schema",
 ]
 
-SCHEMA_VERSION: Final = 2
+SCHEMA_VERSION: Final = 3
 """Версия схемы, которую знает эта версия библиотеки."""
 
 VERSION_KEY: Final = "schema_version"
@@ -116,12 +118,18 @@ def validate_schema(schema: str | None) -> str | None:
 
 @dataclass(frozen=True, slots=True)
 class _Installation:
-    """Таблицы одной установки в её схеме (в порядке имён, как ``sorted_tables``)."""
+    """Таблицы одной установки в её схеме.
+
+    ``tables`` — таблицы версии 1 в порядке имён, как ``sorted_tables``;
+    объекты следующих версий лежат в отдельных полях.
+    """
 
     schema: str | None
     tables: list[Table[TypedColumns]]
     meta: Table[MetaColumns]
     counter_delta: Table[TypedColumns]
+    batch_attr: Table[TypedColumns]
+    batch_kind_index: Index
 
 
 def _installation(
@@ -134,15 +142,15 @@ def _installation(
     """
     source = build_metadata(prefix, _delta_timestamps=delta_timestamps)
     meta = source.meta
+    batch: Table[TypedColumns] = source.batch
+    batch_attr: Table[TypedColumns] = source.batch_attr
     counter_delta: Table[TypedColumns] = source.counter_delta
     tables: list[Table[TypedColumns]] = [
-        source.batch,
         source.item,
         source.outbox,
         source.lease,
         source.feed,
         source.counter,
-        source.counter_delta,
         source.metric,
         source.item_mark,
         source.expiry,
@@ -151,14 +159,26 @@ def _installation(
     if schema is not None:
         target = MetaData()
         meta = meta.to_metadata(target, schema=schema)
+        batch = batch.to_metadata(target, schema=schema)
+        batch_attr = batch_attr.to_metadata(target, schema=schema)
+        counter_delta = counter_delta.to_metadata(target, schema=schema)
         tables = [table.to_metadata(target, schema=schema) for table in tables]
-        counter_delta = next(table for table in tables if table.name == source.counter_delta.name)
     return _Installation(
         schema=schema,
-        tables=sorted([*tables, meta], key=lambda t: t.name),
+        tables=sorted([*tables, batch, counter_delta, meta], key=lambda t: t.name),
         meta=meta,
         counter_delta=counter_delta,
+        batch_attr=batch_attr,
+        batch_kind_index=_index(batch, "_kind_idx"),
     )
+
+
+def _index(table: Table[TypedColumns], suffix: str) -> Index:
+    return next(index for index in table.indexes if str(index.name) == f"{table.name}{suffix}")
+
+
+def _sorted_indexes(table: Table[TypedColumns]) -> list[Index]:
+    return sorted(table.indexes, key=lambda index: str(index.name))
 
 
 def _v1(installation: _Installation) -> list[Executable]:
@@ -168,7 +188,10 @@ def _v1(installation: _Installation) -> list[Executable]:
     for table in installation.tables:
         statements.append(CreateTable(table))
         statements.extend(
-            CreateIndex(index) for index in sorted(table.indexes, key=lambda i: str(i.name))
+            CreateIndex(index)
+            for index in _sorted_indexes(table)
+            # Индекс листинга корней появился в версии 3.
+            if index is not installation.batch_kind_index
         )
     return statements
 
@@ -213,21 +236,29 @@ def _compile_drop_counter_delta_timestamp_default(
 
 
 def _v2(installation: _Installation) -> list[Executable]:
-    created_index = next(
-        index
-        for index in installation.counter_delta.indexes
-        if str(index.name).endswith("_created_idx")
-    )
     return [
         _AddCounterDeltaTimestamp(installation.counter_delta),
         _DropCounterDeltaTimestampDefault(installation.counter_delta),
-        CreateIndex(created_index),
+        CreateIndex(_index(installation.counter_delta, "_created_idx")),
+    ]
+
+
+def _v3(installation: _Installation) -> list[Executable]:
+    # Обычный CREATE INDEX, не CONCURRENTLY: миграция идёт одной транзакцией.
+    # Пока индекс th_batch строится, запись в th_batch ждёт; таблица растёт с
+    # числом батчей, а не Items, а ожидание чужих блокировок ограничивает
+    # lock_timeout.
+    return [
+        CreateTable(installation.batch_attr),
+        *(CreateIndex(index) for index in _sorted_indexes(installation.batch_attr)),
+        CreateIndex(installation.batch_kind_index),
     ]
 
 
 _MIGRATIONS: Final[Mapping[int, Callable[[_Installation], list[Executable]]]] = {
     1: _v1,
     2: _v2,
+    3: _v3,
 }
 
 

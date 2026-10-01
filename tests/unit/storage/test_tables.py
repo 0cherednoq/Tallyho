@@ -23,6 +23,7 @@ UPDATE_GOLDEN_ENV = "TALLYHO_UPDATE_GOLDEN"
 
 TABLE_SUFFIXES = (
     "batch",
+    "batch_attr",
     "item",
     "outbox",
     "lease",
@@ -120,6 +121,25 @@ def test_mutable_index_rule_catches_violations() -> None:
     Index("partial", item.c.id, postgresql_where=item.c.state < 10)
     Index("clean", item.c.id)
     assert sorted(mutable_item_indexes(item.indexes)) == ["by_state", "partial"]
+
+
+def test_batch_attr_has_gin_index_for_containment(tables: Tables) -> None:
+    # jsonb_path_ops обслуживает только containment (@>) — им и фильтрует листинг.
+    (index,) = tables.batch_attr.indexes
+    options = index.dialect_options["postgresql"]
+    assert [column.name for column in index.columns] == ["attributes"]
+    assert options["using"] == "gin"
+    assert options["ops"] == {"attributes": "jsonb_path_ops"}
+    assert [column.name for column in tables.batch_attr.primary_key] == ["batch_id"]
+    assert not tables.batch_attr.c.attributes.nullable
+    assert tables.batch_attr.c.memo.nullable
+
+
+def test_batch_kind_index_covers_only_roots(tables: Tables) -> None:
+    index = next(index for index in tables.batch.indexes if index.name == "th_batch_kind_idx")
+    assert [column.name for column in index.columns] == ["kind", "id"]
+    assert not index.unique
+    assert index_columns(index) == {"kind", "id", "parent_id"}
 
 
 @pytest.mark.parametrize(

@@ -13,6 +13,8 @@
   ``result``, ``error``, ``finished_at``): finish — HOT update без записи в
   индексы;
 * FK не объявляются: целостность держит библиотека, retention удаляет деревом;
+* ``th_batch_attr`` — отдельная таблица: jsonb с GIN-индексом не лежит в часто
+  обновляемой строке ``th_batch``;
 * partial-индексы записаны через коды :mod:`tallyho.model.states` (D-005).
   Чтобы планировщик взял такой индекс, запрос должен содержать то же условие
   литералом, а не bind-параметром.
@@ -56,6 +58,7 @@ if TYPE_CHECKING:
 __all__ = [
     "DEFAULT_PREFIX",
     "PROGRESS_HOOK",
+    "BatchAttrColumns",
     "BatchColumns",
     "CounterColumns",
     "CounterDeltaColumns",
@@ -167,6 +170,18 @@ class BatchColumns(TypedColumns):
     created_at = _utc()
     updated_at = _utc()
     finished_at = _utc(nullable=True)
+
+
+@final
+class BatchAttrColumns(TypedColumns):
+    """Колонки ``th_batch_attr``: неизменяемые ``attributes`` и ``memo`` корня (D-038).
+
+    Строка есть только у корня с атрибутами или ``memo``; пишется один раз.
+    """
+
+    batch_id = Column(Uuid(), primary_key=True)
+    attributes = _jsonb(server_default="'{}'::jsonb")
+    memo = _jsonb(nullable=True)
 
 
 @final
@@ -323,6 +338,7 @@ class Tables:
 
     metadata: MetaData
     batch: Table[BatchColumns]
+    batch_attr: Table[BatchAttrColumns]
     item: Table[ItemColumns]
     outbox: Table[OutboxColumns]
     lease: Table[LeaseColumns]
@@ -350,6 +366,7 @@ def build_metadata(prefix: str = DEFAULT_PREFIX, *, _delta_timestamps: bool = Tr
     return Tables(
         metadata=metadata,
         batch=_batch(metadata, prefix),
+        batch_attr=_batch_attr(metadata, prefix),
         item=_item(metadata, prefix),
         outbox=_outbox(metadata, prefix),
         lease=_lease(metadata, prefix),
@@ -417,7 +434,23 @@ def _batch(metadata: MetaData, prefix: str) -> Table[BatchColumns]:
             or_(~c.release_required, c.released_at.is_not(None)),
         ),
     )
+    # Листинг корней одного kind, keyset по id DESC (схема v3).
+    Index(f"{name}_kind_idx", c.kind, c.id, postgresql_where=c.parent_id.is_(None))
     return batch
+
+
+def _batch_attr(metadata: MetaData, prefix: str) -> Table[BatchAttrColumns]:
+    # Отдельная таблица, а не колонки th_batch: строка батча часто обновляется,
+    # и каждое не-HOT обновление заново писало бы jsonb в GIN (схема v3).
+    name = f"{prefix}batch_attr"
+    attr = Table(name, metadata, BatchAttrColumns)
+    Index(
+        f"{name}_attributes_idx",
+        attr.c.attributes,
+        postgresql_using="gin",
+        postgresql_ops={"attributes": "jsonb_path_ops"},
+    )
+    return attr
 
 
 def _item(metadata: MetaData, prefix: str) -> Table[ItemColumns]:
