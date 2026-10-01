@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Protocol, cast
 from tallyho.model.states import OnFeederFailed
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Mapping, Sequence
+    from collections.abc import AsyncIterator, Collection, Mapping, Sequence
     from contextlib import AbstractAsyncContextManager
     from datetime import datetime, timedelta
     from uuid import UUID
@@ -19,6 +19,7 @@ if TYPE_CHECKING:
     from tallyho.hooks.registry import HookRegistry
     from tallyho.model.calls import TaskCall
     from tallyho.model.policy import FailurePolicy
+    from tallyho.model.states import ItemState
     from tallyho.model.views import BatchView, InFlightItem, ItemView
     from tallyho.protocols.broker import Dispatcher, WorkerFactory
     from tallyho.protocols.clock import Clock
@@ -113,6 +114,7 @@ class EngineSettings:
     sweep_interval: timedelta
     lock_timeout: timedelta
     watch_throttle: timedelta
+    items_scan_window: int
 
 
 class MaintenanceRunner(Protocol):
@@ -164,8 +166,14 @@ class EngineFacade(Protocol):
         """Прочитать выполняющиеся Items."""
         ...
 
-    def items(self, batch_id: UUID, label: str) -> AsyncIterator[ItemView]:
-        """Поток отмеченных Items."""
+    def items(
+        self,
+        batch_id: UUID,
+        *,
+        states: Collection[ItemState] | None = None,
+        labels: Collection[str] | None = None,
+    ) -> AsyncIterator[ItemView]:
+        """Поток Items батча по состояниям, меткам или их пересечению."""
         ...
 
     async def find(self, kind: str, key: str) -> UUID:

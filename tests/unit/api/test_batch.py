@@ -16,11 +16,11 @@ from tallyho import BatchBuilder, BatchHandle
 from tallyho.engine.public import BatchDefinition, BatchReference, BatchWriter, EngineFacade
 from tallyho.model.calls import TaskCall
 from tallyho.model.errors import ConfigurationError
-from tallyho.model.states import BatchState, OnFeederFailed
+from tallyho.model.states import BatchState, ItemState, OnFeederFailed
 from tallyho.protocols.broker import Dispatcher
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Callable, Sequence
+    from collections.abc import AsyncIterator, Callable, Collection, Sequence
     from types import TracebackType
 
     from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession
@@ -187,8 +187,14 @@ class Facade(EngineFacade):
         return []
 
     @override
-    def items(self, batch_id: UUID, label: str) -> AsyncIterator[ItemView]:
-        self.calls.append(("items", (batch_id, label)))
+    def items(
+        self,
+        batch_id: UUID,
+        *,
+        states: Collection[ItemState] | None = None,
+        labels: Collection[str] | None = None,
+    ) -> AsyncIterator[ItemView]:
+        self.calls.append(("items", (batch_id, states, labels)))
         return no_items()
 
     @override
@@ -363,7 +369,10 @@ async def test_handle_delegates_reads_wait_and_mutations() -> None:
     assert (await handle.view()).state is BatchState.SUCCEEDED
     assert (await handle.wait(timedelta(seconds=1))).state is BatchState.SUCCEEDED
     assert await handle.in_flight(7) == []
-    assert [item async for item in handle.items(label="bad")] == []
+    assert [item async for item in handle.items(labels=["bad"])] == []
+    assert [item async for item in handle.items(states={ItemState.CANCELLED})] == []
+    assert ("items", (ROOT_ID, {ItemState.CANCELLED}, None)) in facade.calls
+    assert ("items", (ROOT_ID, None, ["bad"])) in facade.calls
     assert (await handle.child("part")).id == CHILD_ID
     at = datetime.now(UTC)
     assert await handle.reschedule(at) == 3

@@ -234,7 +234,7 @@ async def test_hot_path_plans_have_no_large_or_sequential_scans(
 ) -> None:
     database = populated_database
     queries = HOT_QUERIES.build(database.tables, database.probe)
-    assert len(queries) == 12
+    assert len(queries) == 13
     assert len({query.name for query in queries}) == len(queries)
     async with schema_connection(database.engine, database.schema) as connection:
         await _set_search_path(connection, database.schema)

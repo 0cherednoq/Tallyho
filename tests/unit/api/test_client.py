@@ -89,6 +89,7 @@ def test_defaults_match_architecture_table() -> None:
         "lock_timeout": timedelta(seconds=5),
         "retention": timedelta(days=14),
         "watch_throttle": timedelta(milliseconds=500),
+        "items_scan_window": 5000,
     }
     assert {field.name: getattr(value, field.name) for field in fields(value)} == expected
 
@@ -98,6 +99,7 @@ def test_defaults_match_architecture_table() -> None:
     [
         {"counter_slots": 0},
         {"counter_slots": True},
+        {"items_scan_window": 0},
         {"completer_backpressure": 10, "completer_max_batch": 11},
         {"heartbeat_every": timedelta(0)},
         {"relay_grace": timedelta(seconds=-1)},

@@ -96,6 +96,7 @@ class Settings:
     lock_timeout: timedelta = timedelta(seconds=5)
     retention: timedelta | None = timedelta(days=14)
     watch_throttle: timedelta = timedelta(milliseconds=500)
+    items_scan_window: int = 5000
 
     def __post_init__(self) -> None:
         """Проверить все диапазоны.
@@ -107,6 +108,7 @@ class Settings:
             "counter_slots": self.counter_slots,
             "completer_max_batch": self.completer_max_batch,
             "completer_backpressure": self.completer_backpressure,
+            "items_scan_window": self.items_scan_window,
         }
         for name, value in integers.items():
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
@@ -186,6 +188,7 @@ class Settings:
             sweep_interval=self.sweep_interval,
             lock_timeout=self.lock_timeout,
             watch_throttle=self.watch_throttle,
+            items_scan_window=self.items_scan_window,
         )
 
 

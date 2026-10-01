@@ -17,6 +17,7 @@ if TYPE_CHECKING:
         AsyncIterator,
         Awaitable,
         Callable,
+        Collection,
         Iterable,
         Mapping,
         Sequence,
@@ -30,6 +31,7 @@ if TYPE_CHECKING:
 
     from tallyho.engine.public import BatchWriter, EngineFacade
     from tallyho.model.policy import FailurePolicy
+    from tallyho.model.states import ItemState
     from tallyho.model.views import BatchView, InFlightItem, ItemView
     from tallyho.protocols.broker import Dispatcher
 
@@ -358,13 +360,26 @@ class BatchHandle:
         """
         return await self._engine.in_flight(self.id, limit)
 
-    def items(self, *, label: str) -> AsyncIterator[ItemView]:
-        """Поток отмеченных Items с заданной меткой.
+    def items(
+        self,
+        *,
+        states: Collection[ItemState] | None = None,
+        labels: Collection[str] | None = None,
+    ) -> AsyncIterator[ItemView]:
+        """Поток Items этого батча по состояниям, меткам или их пересечению.
+
+        ``labels`` находит только помеченные Items (по умолчанию — ошибки),
+        ``states`` — Items в любом состоянии, включая ``CANCELLED``. Хотя бы
+        один фильтр обязателен; порядок выдачи контрактом не является
+        (ARCHITECTURE §11.2).
+
+        Вызов без фильтров, с пустым фильтром или со строкой вместо коллекции
+        сразу даёт ``ConfigurationError``.
 
         Returns:
-            Keyset-поток Items.
+            Асинхронный поток ``ItemView``.
         """
-        return self._engine.items(self.id, label)
+        return self._engine.items(self.id, states=states, labels=labels)
 
     async def child(self, key: str) -> BatchHandle:
         """Найти прямого потомка по ключу.

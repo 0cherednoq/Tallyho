@@ -12,7 +12,8 @@ from typing import TYPE_CHECKING, Protocol, TypeVar, final
 
 from sqlalchemy import any_, literal, select
 
-from tallyho.model.states import TERMINAL_THRESHOLD, BatchState
+from tallyho.model.states import TERMINAL_THRESHOLD, BatchState, ItemState
+from tallyho.storage.item_scan import DEFAULT_ITEMS_SCAN_WINDOW, item_window_statement
 from tallyho.storage.tables import PROGRESS_HOOK
 
 if TYPE_CHECKING:
@@ -208,6 +209,17 @@ def _items_by_batch(tables: Tables, probe: HotQueryProbe) -> Select[UUID]:
     item = tables.item
     return (
         select(item.c.id).where(item.c.batch_id == probe.batch_id).order_by(item.c.id).limit(_PAGE)
+    )
+
+
+@HOT_QUERIES.register("item.scan_window", max_plan_rows=DEFAULT_ITEMS_SCAN_WINDOW)
+def _item_scan_window(tables: Tables, probe: HotQueryProbe) -> Select[*tuple[object, ...]]:
+    return item_window_statement(
+        tables,
+        batch_id=probe.batch_id,
+        states=(ItemState.ERROR, ItemState.CANCELLED),
+        after=probe.item_id,
+        window=DEFAULT_ITEMS_SCAN_WINDOW,
     )
 
 

@@ -180,7 +180,7 @@ async def test_a_fq_04_enqueue_options_and_expiry(flexiq_contract: FlexiqContrac
     assert stored_ttl == 30_000
     assert view.progress.ok == 1
     assert view.progress.error == 1
-    expired = [item async for item in batch.handle.items(label="expired")]
+    expired = [item async for item in batch.handle.items(labels=["expired"])]
     assert len(expired) == 1
 
     async with app.th.batch("a-fq-04-priority", key="priority") as priority_batch:
@@ -332,7 +332,7 @@ async def test_a_fq_08_retry_policy_attempts_and_exhaustion(
     }
     assert view.progress.ok == 1
     assert view.progress.error == 2
-    assert len([item async for item in batch.handle.items(label="exhausted")]) == 2
+    assert len([item async for item in batch.handle.items(labels=["exhausted"])]) == 2
 
 
 async def test_a_fq_09_retry_budget_and_circuit_breaker(

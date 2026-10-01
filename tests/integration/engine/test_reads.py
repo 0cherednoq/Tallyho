@@ -208,7 +208,7 @@ async def test_in_flight_marked_items_and_lookups(env: Env) -> None:
     assert await reads.find("mail", "campaign:1") == root.id
     assert await reads.child(root.id, "send") == child.id
     leases = await reads.in_flight(child.id, limit=1)
-    marked = [entry async for entry in reads.items(child.id, label="bounce")]
+    marked = [entry async for entry in reads.items(child.id, labels=["bounce"])]
 
     assert [entry.id for entry in marked] == ids
     assert all(entry.state is ItemState.ERROR for entry in marked)
@@ -224,7 +224,7 @@ async def test_in_flight_marked_items_and_lookups(env: Env) -> None:
             delete(env.tables.batch).where(env.tables.batch.c.root_id == root.id)
         )
     with pytest.raises(BatchPurged):
-        _ = [entry async for entry in reads.items(child.id, label="bounce")]
+        _ = [entry async for entry in reads.items(child.id, labels=["bounce"])]
     with pytest.raises(BatchPurged):
         _ = await reads.in_flight(child.id)
 

@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from collections.abc import Collection
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import TYPE_CHECKING, Final, TypeAlias, cast, final
+from typing import TYPE_CHECKING, Final, TypeAlias, TypeVar, cast, final
 from uuid import UUID
 
 from sqlalchemy import BigInteger, func, select
@@ -15,6 +16,11 @@ from tallyho.model.errors import BatchPurged, ConfigurationError, NotFoundError
 from tallyho.model.progress import NodeCounters, ProgressSettings, compute_progress
 from tallyho.model.states import BatchState, CancelReason, ItemState
 from tallyho.model.views import BatchSummary, BatchView, InFlightItem, ItemView
+from tallyho.storage.item_scan import (
+    DEFAULT_ITEMS_SCAN_WINDOW,
+    item_window_statement,
+    marked_window_statement,
+)
 from tallyho.storage.now import sql_now
 
 if TYPE_CHECKING:
@@ -27,10 +33,17 @@ if TYPE_CHECKING:
     from tallyho.protocols.clock import Clock
     from tallyho.storage.tables import Tables
 
-__all__ = ["DEFAULT_ITEM_PAGE_SIZE", "DEFAULT_LEASE_DURATION", "Reads"]
+__all__ = [
+    "DEFAULT_ITEMS_SCAN_WINDOW",
+    "DEFAULT_ITEM_PAGE_SIZE",
+    "DEFAULT_LEASE_DURATION",
+    "Reads",
+]
 
 DEFAULT_ITEM_PAGE_SIZE: Final = 1000
 DEFAULT_LEASE_DURATION: Final = timedelta(seconds=60)
+
+_MemberT = TypeVar("_MemberT")
 
 _LeaseRow: TypeAlias = tuple[
     UUID,
@@ -42,8 +55,10 @@ _LeaseRow: TypeAlias = tuple[
     int | None,
     int | None,
 ]
-_ItemRow: TypeAlias = tuple[
-    UUID,
+_WindowRow: TypeAlias = tuple[
+    UUID | None,
+    int,
+    UUID | None,
     UUID,
     int,
     str,
@@ -58,10 +73,23 @@ _ItemRow: TypeAlias = tuple[
     datetime,
     datetime | None,
 ]
+"""Граница окна (``last_id``, ``scanned``) и колонки ``ITEM_VIEW_FIELDS``."""
 
 _NON_POSITIVE_LIMIT = "limit должен быть положительным целым числом"
 _ROOT_NOT_FOUND = "корневой батч не найден"
 _CHILD_NOT_FOUND = "под-батч не найден"
+_NO_ITEM_FILTER = "handle.items() требует хотя бы один фильтр: states= или labels="
+_EMPTY_ITEM_FILTER = "фильтр handle.items() не может быть пустой коллекцией"
+_BAD_STATES = "states должен быть коллекцией ItemState"
+_BAD_LABELS = "labels должен быть коллекцией строк, а не одной строкой"
+
+
+@dataclass(frozen=True, slots=True)
+class _ItemFilter:
+    """Проверенные фильтры ``items``: пустой кортеж — фильтр не задан."""
+
+    states: tuple[ItemState, ...]
+    labels: tuple[str, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,7 +118,7 @@ class _Node:
 class Reads:
     """Read model over one tallyho installation."""
 
-    def __init__(
+    def __init__(  # ruff: ignore[too-many-arguments]  # настройки чтения именованные, со значениями по умолчанию
         self,
         engine: AsyncEngine,
         tables: Tables,
@@ -98,14 +126,16 @@ class Reads:
         *,
         progress: ProgressSettings | None = None,
         item_page_size: int = DEFAULT_ITEM_PAGE_SIZE,
+        items_scan_window: int = DEFAULT_ITEMS_SCAN_WINDOW,
         lease_duration: timedelta = DEFAULT_LEASE_DURATION,
     ) -> None:
         """Configure reads without owning or mutating application transactions.
 
         Raises:
-            ConfigurationError: A page size or lease duration is not positive.
+            ConfigurationError: A page size, scan window or lease duration is not positive.
         """
         _positive_limit(item_page_size)
+        _positive_limit(items_scan_window)
         if lease_duration <= timedelta(0):
             message = "lease_duration должен быть положительным timedelta"
             raise ConfigurationError(message)
@@ -114,6 +144,7 @@ class Reads:
         self.clock = clock
         self.progress = progress or ProgressSettings()
         self.item_page_size = item_page_size
+        self.items_scan_window = items_scan_window
         self.lease_duration = lease_duration
 
     async def view(self, batch_id: UUID) -> BatchView:
@@ -276,89 +307,70 @@ class Reads:
             ) in rows
         ]
 
-    async def items(self, batch_id: UUID, *, label: str) -> AsyncIterator[ItemView]:
-        """Stream marked Items using ``(batch_id, label, item_id)`` keyset pages.
+    def items(
+        self,
+        batch_id: UUID,
+        *,
+        states: Collection[ItemState] | None = None,
+        labels: Collection[str] | None = None,
+    ) -> AsyncIterator[ItemView]:
+        """Stream Items of one batch filtered by state, mark label, or both.
 
-        Yields:
-            Marked Items in stable id order.
+        ``labels`` walks ``th_item_mark`` in pages of ``item_page_size``;
+        ``states`` alone walks ``th_item`` by ``(batch_id, id)`` in windows of
+        ``items_scan_window`` rows. No statement reads more rows than its window,
+        however rare the matches are. Arguments are validated here, before any
+        database round trip; ``BatchPurged`` is raised on the first step of the
+        returned iterator.
 
-        Raises:
-            BatchPurged: The batch is no longer present.
+        A call without filters, with an empty filter, or with a filter that is
+        not a collection of the expected values fails with ``ConfigurationError``.
+
+        Returns:
+            Matching Items; the order is not part of the contract.
         """
-        mark = self.tables.item_mark
-        item = self.tables.item
-        cursor: UUID | None = None
+        return self._items(batch_id, _item_filter(states, labels))
+
+    async def _items(self, batch_id: UUID, selection: _ItemFilter) -> AsyncIterator[ItemView]:
         async with self.engine.connect() as conn:
             if not await self._exists(conn, batch_id):
                 raise BatchPurged(batch_id)
+        if not selection.labels:
+            async for view in self._windows(batch_id, selection.states, None):
+                yield view
+            return
+        for label in selection.labels:
+            async for view in self._windows(batch_id, selection.states, label):
+                yield view
+
+    async def _windows(
+        self, batch_id: UUID, states: tuple[ItemState, ...], label: str | None
+    ) -> AsyncIterator[ItemView]:
+        window = self.items_scan_window if label is None else self.item_page_size
+        after: UUID | None = None
         while True:
-            where: list[ColumnElement[bool]] = [
-                mark.c.batch_id == batch_id,
-                mark.c.label == label,
-            ]
-            if cursor is not None:
-                where.append(mark.c.item_id > cursor)
             statement = (
-                select(
-                    item.c.id,
-                    item.c.batch_id,
-                    item.c.state,
-                    item.c.task_name,
-                    item.c.label,
-                    item.c.attempt,
-                    item.c.depth,
-                    item.c.key,
-                    item.c.weight,
-                    item.c.child_batch_id,
-                    item.c.result,
-                    item.c.error,
-                    item.c.created_at,
-                    item.c.finished_at,
+                item_window_statement(
+                    self.tables, batch_id=batch_id, states=states, after=after, window=window
                 )
-                .select_from(mark.join(item, item.c.id == mark.c.item_id))
-                .where(*where)
-                .order_by(mark.c.item_id)
-                .limit(self.item_page_size)
+                if label is None
+                else marked_window_statement(
+                    self.tables,
+                    batch_id=batch_id,
+                    label=label,
+                    states=states,
+                    after=after,
+                    window=window,
+                )
             )
             async with self.engine.connect() as conn:
-                rows = cast(
-                    "list[_ItemRow]",
-                    (await conn.execute(statement)).all(),
-                )
-            for (
-                item_id,
-                row_batch_id,
-                state,
-                task_name,
-                row_label,
-                attempt,
-                depth,
-                key,
-                weight,
-                child_batch_id,
-                result,
-                error,
-                created_at,
-                finished_at,
-            ) in rows:
-                cursor = item_id
-                yield ItemView(
-                    id=item_id,
-                    batch_id=row_batch_id,
-                    state=ItemState(state),
-                    task_name=task_name,
-                    label=row_label,
-                    attempt=attempt,
-                    depth=depth,
-                    key=key,
-                    weight=weight,
-                    child_batch_id=child_batch_id,
-                    result=result,
-                    error=error,
-                    created_at=created_at,
-                    finished_at=finished_at,
-                )
-            if len(rows) < self.item_page_size:
+                rows = cast("list[_WindowRow]", (await conn.execute(statement)).all())
+            # Первая строка есть всегда: граница окна возвращается и без совпадений.
+            after, scanned = rows[0][0], rows[0][1]
+            for row in rows:
+                if row[2] is not None:
+                    yield _item_view(row)
+            if scanned < window:
                 return
 
     async def find(self, kind: str, key: str) -> UUID:
@@ -556,6 +568,77 @@ def _target(nodes: list[_Node], batch_id: UUID) -> _Node:
 
 def _reason(value: object) -> CancelReason | None:
     return CancelReason(value) if isinstance(value, str) else None
+
+
+def _item_filter(states: object, labels: object) -> _ItemFilter:
+    if states is None and labels is None:
+        raise ConfigurationError(_NO_ITEM_FILTER)
+    state_values = _collection(states, ItemState, _BAD_STATES)
+    label_values = _collection(labels, str, _BAD_LABELS)
+    return _ItemFilter(
+        states=tuple(sorted(set(state_values))),
+        labels=tuple(dict.fromkeys(label_values)),
+    )
+
+
+def _collection(value: object, member: type[_MemberT], message: str) -> tuple[_MemberT, ...]:
+    """Проверить один фильтр ``items``.
+
+    Строка — тоже ``Collection``, но как фильтр она молча разобралась бы на
+    символы, поэтому отклоняется явно.
+
+    Returns:
+        Значения фильтра; пустой кортеж, если фильтр не задан (``None``).
+
+    Raises:
+        ConfigurationError: Значение не коллекция, пусто или содержит чужой тип.
+    """
+    if value is None:
+        return ()
+    if isinstance(value, str | bytes) or not isinstance(value, Collection):
+        raise ConfigurationError(message)
+    members: tuple[object, ...] = tuple(value)
+    if not members:
+        raise ConfigurationError(_EMPTY_ITEM_FILTER)
+    checked = tuple(entry for entry in members if isinstance(entry, member))
+    if len(checked) != len(members):
+        raise ConfigurationError(message)
+    return checked
+
+
+def _item_view(row: _WindowRow) -> ItemView:
+    (
+        item_id,
+        batch_id,
+        state,
+        task_name,
+        label,
+        attempt,
+        depth,
+        key,
+        weight,
+        child_batch_id,
+        result,
+        error,
+        created_at,
+        finished_at,
+    ) = row[2:]
+    return ItemView(
+        id=cast("UUID", item_id),
+        batch_id=batch_id,
+        state=ItemState(state),
+        task_name=task_name,
+        label=label,
+        attempt=attempt,
+        depth=depth,
+        key=key,
+        weight=weight,
+        child_batch_id=child_batch_id,
+        result=result,
+        error=error,
+        created_at=created_at,
+        finished_at=finished_at,
+    )
 
 
 def _positive_limit(value: int) -> None:

@@ -34,7 +34,7 @@ from tallyho.protocols.serialization import PayloadCodec, SerializerCodec
 from tallyho.storage.tx import RetryPolicy, after_commit, resolve_connection
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator, AsyncIterator, Callable, Sequence
+    from collections.abc import AsyncGenerator, AsyncIterator, Callable, Collection, Sequence
     from datetime import datetime
     from uuid import UUID
 
@@ -49,6 +49,7 @@ if TYPE_CHECKING:
     )
     from tallyho.hooks.registry import HookRegistry
     from tallyho.model.calls import TaskCall
+    from tallyho.model.states import ItemState
     from tallyho.model.views import BatchView, InFlightItem, ItemView
     from tallyho.protocols.broker import Dispatcher, WorkerFactory
     from tallyho.protocols.clock import Clock
@@ -269,6 +270,7 @@ class _Facade:
             value.tables,
             self.clock,
             progress=progress_settings,
+            items_scan_window=settings.items_scan_window,
             lease_duration=settings.lease_ttl,
         )
         self._watcher = ProgressWatcher(
@@ -416,8 +418,14 @@ class _Facade:
     async def in_flight(self, batch_id: UUID, limit: int) -> list[InFlightItem]:
         return await self._require(self._reads).in_flight(batch_id, limit=limit)
 
-    def items(self, batch_id: UUID, label: str) -> AsyncIterator[ItemView]:
-        return self._require(self._reads).items(batch_id, label=label)
+    def items(
+        self,
+        batch_id: UUID,
+        *,
+        states: Collection[ItemState] | None = None,
+        labels: Collection[str] | None = None,
+    ) -> AsyncIterator[ItemView]:
+        return self._require(self._reads).items(batch_id, states=states, labels=labels)
 
     async def find(self, kind: str, key: str) -> UUID:
         return await self._require(self._reads).find(kind, key)
