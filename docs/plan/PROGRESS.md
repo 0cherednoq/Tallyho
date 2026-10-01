@@ -6,8 +6,8 @@
 ## Текущее состояние
 
 * **Ветка:** `impl/v1`
-* **Текущая волна:** T10.5
-* **Последний зелёный коммит:** 9839ec9
+* **Текущая волна:** T10.6
+* **Последний зелёный коммит:** d377dd7
 
 ## Задачи
 
@@ -53,7 +53,7 @@
 | T10.2 | Стресс: дедлоки, конвейеры | T9.2 | done | c4cf7db |
 | T10.3 | EXPLAIN-гард | T10.2 | done | f861d82 |
 | T10.4 | Наблюдаемость и логи | T6.1 | done | 9839ec9 |
-| T10.5 | CLI | T6.1 | todo | |
+| T10.5 | CLI | T6.1 | done | d377dd7 |
 | T10.6 | Мутационное тестирование | T10.2 | todo | |
 | T11.1 | Эталонное приложение и генераторы | T8.2, T9.2 | todo | |
 | T11.2 | Оракул инвариантов | T11.1 | todo | |
@@ -72,6 +72,14 @@
 - Отклонения от плана/доков: … (или «нет»)
 - Узнали / на что обратить внимание дальше: …
 -->
+### 2026-10-01 · T10.5 · done · d377dd7
+- Сделано: CLI получил подкоманды `migrate --dsn --schema`, `inspect <uuid|kind:key> --dsn --schema` и `maintenance --dsn --schema [--hook-module ...]`. `inspect` печатает детерминированное дерево с состоянием, done/expected, found, queued, in-flight, errors, cancellations и ratio; maintenance регистрирует graceful SIGINT/SIGTERM и поддерживает детерминированный `--once`.
+- Безопасность maintenance: поскольку T10.5 не задаёт CLI-конфигурацию брокера, встроенный Dispatcher никогда не подтверждает сообщения. Relay сохраняет outbox для процесса с настоящим адаптером, при этом sweeper/finalizer/snapshotter и tx-хуки могут продолжать recovery. Это закреплено в ARCHITECTURE.
+- DoD проверен на PostgreSQL: миграция до version=2, inspect одного батча по UUID и `kind:key`, реальный maintenance pass; unit-тесты проверяют signal wiring/cleanup, платформу без `add_signal_handler`, отказ dispatch без потери outbox, рендер дерева и защитный разбор аргументов. `sys.exit` остаётся только в `tallyho.cli.__main__`.
+- Проверка: CLI — 14 passed; `poe fmt`, `poe check` — зелёные (869 быстрых тестов); pre-commit all-files — зелёный. `poe test-all` не повторялся после T10.5: `engine/` и `storage/` не менялись; непосредственно перед задачей полный gate T10.4 был зелёным (1223 passed, 1 skip, 97,09%).
+- Отклонения: добавлен `maintenance --once` для детерминированной эксплуатации и проверки. Без аргументов CLI сохраняет прежнее поведение: печатает help и возвращает 0.
+- Дальше: T10.6, мутационное тестирование CAS-запросов.
+
 ### 2026-10-01 · T10.4 · done · 9839ec9
 - Сделано: `Observer` расширен post-commit событиями create/claim и operational-событиями relay lag, размера буфера Completer, возраста старейшего lease и внутренних transaction retry. События подключены к producer, динамическим sub-batch, Completer, Relay и Sweeper; `RetryPolicy` получил нейтральный callback, поэтому storage сохранил нижнюю границу слоя.
 - Добавлен опциональный extra `otel` и `tallyho.observability.otel.OpenTelemetryObserver`: спаны `tallyho.create/claim/finish/finalize`, метрики `th_hook_failures`, `th_hook_missing`, `th_relay_lag`, `th_completer_buffer_size`, `th_oldest_lease_age`, `th_transaction_retries` только для `40P01`. Payload и аргументы задач не экспортируются; hook-логи содержат `batch_id`, `kind`, hook, attempt и только тип ошибки.
