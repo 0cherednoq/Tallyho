@@ -104,6 +104,32 @@ jobs:
       - run: uv sync --all-extras
       - run: uv run pytest tests/contract/flexiq/test_contract.py -m flexiq -n 0 --no-cov
 
+  mutation-cas:
+    name: Mutation tests (critical CAS)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: tallyho
+          POSTGRES_PASSWORD: tallyho
+          POSTGRES_DB: tallyho
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U tallyho"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      TALLYHO_TEST_DSN: postgresql+asyncpg://tallyho:tallyho@localhost:5432/tallyho
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          python-version: "3.11"
+      - run: uv sync --all-extras
+      - run: uv run poe mutation-cas
+
   build:
     name: Build distribution
     runs-on: ubuntu-latest

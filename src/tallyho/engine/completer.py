@@ -887,21 +887,25 @@ class _Tx:
         plain_values = {item_id: value for item_id, (_, value) in values.items()}
         for finished_id, batch_id, weight, attempt, depth in changed:
             value = plain_values[finished_id]
-            self.items[finished_id] = _ItemRow(
-                batch_id=batch_id,
-                state=ItemState(value.result_class),
-                attempt=attempt,
-                depth=depth,
-                weight=weight,
-            )
+            if scalar:
+                row = _ItemRow(
+                    batch_id=batch_id,
+                    state=ItemState(value.result_class),
+                    attempt=attempt,
+                    depth=depth,
+                    weight=weight,
+                )
+                self.items[finished_id] = row
+            else:
+                row = self.items[finished_id]
             successful.append(finished_id)
             counter = value.result_class.name.lower()
-            self.deltas[batch_id] += CounterDelta(**{counter: 1, "w_done": weight})
-            self.metrics[batch_id, value.effective_label, self.c.settings.slot] += 1
+            self.deltas[row.batch_id] += CounterDelta(**{counter: 1, "w_done": row.weight})
+            self.metrics[row.batch_id, value.effective_label, self.c.settings.slot] += 1
             for name, increment in value.metrics.items():
-                self.metrics[batch_id, name, self.c.settings.slot] += increment
-            self.applied.finished[finished_id] = (batch_id, value, attempt)
-            self.applied.finalize.add(batch_id)
+                self.metrics[row.batch_id, name, self.c.settings.slot] += increment
+            self.applied.finished[finished_id] = (row.batch_id, value, row.attempt)
+            self.applied.finalize.add(row.batch_id)
         await self._delete_leases(list(values))
         await self._delete_expiry(successful)
         await self._write_marks(successful, plain_values)

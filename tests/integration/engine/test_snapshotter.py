@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import timedelta
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, ClassVar
 
 import pytest
 from sqlalchemy import func, update
@@ -14,6 +14,7 @@ from tallyho.engine.producer import RootSpec, SubBatchSpec
 from tallyho.engine.snapshotter import Snapshotter, SnapshotterSettings
 from tallyho.model.calls import TaskCall
 from tallyho.model.errors import ConfigurationError
+from tallyho.model.progress import ProgressSettings
 from tallyho.model.states import BatchState
 from tallyho.protocols.clock import SystemClock
 from tallyho.protocols.observer import NullObserver
@@ -22,12 +23,14 @@ from tests.helpers.probe import committed_ids, create_probe, insert_id
 from tests.integration.engine.completer_env import schema_engine
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable, Mapping
     from uuid import UUID
 
-    from sqlalchemy.ext.asyncio import AsyncSession
+    from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
     from tallyho.hooks.registry import HookRegistry
     from tallyho.model.views import BatchSummary
+    from tallyho.storage.tables import Tables
     from tests.integration.engine.conftest import Env
 
 __all__: list[str] = []
@@ -52,6 +55,7 @@ class ExplodingObserver(NullObserver):
 
     missing_calls: int = 0
     failed_calls: int = 0
+    last_error: BaseException | None = None
 
     @override
     def hook_missing(self, *, batch_id: UUID, kind: str, hook: str) -> None:
@@ -70,10 +74,38 @@ class ExplodingObserver(NullObserver):
         attempt: int,
         error: BaseException,
     ) -> None:
-        del batch_id, kind, hook, attempt, error
+        del batch_id, kind, hook, attempt
         self.failed_calls += 1
+        self.last_error = error
         message = "observer failed"
         raise RuntimeError(message)
+
+
+class _ReadsSpy:
+    """Запомнить зависимости read model, переданные из ``Snapshotter.tick``."""
+
+    calls: ClassVar[list[tuple[object, ProgressSettings | None]]] = []
+
+    def __init__(
+        self,
+        engine: AsyncEngine,
+        tables: Tables,
+        clock: object,
+        *,
+        progress: ProgressSettings | None = None,
+    ) -> None:
+        del engine, tables
+        self.calls.append((clock, progress))
+
+    async def summaries(
+        self,
+        batch_ids: Iterable[UUID],
+        *,
+        rates: Mapping[UUID, float | None] | None = None,
+        next_seq: bool = False,
+    ) -> dict[UUID, BatchSummary]:
+        del batch_ids, rates, next_seq
+        return {}
 
 
 def snapshotter(env: Env, registry: HookRegistry, clock: ManualClock) -> Snapshotter:
@@ -140,6 +172,75 @@ async def test_tick_writes_only_changes_with_strict_seq_and_eta(
     assert len(seen) == 3
 
 
+async def test_tick_prioritizes_oldest_due_batch(env: Env, registry: HookRegistry) -> None:
+    clock = ManualClock()
+    seen: list[UUID] = []
+
+    @registry.on_progress("first", every=timedelta(seconds=30))
+    async def save_first(_session: AsyncSession, summary: BatchSummary) -> None:
+        await asyncio.sleep(0)
+        seen.append(summary.id)
+
+    async with env.transaction() as conn:
+        first = await env.producer.create_root(conn, RootSpec(kind="first"))
+
+    subject = snapshotter(env, registry, clock)
+    assert await subject.tick() == 1
+    clock.advance(5)
+
+    @registry.on_progress("second", every=timedelta(seconds=10))
+    async def save_second(_session: AsyncSession, summary: BatchSummary) -> None:
+        await asyncio.sleep(0)
+        seen.append(summary.id)
+
+    async with env.transaction() as conn:
+        second = await env.producer.create_root(conn, RootSpec(kind="second"))
+
+    assert await subject.tick() == 1
+    async with env.transaction() as conn:
+        await upsert_slots(
+            conn,
+            env.tables,
+            {
+                (first.id, 1): CounterDelta(ok=1, w_done=1),
+                (second.id, 1): CounterDelta(ok=1, w_done=1),
+            },
+        )
+    seen.clear()
+    clock.advance(25)
+    subject.settings = SnapshotterSettings(batch_size=1)
+    assert await subject.tick() == 1
+    assert seen == [second.id]
+
+
+async def test_tick_passes_clock_and_progress_settings_to_reads(
+    env: Env,
+    registry: HookRegistry,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = ManualClock()
+    progress = ProgressSettings(eta_window=timedelta(seconds=7))
+
+    @registry.on_progress("configured", every=timedelta(seconds=1))
+    async def save(_session: AsyncSession, _summary: BatchSummary) -> None:
+        await asyncio.sleep(0)
+
+    async with env.transaction() as conn:
+        _ = await env.producer.create_root(conn, RootSpec(kind="configured"))
+
+    _ReadsSpy.calls.clear()
+    monkeypatch.setattr("tallyho.engine.snapshotter.Reads", _ReadsSpy)
+    subject = Snapshotter(
+        tables=env.tables,
+        engine=schema_engine(env),
+        clock=clock,
+        hooks=registry,
+        settings=SnapshotterSettings(progress=progress),
+    )
+    assert await subject.tick() == 0
+    assert _ReadsSpy.calls == [(clock, progress)]
+
+
 async def test_finalization_wins_after_hook_and_rolls_back_domain_write(
     env: Env, registry: HookRegistry
 ) -> None:
@@ -165,7 +266,6 @@ async def test_finalization_wins_after_hook_and_rolls_back_domain_write(
             .where(env.tables.batch.c.id == root.id)
             .values(
                 state=int(BatchState.SUCCEEDED),
-                snap_seq=env.tables.batch.c.snap_seq + 1,
                 finished_at=func.now(),
             )
         )
@@ -173,7 +273,7 @@ async def test_finalization_wins_after_hook_and_rolls_back_domain_write(
     assert await running == 0
     assert await committed_ids(env.engine, probe) == []
     row = await env.batch(root.id)
-    assert row["snap_seq"] == 1
+    assert row["snap_seq"] == 0
     assert row["state"] == int(BatchState.SUCCEEDED)
 
 
@@ -230,6 +330,7 @@ async def test_hook_failure_rolls_back_and_is_retried(env: Env, registry: HookRe
     )
     assert await subject.tick() == 0
     assert observer.failed_calls == 1
+    assert isinstance(observer.last_error, RuntimeError)
     assert await committed_ids(env.engine, probe) == []
     assert (await env.batch(root.id))["snap_seq"] == 0
 
@@ -238,6 +339,27 @@ async def test_hook_failure_rolls_back_and_is_retried(env: Env, registry: HookRe
     assert await subject.tick() == 1
     assert await committed_ids(env.engine, probe) == [1]
     assert (await env.batch(root.id))["snap_seq"] == 1
+
+
+async def test_hook_timeout_rolls_back_snapshot(env: Env, registry: HookRegistry) -> None:
+    clock = ManualClock()
+
+    @registry.on_progress("slow", every=timedelta(seconds=1))
+    async def save(_session: AsyncSession, _summary: BatchSummary) -> None:
+        await asyncio.sleep(0.1)
+
+    async with env.transaction() as conn:
+        root = await env.producer.create_root(conn, RootSpec(kind="slow"))
+
+    subject = Snapshotter(
+        tables=env.tables,
+        engine=schema_engine(env),
+        clock=clock,
+        hooks=registry,
+        settings=SnapshotterSettings(hook_timeout=timedelta(milliseconds=10)),
+    )
+    assert await subject.tick() == 0
+    assert (await env.batch(root.id))["snap_seq"] == 0
 
 
 async def test_overlapping_tree_rates_and_missing_hook_are_safe(

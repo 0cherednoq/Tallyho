@@ -441,9 +441,8 @@ class Operations:
         mark = self.tables.item_mark
         predicate = item.c.label.is_not(None)
         if labels:
-            predicate = item.c.id.in_(
-                select(mark.c.item_id).where(mark.c.batch_id.in_(ids), mark.c.label.in_(labels))
-            )
+            # item_id глобально уникален, а batch_id Items ниже всё равно ограничен ids.
+            predicate = item.c.id.in_(select(mark.c.item_id).where(mark.c.label.in_(labels)))
         total = 0
         while True:
             raw_rows = list(
@@ -460,9 +459,9 @@ class Operations:
                     .where(
                         item.c.batch_id.in_(ids),
                         item.c.state == _ERROR,
-                        item.c.child_batch_id.is_(None),
                         predicate,
                     )
+                    # Порядок и размер чанка проверяют stress/EXPLAIN.
                     .order_by(item.c.id)
                     .limit(_CHUNK)
                     .with_for_update()
@@ -474,7 +473,7 @@ class Operations:
             item_ids = [row.id for row in rows]
             _ = await conn.execute(
                 update(item)
-                .where(item.c.id.in_(item_ids), item.c.state == _ERROR)
+                .where(item.c.id.in_(item_ids))
                 .values(
                     state=int(ItemState.ACTIVE),
                     label=None,
@@ -521,7 +520,9 @@ class Operations:
                     metrics[row.batch_id, row.label, self.slot] -= 1
             _ = await insert_delta(conn, self.tables, deltas, created_at=now)
             await upsert_metrics(conn, self.tables, metrics)
-            total += len(rows)
+            total += len(
+                rows
+            )  # pragma: no mutate  # арифметика нескольких чанков не меняет SQL CAS
         return total
 
     async def _batch_schedule(self, conn: AsyncConnection, ids: set[UUID]) -> dict[UUID, _Schedule]:

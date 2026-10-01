@@ -5,6 +5,8 @@ __pycache__/
 build/
 dist/
 .venv/
+.venv-wsl/
+mutants/
 
 # Tools
 .mypy_cache/

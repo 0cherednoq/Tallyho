@@ -87,6 +87,11 @@ async def test_empty_batch_finalizes_once_and_writes_callbacks(
     async with env.transaction() as conn:
         root = await env.producer.create_root(conn, RootSpec(kind="empty", callbacks=calls))
         assert await env.producer.seal(conn, root.id)
+        _ = await conn.execute(
+            update(env.tables.batch)
+            .where(env.tables.batch.c.id == root.id)
+            .values(hook_error="old", updated_at=NOW - timedelta(days=1))
+        )
 
     progress = RecordingProgress()
     subject = finalizer(env, registry, progress=progress)
@@ -96,6 +101,9 @@ async def test_empty_batch_finalizes_once_and_writes_callbacks(
     row = await env.batch(root.id)
     assert row["state"] == BatchState.SUCCEEDED
     assert row["snap_seq"] == 1
+    assert row["finished_at"] is not None
+    assert row["updated_at"] > NOW - timedelta(days=1)
+    assert row["hook_error"] is None
     assert progress.calls == [([root.id], True)]
     outbox = env.tables.outbox
     async with env.connection() as conn:
@@ -145,6 +153,65 @@ async def test_concurrent_finalizers_commit_one_hook(env: Env, registry: HookReg
     assert sorted(results) == [False, True]
     assert calls == 2
     assert len(await committed_ids(env.engine, probe)) == 1
+
+
+async def test_terminal_state_wins_while_finalizer_hook_is_running(
+    env: Env, registry: HookRegistry
+) -> None:
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    @registry.on_finalized("state-race")
+    async def save(_session: AsyncSession, _summary: BatchSummary) -> None:
+        entered.set()
+        await release.wait()
+
+    async with env.transaction() as conn:
+        root = await env.producer.create_root(conn, RootSpec(kind="state-race"))
+        _ = await env.producer.seal(conn, root.id)
+
+    running = asyncio.create_task(finalizer(env, registry).try_finalize(root.id))
+    await entered.wait()
+    async with env.transaction() as conn:
+        _ = await conn.execute(
+            update(env.tables.batch)
+            .where(env.tables.batch.c.id == root.id)
+            .values(state=int(BatchState.SUCCEEDED), finished_at=NOW)
+        )
+    release.set()
+    assert not await running
+    assert (await env.batch(root.id))["snap_seq"] == 0
+
+
+async def test_changed_snapshot_retries_finalizer_hook(env: Env, registry: HookRegistry) -> None:
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    calls = 0
+
+    @registry.on_finalized("snapshot-race")
+    async def save(_session: AsyncSession, _summary: BatchSummary) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            entered.set()
+            await release.wait()
+
+    async with env.transaction() as conn:
+        root = await env.producer.create_root(conn, RootSpec(kind="snapshot-race"))
+        _ = await env.producer.seal(conn, root.id)
+
+    running = asyncio.create_task(finalizer(env, registry).try_finalize(root.id))
+    await entered.wait()
+    async with env.transaction() as conn:
+        _ = await conn.execute(
+            update(env.tables.batch)
+            .where(env.tables.batch.c.id == root.id)
+            .values(snap_seq=env.tables.batch.c.snap_seq + 1)
+        )
+    release.set()
+    assert await running
+    assert calls == 2
+    assert (await env.batch(root.id))["snap_seq"] == 2
 
 
 async def test_hook_transaction_error_rolls_back_and_is_recorded(

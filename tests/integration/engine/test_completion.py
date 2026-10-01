@@ -5,20 +5,24 @@ from __future__ import annotations
 import asyncio
 from datetime import timedelta
 from typing import TYPE_CHECKING
+from uuid import uuid4
 
 import pytest
-from sqlalchemy import column, func, select, table
+from sqlalchemy import column, func, select, table, update
 from sqlalchemy.ext.asyncio import AsyncSession
+from typing_extensions import override
 
-from tallyho.engine.completer import FinishResult, SpawnRequest
+from tallyho.engine.completer import FinishResult, ItemRef, SpawnRequest
 from tallyho.engine.completion import complete_in
 from tallyho.engine.spawn import SpawnRoute
 from tallyho.model.calls import TaskCall
 from tallyho.model.states import ItemState, ResultClass
+from tallyho.protocols.observer import NullObserver
 from tallyho.storage.tx import resolve_connection
 from tests.helpers.probe import committed_ids, create_probe, insert_id
 from tests.integration.engine.completer_env import (
     COMPLETER_SLOT,
+    NOW,
     Finalized,
     RecordingProgress,
     open_completer,
@@ -32,6 +36,26 @@ if TYPE_CHECKING:
     from tests.integration.engine.conftest import Env
 
 __all__: list[str] = []
+
+
+class RecordingFinishObserver(NullObserver):
+    """Record the scalar completion event emitted after commit."""
+
+    def __init__(self) -> None:
+        self.finished: list[tuple[UUID, ResultClass, str | None, int]] = []
+
+    @override
+    def item_finished(
+        self,
+        *,
+        batch_id: UUID,
+        item_id: UUID,
+        result: ResultClass,
+        label: str | None,
+        attempt: int,
+    ) -> None:
+        del batch_id
+        self.finished.append((item_id, result, label, attempt))
 
 
 async def _state(env: Env, item_id: UUID) -> ItemState:
@@ -156,6 +180,57 @@ async def test_complete_in_duplicate_returns_false_and_counts_once(env: Env) -> 
 
     counters = await env.counters(seeded.batch_id)
     assert (counters.skip, counters.error, counters.pending) == (1, 0, 0)
+
+
+async def test_complete_in_scalar_persists_fields_observer_and_batch_guard(env: Env) -> None:
+    seeded = await seed(env, 2)
+    error_ref, untouched_ref = seeded.refs
+    async with env.transaction() as conn:
+        _ = await conn.execute(
+            update(env.tables.item).where(env.tables.item.c.id == error_ref.id).values(attempt=4)
+        )
+
+    observer = RecordingFinishObserver()
+    value = FinishResult(
+        result_class=ResultClass.ERROR,
+        label="rejected",
+        result={"provider": "mx-1"},
+        error={"code": 550},
+    )
+    async with open_completer(env, observer=observer) as completer:
+        async with AsyncSession(schema_engine(env)) as session:
+            assert await complete_in(session, error_ref, value, completer=completer)
+            await session.commit()
+        async with AsyncSession(schema_engine(env)) as session:
+            wrong = ItemRef(untouched_ref.id, uuid4())
+            assert not await complete_in(session, wrong, value, completer=completer)
+            await session.commit()
+
+    async with env.connection() as conn:
+        rows = (
+            await conn.execute(
+                select(env.tables.item).where(
+                    env.tables.item.c.id.in_([error_ref.id, untouched_ref.id])
+                )
+            )
+        ).mappings()
+        by_id = {row["id"]: row for row in rows}
+    changed = by_id[error_ref.id]
+    assert (
+        changed["state"],
+        changed["label"],
+        changed["result"],
+        changed["error"],
+        changed["finished_at"],
+    ) == (
+        ItemState.ERROR,
+        "rejected",
+        {"provider": "mx-1"},
+        {"code": 550},
+        NOW,
+    )
+    assert by_id[untouched_ref.id]["state"] == ItemState.ACTIVE
+    assert observer.finished == [(error_ref.id, ResultClass.ERROR, "rejected", 4)]
 
 
 async def test_complete_in_connection_spawns_atomically_and_folds_all_deltas(env: Env) -> None:
