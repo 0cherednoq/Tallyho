@@ -6,8 +6,8 @@
 ## Текущее состояние
 
 * **Ветка:** `impl/v1`
-* **Текущая волна:** T10.4
-* **Последний зелёный коммит:** f861d82
+* **Текущая волна:** T10.5
+* **Последний зелёный коммит:** 9839ec9
 
 ## Задачи
 
@@ -52,7 +52,7 @@
 | T10.1 | Приёмка A-DB | T9.1 | done | 1ca32df |
 | T10.2 | Стресс: дедлоки, конвейеры | T9.2 | done | c4cf7db |
 | T10.3 | EXPLAIN-гард | T10.2 | done | f861d82 |
-| T10.4 | Наблюдаемость и логи | T6.1 | todo | |
+| T10.4 | Наблюдаемость и логи | T6.1 | done | 9839ec9 |
 | T10.5 | CLI | T6.1 | todo | |
 | T10.6 | Мутационное тестирование | T10.2 | todo | |
 | T11.1 | Эталонное приложение и генераторы | T8.2, T9.2 | todo | |
@@ -72,6 +72,14 @@
 - Отклонения от плана/доков: … (или «нет»)
 - Узнали / на что обратить внимание дальше: …
 -->
+### 2026-10-01 · T10.4 · done · 9839ec9
+- Сделано: `Observer` расширен post-commit событиями create/claim и operational-событиями relay lag, размера буфера Completer, возраста старейшего lease и внутренних transaction retry. События подключены к producer, динамическим sub-batch, Completer, Relay и Sweeper; `RetryPolicy` получил нейтральный callback, поэтому storage сохранил нижнюю границу слоя.
+- Добавлен опциональный extra `otel` и `tallyho.observability.otel.OpenTelemetryObserver`: спаны `tallyho.create/claim/finish/finalize`, метрики `th_hook_failures`, `th_hook_missing`, `th_relay_lag`, `th_completer_buffer_size`, `th_oldest_lease_age`, `th_transaction_retries` только для `40P01`. Payload и аргументы задач не экспортируются; hook-логи содержат `batch_id`, `kind`, hook, attempt и только тип ошибки.
+- DoD проверен интеграционно: spy видит полный успешный producer → relay → claim → finish → finalize путь и gauges, а секретный аргумент отсутствует в `caplog`. Отдельный OTEL-тест проверяет четыре span и шесть метрик; storage-тест подтверждает callback на каждом реальном `40P01` retry.
+- Проверка: `poe fmt`, `poe check` — зелёные (853 быстрых теста); `poe test-all` — 1223 passed, 1 документированный Windows skip, покрытие 97,09%, seed 1036177143, 49:58; pre-commit all-files — зелёный.
+- Отклонения от плана/доков: ARCHITECTURE обновлена до реализации, потому что её roadmap относил OpenTelemetry к v1.x, а обязательная T10.4 — к v1. Пакет `observability` закреплён верхним слоем; extra остаётся полностью опциональным. Возраст lease считается от последнего claim/heartbeat как `lease_until - lease_ttl`, поскольку схема не хранит исходный `acquired_at`.
+- Дальше: T10.5, CLI `migrate`, `inspect`, `watch`, `maintenance`, `retry-finalize`, `purge` и подтверждения опасных операций.
+
 ### 2026-10-01 · T10.3 · done · f861d82
 - Сделано: добавлен production-реестр `tallyho.storage.hot_queries` из 12 SQLAlchemy statements горячего пути: восемь форм чтения `th_batch`, три — `th_item`, одна — слотов `th_counter`. У каждого запроса есть стабильное имя и допустимая верхняя оценка `Plan Rows`; partial-предикаты используют те же константы модели и metadata, что индексы §5.2.
 - `tests/integration/stress/test_explain_guard.py` за один module-scoped fixture через `generate_series` создаёт 10 000 корней, 30 000 дочерних батчей, 80 000 counter-слотов и ровно 1 000 000 Items, выполняет `ANALYZE`, затем `EXPLAIN (FORMAT JSON)` всего реестра. Гард рекурсивно запрещает `Seq Scan` по `th_batch/th_item/th_counter` и превышение индивидуального порога строк в любом узле плана.
