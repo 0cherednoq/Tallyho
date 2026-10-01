@@ -388,6 +388,9 @@ class Operations:
                     else_=int(BatchState.SEALED),
                 ),
                 finished_at=None,
+                # release() относится к последней финализации: после переоткрытия
+                # его нужно вызвать заново, иначе retention удалит дерево (§7.6).
+                released_at=None,
                 hook_error=None,
                 updated_at=now,
             )
