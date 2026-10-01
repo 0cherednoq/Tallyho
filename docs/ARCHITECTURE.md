@@ -43,6 +43,8 @@
 * доменные статусы, бизнес-процессы, стейт-машины, хранение бизнес-данных — это домен пользователя. Мы отдаём ему точные факты о группе задач в его транзакции, а что они значат для бизнеса, решает он;
 * durable execution с replay, как Temporal/DBOS.
 
+**Критерий для расширений.** Новая возможность попадает в tallyho, только если она описывает техническое выполнение группы задач: что создано, что выполняется, чем закончилось. Всё, что отвечает на вопрос «что это значит для бизнеса», остаётся в домене. Поэтому у батча нет изменяемого доменного состояния (`status`, `data`, `domain_state`), а есть только неизменяемый контекст корреляции — `attributes` и `memo` (§2, §5.1): по нему батч находят и связывают с доменной сущностью, но решений библиотека по нему не принимает.
+
 **Нефункциональные требования**
 
 | Требование | Как выполняется |
@@ -66,6 +68,8 @@
 | **Batch** | Группа задач. Техническое состояние, счётчики, колбэки, хуки |
 | **Kind** | Строковый тип батча (`"campaign_deliveries"`). По нему находятся хуки |
 | **Key** | Ключ батча для идемпотентного создания и связи с доменом. У корня уникален в пределах `kind` (`"campaign:42"`), у под-батча — в пределах дерева (`"send"`) |
+| **Attributes** | Неизменяемые пары «ключ → `str \| int \| bool`» корневого батча для корреляции и поиска (`{"tenant": "acme", "campaign_id": 42}`). Задаются при создании, индексируются, видны в сводке любого узла дерева. Не статус и не данные домена |
+| **Memo** | Неизменяемый JSON-объект корневого батча для диагностики. Не индексируется, в фильтрах не участвует |
 | **Item** | Одна задача в брокере |
 | **Sub-batch** | Батч, который для родителя выглядит одним Item (виртуальный Item). У под-батча есть `key`, уникальный внутри дерева (`"cards"`) |
 | **Этап конвейера** | Не отдельная сущность, а под-батч, который наполняют задачи других под-батчей |
@@ -194,6 +198,7 @@ classDiagram
         +batch(kind, key, ...) BatchBuilder
         +handle(batch_id) BatchHandle
         +find(kind, key) BatchHandle
+        +list_batches(kinds, states, attributes, ...) BatchPage
         +on_finalized(kind) decorator
         +on_progress(kind, every) decorator
         +on_policy_breach(kind) decorator
@@ -221,7 +226,7 @@ classDiagram
         +retry_failed(labels, session) None
         +retry_finalize() None
         +release(session) None
-        +items(label) AsyncIterator~ItemView~
+        +items(states, labels) AsyncIterator~ItemView~
     }
     class ItemContext {
         +UUID id
@@ -249,6 +254,7 @@ classDiagram
         +dict labels
         +dict metrics
         +dict~str, BatchSummary~ children
+        +dict attributes
         +int seq
         +datetime finished_at
     }
@@ -368,6 +374,7 @@ erDiagram
     TH_ITEM ||--o| TH_LEASE : "пока выполняется"
     TH_ITEM ||--o| TH_ITEM_MARK : "только помеченные"
     TH_ITEM ||--o| TH_WINDOW : "отправлен, окно max_in_flight"
+    TH_BATCH ||--o| TH_BATCH_ATTR : "только корень с атрибутами"
 
     TH_BATCH {
         uuid id PK "UUIDv7"
@@ -487,9 +494,25 @@ erDiagram
         uuid item_id PK
         uuid batch_id
     }
+    TH_BATCH_ATTR {
+        uuid batch_id PK "id корня"
+        jsonb attributes "str/int/bool, неизменяемы"
+        jsonb memo "NULL, JSON-объект без индекса"
+    }
 ```
 
-`th_meta(key PK, value)` хранит версию схемы и на диаграмме не показана. Колонок `status` и `data` у батча нет: доменное состояние живёт у пользователя.
+`th_meta(key PK, value)` хранит версию схемы и на диаграмме не показана.
+
+Доменного состояния у батча нет: колонок `status` и `data` не существует, статус и данные живут у пользователя. Есть только неизменяемый контекст корреляции — `attributes` и `memo` корня. Он хранится в side-таблице `th_batch_attr`, а не в `th_batch`: строка батча часто обновляется (состояние, `snap_seq`, `updated_at`), и каждое не-HOT обновление заново писало бы jsonb в GIN-индекс. Строка `th_batch_attr` пишется один раз в транзакции создания корня и удаляется retention вместе с деревом; для корня без атрибутов и `memo` её нет.
+
+Правила атрибутов:
+* значения — только `str`, `int` (в пределах `bigint`) и `bool`; `UUID` нормализуется в строку и при записи, и в фильтре. `float`, `None`, `datetime` и коллекции отклоняются `InvalidAttributesError` (подкласс `ConfigurationError`): containment jsonb строг к типу JSON, и неявное приведение дало бы фильтр, который молча ничего не находит;
+* ключ — непустая строка; префикс `tallyho.` зарезервирован за библиотекой. Обязательного пространства имён (`app.*`) нет;
+* лимиты — в §15;
+* атрибуты есть только у корня, как `retention` и `max_items`. `summary.attributes` и `view.attributes` любого узла дерева возвращают атрибуты корня;
+* повторный `th.batch(kind, key)` возвращает существующий батч, его атрибуты и `memo` не меняются (первый выигрывает, как для остальных параметров);
+* тенант — обычный атрибут. Фильтровать по нему в листинге обязано приложение: tallyho не знает, кто вызывает;
+* атрибуты и `memo` не попадают в логи и телеметрию.
 
 ### 5.2 Индексы и запросы горячего пути
 
@@ -505,8 +528,11 @@ erDiagram
 | th_batch | `(deadline_at) WHERE deadline_at IS NOT NULL AND state IN (open, sealed)` | sweeper: дедлайны | размер = активные |
 | th_batch | `(id) WHERE state IN (open, sealed) AND 'progress' = ANY(hooks)` | Snapshotter: активные батчи со снимками | размер = активные с хуком |
 | th_batch | `(finished_at) WHERE id = root_id AND finished_at IS NOT NULL AND retention IS NOT NULL AND (NOT release_required OR released_at IS NOT NULL)` | retention деревьями | размер = готовые к удалению |
+| th_batch | `(kind, id) WHERE parent_id IS NULL` | `th.list_batches(kinds=…)`: корни одного `kind`, keyset по `id DESC` | O(log n + k) |
+| th_batch_attr | PK `(batch_id)` | атрибуты корня в `view()` и сводке хука | O(log n) |
+| th_batch_attr | `GIN (attributes jsonb_path_ops)` | `th.list_batches(attributes=…)`: containment `@>` | размер = корни с атрибутами; пишется один раз |
 | th_item | PK | claim/finish по id | O(log n), UUIDv7 → горячие страницы справа |
-| th_item | `(batch_id, id)` | листинг, cancel, reconcile | O(log n + k) |
+| th_item | `(batch_id, id)` | листинг, `handle.items(states=…)` окнами, cancel, reconcile | O(log n + k) |
 | th_item | `UNIQUE (batch_id, key) WHERE key IS NOT NULL` | дедуп spawn/add | O(log n) |
 | th_outbox | `(available_at)` | relay | размер = неотправленное |
 | th_outbox | `(batch_id, available_at)` | pause/resume/cancel/reschedule; окно `max_in_flight`: запаркованные (`∞`) и готовые записи батча | размер = неотправленное |
@@ -519,7 +545,7 @@ erDiagram
 | th_counter_delta | `(batch_id)` | точное чтение и свёртка | размер = несвёрнутое |
 | th_counter_delta | `(created_at, id)` | sweeper: свёртка дельт старше `finalize_grace` | размер = несвёрнутое |
 | th_metric | PK `(batch_id, name, slot)` | разбивка по labels | O(names × slots) |
-| th_item_mark | PK `(batch_id, label, item_id)` | «все hard_bounce батча» для экспорта | O(log n + k) |
+| th_item_mark | PK `(batch_id, label, item_id)` | `handle.items(labels=…)`: «все hard_bounce батча» для экспорта | O(log n + k) |
 
 Хранение: `th_item` `fillfactor=85` (место для HOT). `th_counter`/`th_metric` `fillfactor=50` + агрессивный per-table autovacuum. Состояния — `smallint`. FK на горячих таблицах не объявляем: целостность держит библиотека, retention удаляет деревом чанками.
 
@@ -741,6 +767,8 @@ async def save_progress(session: AsyncSession, s: BatchSummary) -> None: ...
 | `retention=timedelta(days=14)` (по умолчанию) | Дерево удаляется через 14 дней после `finished_at` корня |
 | `retention=None` | Хранить вечно |
 | `release_required=True` | Удаление только после `handle.release(session)` **и** истечения `retention`. Для случаев, когда домену нужны детали по Items (экспорт упавших получателей) |
+
+`release()` вызывается у корня и относится к **последней финализации** дерева. `retry_failed()` на любом узле переоткрывает корень и сбрасывает его `released_at`: после новой финализации итоги Items другие, и домен должен забрать их заново и снова вызвать `release()`. Без этого retention удалил бы дерево по старому разрешению, не дожидаясь повторного экспорта. Инвариант: дерево с `release_required=True` не удаляется, пока после последней финализации корня не вызван `release()`.
 
 Удаление идёт чанками по 1 000 Items (`DELETE ... WHERE ctid IN (SELECT ... LIMIT)`), по деревьям, от листьев к корню. `handle.view()` удалённого батча бросает `BatchPurged`. Итог к этому моменту уже в домене.
 
@@ -1166,12 +1194,14 @@ sequenceDiagram
     participant SW as Sweeper retention
 
     F->>DB: финализация + on_finalized, итог в домене, outbox колбэка
-    CB->>DB: handle.items(label=hard_bounce) страницами по th_item_mark
+    CB->>DB: handle.items(labels=[hard_bounce]) страницами по th_item_mark
     CB->>D: INSERT campaign_failures ... чанками
     CB->>DB: handle.release(session) в той же транзакции, что и последний чанк
     SW->>DB: корни WHERE finished_at + retention меньше now AND (NOT release_required OR released_at IS NOT NULL)
-    SW->>DB: DELETE деревом, чанками по 1000
+    SW->>DB: DELETE деревом, чанками по 1000, вместе со строкой th_batch_attr
 ```
+
+`retry_failed()` после `release()` отменяет разрешение (§7.6): `released_at` корня снова `NULL`, колбэк экспорта выполнится после новой финализации и вызовет `release()` ещё раз. Полный рецепт экспорта исходов — §12.9.
 
 ### UC-15 Sweeper: восстановление
 
@@ -1208,12 +1238,13 @@ sequenceDiagram
     participant R as Relay
 
     O->>DB: retry_failed(labels=[exhausted], session): CAS completed_with_errors / failed → sealed
+    O->>DB: корень: finished_at = NULL, released_at = NULL
     O->>DB: чанками по th_item_mark: state=active, attempt=0, error −n, INSERT outbox
     O->>DB: доменный статус меняет сам пользователь в этой же транзакции
     R->>R: отправка → UC-03 … UC-07, on_finalized вызовется снова с новым итогом
 ```
 
-`on_finalized` после `retry_failed` вызывается повторно. Хук должен быть написан как «установить итог», а не «прибавить к итогу».
+`on_finalized` после `retry_failed` вызывается повторно. Хук должен быть написан как «установить итог», а не «прибавить к итогу». Колбэк `on_finalized_task` тоже ставится заново, а выданный ранее `release()` перестаёт действовать (§7.6): экспорт исходов Items повторяется для нового итога.
 
 `retry_failed` у этапа, который наполняет другие (например, `cards`), возможен, только пока его этапы-получатели не финализированы. Иначе новые Items не смогут никуда добавлять, и будет ошибка `DownstreamFinalized`. Повтор всего конвейера — `retry_failed` на корне: он переоткрывает этапы от источников к получателям.
 
@@ -1405,17 +1436,17 @@ th.install(fq)  # системная задача tallyho.system и DLQ-хук
 async def my_task(x: int) -> None: ...
 
 
-await th.migrate()  # или ревизии Alembic: upgrade(..., version=1), затем version=2
+await th.migrate()  # или ревизии Alembic: upgrade(..., version=1), затем version=2 и version=3
 ```
 
 ### 11.2 Сводка
 
 | Область | Методы |
 |---|---|
-| Батч | `th.batch(kind, key=, start_at=, on_succeeded=, on_completed_with_errors=, on_failed=, on_cancelled=, on_finalized_task=, failure_policy=, max_in_flight=, expected_total=, max_items=, deadline=, retention=, release_required=, session=)` → `BatchBuilder`: `add`, `map`, `add_calls`, `sub_batch`, `expect`, `seal` |
-| Под-батч / этап | `builder.sub_batch(key, fed_by=[...], on_feeder_failed="seal" или "cancel", max_in_flight=, max_depth=, expected_total=, failure_policy=, on_...=)` — те же параметры, что у батча, кроме `retention`/`release_required`/`max_items` (наследуются от корня) |
-| Поиск | `th.handle(batch_id)`, `th.find(kind, key)`, `handle.child(key)` |
-| Handle | `view`, `watch`, `wait`, `in_flight(limit=)`, `reschedule`, `pause`, `resume`, `cancel`, `retry_failed(labels=)`, `retry_finalize`, `release`, `items(label=)` |
+| Батч | `th.batch(kind, key=, start_at=, on_succeeded=, on_completed_with_errors=, on_failed=, on_cancelled=, on_finalized_task=, failure_policy=, max_in_flight=, expected_total=, max_items=, deadline=, retention=, release_required=, attributes=, memo=, session=)` → `BatchBuilder`: `add`, `map`, `add_calls`, `sub_batch`, `expect`, `seal` |
+| Под-батч / этап | `builder.sub_batch(key, fed_by=[...], on_feeder_failed="seal" или "cancel", max_in_flight=, max_depth=, expected_total=, failure_policy=, on_...=)` — те же параметры, что у батча, кроме `retention`/`release_required`/`max_items`/`attributes`/`memo` (задаются только у корня) |
+| Поиск | `th.handle(batch_id)`, `th.find(kind, key)`, `handle.child(key)`, `th.list_batches(kinds=, states=, attributes=, created_after=, created_before=, limit=, cursor=)` → `BatchPage` |
+| Handle | `view`, `watch`, `wait`, `in_flight(limit=)`, `reschedule`, `pause`, `resume`, `cancel`, `retry_failed(labels=)`, `retry_finalize`, `release`, `items(states=, labels=)` |
 | Задача | `th.item.id()`, `spawn(fn, *args, into=, key=, **kwargs)`, `spawn_call(call, into=)`, `sub_batch`, `expect(n, into=)`, `progress(done, total)`, `incr`, `ok(label=, result=)`, `skip(label)`, `error(label, detail=)`, `complete_in(session)`, `cancelled()`, `current()` |
 | Вызовы | `th.call(fn, *args, **kwargs).opts(key=, weight=, queue=)` — типизировано через `ParamSpec` |
 | Tx-хуки | `@th.on_finalized(kind)`, `@th.on_progress(kind, every=)`, `@th.on_policy_breach(kind)` |
@@ -1428,6 +1459,31 @@ await th.migrate()  # или ревизии Alembic: upgrade(..., version=1), з
 Окно считается по узкой таблице `th_window`: relay при захвате записи outbox вставляет строку `(item_id, batch_id)`, завершение Item её удаляет и возвращает в очередь столько запаркованных записей батча, сколько мест освободилось. Захват по батчу с окном сериализуется `pg_try_advisory_xact_lock`: занятый батч relay пропускает до следующего прохода. Записи сверх окна паркуются (`available_at = ∞`), scan relay страхует возврат мест. Строка окна ключом по `item_id`, поэтому повторный захват после падения relay место не удваивает.
 
 Метки итога — свободные строки. По умолчанию `ok()` без label → `"ok"`, исчерпанные попытки → `error("exhausted")`, lease истёк на последней попытке → `error("lease_expired")`, отмена → `cancelled`. `error()` по умолчанию помечается в `th_item_mark`, `ok()`/`skip()` — нет (переопределяется `mark=`).
+
+**Атрибуты.** `attributes=` и `memo=` принимает только `th.batch(...)`; правила значений — §5.1, лимиты — §15. `BatchView.attributes`, `BatchView.memo` и `BatchSummary.attributes` у любого узла дерева — значения корня; у батча без атрибутов — пустой словарь, `memo` — `None`.
+
+**Листинг батчей.** `th.list_batches(...)` возвращает только корни, от новых к старым (keyset по `id DESC`, UUIDv7):
+
+| Параметр | Значение |
+|---|---|
+| `kinds` | коллекция `kind`; `None` — любые |
+| `states` | коллекция `BatchState`; `None` — любые |
+| `attributes` | словарь, все пары которого должны совпасть (containment); значения нормализуются той же функцией, что при записи |
+| `created_after` / `created_before` | границы по `created_at`, полуинтервал `[after, before)` |
+| `limit` | размер страницы, по умолчанию 100, не больше 1 000 |
+| `cursor` | непрозрачная строка из `BatchPage.next_cursor`; чужой или испорченный курсор — `ConfigurationError` |
+
+Результат — `BatchPage(items: tuple[BatchInfo, ...], next_cursor: str | None)`. `BatchInfo` — лёгкий DTO без прогресса: `id`, `kind`, `key`, `state`, `attributes`, `created_at`, `finished_at`. Счётчики листинг не читает: за прогрессом — `th.handle(info.id).view()`. Батч, созданный во время обхода, на уже пройденные страницы не попадает и не сдвигает их: страницы не содержат ни пропусков, ни дублей среди батчей, существовавших на момент первого запроса.
+
+**Чтение Items.** `handle.items(*, states=None, labels=None)` — асинхронный итератор `ItemView` одного батча (не поддерева):
+
+* хотя бы один фильтр обязателен; вызов без фильтров — `ConfigurationError`: полный обход батча не должен получаться случайно;
+* `labels=` читает `th_item_mark` и находит только помеченные Items (по умолчанию — ошибки);
+* `states=` (коллекция `ItemState`) находит Items в любом состоянии, включая `CANCELLED`, которые не помечаются. Батч обходится по индексу `(batch_id, id)` окнами фиксированного размера: каждый запрос читает не больше `items_scan_window` строк и отдаёт из них подходящие. Один statement не сканирует весь остаток батча при редких совпадениях и не упирается в `statement_timeout`; цена — число запросов пропорционально размеру батча, а не числу совпадений;
+* оба фильтра вместе — пересечение;
+* виртуальные Items под-батчей выдаются как есть и отличаются по `child_batch_id`;
+* порядок выдачи контрактом не является; обход не изолирован снимком — Item, изменившийся во время обхода, может попасть в выдачу в любом из двух состояний. Для точного результата читайте финализированный батч;
+* удалённый батч — `BatchPurged`.
 
 ### 11.3 Адаптер flexiq
 
@@ -2164,6 +2220,85 @@ finally:
     await app.close()
 ```
 
+### 12.9 Вариант: строка на каждого получателя
+
+Пример выше хранит в домене только итоговые числа. Если приложение ведёт строку на каждого получателя (`mailing_delivery`), в неё должны попасть **все** исходы, включая те, при которых код задачи не выполнялся или упал: `exhausted`, `lease_expired`, `expired`, отмена. Отдельного хука на исход Item в v1 нет (§16). Задача решается существующими механизмами в два шага: нормальный исход задача пишет сама, остальные переносит колбэк финализации.
+
+```python
+class Delivery(Base):
+    __tablename__ = "mailing_delivery"
+    campaign_id: Mapped[int] = mapped_column(primary_key=True)
+    email: Mapped[str] = mapped_column(primary_key=True)  # = ключ Item в этапе send
+    status: Mapped[str] = mapped_column(
+        default="pending"
+    )  # pending / sent / skipped / failed / cancelled
+    reason: Mapped[str | None]
+
+
+async def schedule(session: AsyncSession, campaign_id: int, at: datetime) -> None:
+    ...
+    async with th.batch(
+        kind=KIND,
+        key=f"campaign:{c.id}",
+        start_at=at,
+        attributes={"campaign_id": c.id, "tenant": c.tenant},  # корреляция и листинг
+        release_required=True,  # дерево ждёт экспорта
+        on_finalized_task=th.call(settle_campaign, c.id),
+        session=session,
+    ) as root:
+        ...
+
+
+@fq.task(max_retries=4, retry_on=[TemporaryMailError])
+async def send_email(campaign_id: int, contact_id: int, mailbox_id: int) -> None:
+    ...
+    async with db.begin() as s:  # строка доставки и исход Item — один commit
+        await set_delivery(s, campaign_id, email, status="sent")
+        th.item.ok("sent")
+        await th.item.complete_in(s)
+
+
+@th.on_finalized(KIND)
+async def save_result(session: AsyncSession, s: BatchSummary) -> None:
+    await session.execute(
+        update(Campaign)
+        .where(Campaign.batch_id == s.id, Campaign.status.in_((*ACTIVE, "settling")))
+        .values(status="settling", outcome=FINAL[s.state], finished_at=s.finished_at, **_figures(s))
+    )  # счётчики точные уже здесь; терминальный статус поставит settle
+
+
+@fq.task(max_retries=10)
+async def settle_campaign(campaign_id: int) -> None:
+    async with db.begin() as s:
+        c = await s.get(Campaign, campaign_id, with_for_update=True)
+        if c.status != "settling":
+            return  # повторная доставка колбэка
+        root = th.handle(c.batch_id)
+        send = await root.child("send")  # Items лежат в этапе, не в корне
+        async for page in chunks(send.items(states={ItemState.ERROR, ItemState.CANCELLED}), 1000):
+            await mark_deliveries(s, campaign_id, page)  # bulk UPDATE по item.key
+        await s.execute(  # получатели, не ставшие Items
+            update(Delivery)
+            .where(Delivery.campaign_id == campaign_id, Delivery.status == "pending")
+            .values(status="cancelled", reason="not_dispatched")
+        )
+        c.status = c.outcome
+        await root.release(session=s)  # release — у корня, в той же транзакции
+```
+
+Условия, без которых рецепт некорректен:
+
+* **Нормальный путь пишет строку в самой задаче**, через `complete_in`. Экспорт читает только `ERROR` и `CANCELLED`. Item, который после `retry_failed()` завершился успешно, исправит свою строку сам, тем же кодом задачи.
+* **Последний шаг — запрос по остатку.** Получатели, которые так и не стали Items (отмена посреди разворачивания, дубли по ключу, `skipped_by_limit`), в `items()` не появятся; их строки закрывает один `UPDATE ... WHERE status = 'pending'`.
+* **Счётчики ставит `on_finalized`**, а не колбэк: `summary` уже содержит точные абсолютные числа, и они атомарны с финализацией.
+* **Терминальный доменный статус ставит колбэк.** Между финализацией и экспортом кампания находится в промежуточном `settling`. Поэтому кампания не бывает «завершена, а строки доставок ещё не обновлены».
+* **Колбэк идемпотентен.** Экспорт, итоговый статус и `release()` — одна транзакция. Падение посередине оставляет `settling` и неосвобождённое дерево; повтор безопасен. Для аудиторий, где одна транзакция слишком велика, чанки коммитятся отдельно, а `release()` идёт в транзакции последнего.
+* **`retry_failed()` повторяет цикл**: `released_at` сбрасывается (§7.6), `on_finalized` снова ставит `settling` и новый итог, колбэк экспортирует оставшиеся ошибки и вызывает `release()` ещё раз.
+
+Что рецепт не даёт: инфраструктурные исходы видны в домене только после финализации батча, а не по мере появления. Доставка исходов «по ходу» отложена (§16).
+
+Исполняемая версия — отдельный сценарий на малом объёме в `tests/examples/mailing/`.
+
 ---
 
 ## 13. Второй пример: конвейер парсинга
@@ -2369,6 +2504,11 @@ xychart-beta
 | `lock_timeout` | 5 с | retry на `55P03/40P01/40001` |
 | `retention` | 14 дней | `None` — вечно; учитывает `release_required` |
 | `watch_throttle` | 500 мс | NOTIFY не чаще на батч |
+| `attributes_max_keys` | 32 | число атрибутов корня |
+| `attributes_max_key_bytes` / `attributes_max_value_bytes` | 128 / 512 | длина ключа и строкового значения в UTF-8 |
+| `attributes_max_bytes` | 8 КиБ | размер всего словаря атрибутов в JSON |
+| `memo_max_bytes` | 16 КиБ | размер `memo` в JSON |
+| `items_scan_window` | 5 000 | сколько строк `th_item` читает один запрос `handle.items(states=…)` |
 
 ---
 
@@ -2380,9 +2520,18 @@ xychart-beta
 * отложенный старт, pause/resume/cancel, retry_failed;
 * групповой коммит, sweeper;
 * tx-хуки `on_finalized / on_progress / on_policy_breach`, retention + release;
+* неизменяемые атрибуты и `memo` корня, листинг батчей, чтение Items по состояниям и меткам;
 * миграции, адаптер flexiq, `tallyho.testing`, бенчмарк-стенд.
 
-**v1.x**: `watch()` + SSE-хелпер, admin read-only эндпоинты.
+**v1.x**: `watch()` + SSE-хелпер, admin read-only эндпоинты. Отложено сознательно, всё добавляется без поломки совместимости:
+
+| Что | Когда возвращаться | Чем обходиться в v1 |
+|---|---|---|
+| Read Model: стабильные PG views поверх `th_*` | появился потребитель, которому мало `view()` и листинга | `th.list_batches`, `handle.view()`, доменные таблицы через tx-хуки |
+| Operational API (`th.health()`, очереди, отставание) | нужен программный доступ, а не метрики | `Observer` и метрики §10, CLI `inspect` |
+| Изменяемые search attributes | доказан сценарий, который нельзя выразить доменной таблицей | неизменяемые `attributes` + доменная таблица |
+| Tx-хук `on_started` / `on_started_task` | появилось правило, которое должно сработать строго до первой задачи | доменный переход в первой задаче (§12.4, `expand_audience`) |
+| Очередь результатов `th.results.take(session=)` и хук `on_terminal_items` | нужно видеть инфраструктурные исходы Items в домене, пока батч ещё идёт | рецепт финального экспорта (§12.9) |
 
 CLI v1 предоставляет `migrate`, отдельный процесс `maintenance` и read-only
 `inspect` дерева. CLI maintenance не подтверждает outbox без явно установленного
