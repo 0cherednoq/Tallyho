@@ -34,7 +34,14 @@ from tallyho.protocols.serialization import PayloadCodec, SerializerCodec
 from tallyho.storage.tx import RetryPolicy, after_commit, resolve_connection
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator, AsyncIterator, Callable, Collection, Sequence
+    from collections.abc import (
+        AsyncGenerator,
+        AsyncIterator,
+        Callable,
+        Collection,
+        Mapping,
+        Sequence,
+    )
     from datetime import datetime
     from uuid import UUID
 
@@ -48,9 +55,10 @@ if TYPE_CHECKING:
         EngineSettings,
     )
     from tallyho.hooks.registry import HookRegistry
+    from tallyho.model.attributes import AttributeValue
     from tallyho.model.calls import TaskCall
-    from tallyho.model.states import ItemState
-    from tallyho.model.views import BatchView, InFlightItem, ItemView
+    from tallyho.model.states import BatchState, ItemState
+    from tallyho.model.views import BatchPage, BatchView, InFlightItem, ItemView
     from tallyho.protocols.broker import Dispatcher, WorkerFactory
     from tallyho.protocols.clock import Clock
     from tallyho.protocols.ids import IdFactory
@@ -428,6 +436,27 @@ class _Facade:
         labels: Collection[str] | None = None,
     ) -> AsyncIterator[ItemView]:
         return self._require(self._reads).items(batch_id, states=states, labels=labels)
+
+    async def list_batches(  # ruff: ignore[too-many-arguments]  # фильтры листинга именованные (ARCHITECTURE §11.2)
+        self,
+        *,
+        kinds: Collection[str] | None = None,
+        states: Collection[BatchState] | None = None,
+        attributes: Mapping[str, AttributeValue] | None = None,
+        created_after: datetime | None = None,
+        created_before: datetime | None = None,
+        limit: int = 100,
+        cursor: str | None = None,
+    ) -> BatchPage:
+        return await self._require(self._reads).list_batches(
+            kinds=kinds,
+            states=states,
+            attributes=attributes,
+            created_after=created_after,
+            created_before=created_before,
+            limit=limit,
+            cursor=cursor,
+        )
 
     async def find(self, kind: str, key: str) -> UUID:
         return await self._require(self._reads).find(kind, key)

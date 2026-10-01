@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 from collections import defaultdict
 from collections.abc import Collection
 from dataclasses import dataclass
@@ -15,8 +16,20 @@ from sqlalchemy import cast as sql_cast
 from tallyho.model.errors import BatchPurged, ConfigurationError, NotFoundError
 from tallyho.model.progress import NodeCounters, ProgressSettings, compute_progress
 from tallyho.model.states import BatchState, CancelReason, ItemState
-from tallyho.model.views import BatchSummary, BatchView, InFlightItem, ItemView
+from tallyho.model.views import (
+    BatchInfo,
+    BatchPage,
+    BatchSummary,
+    BatchView,
+    InFlightItem,
+    ItemView,
+)
 from tallyho.storage.attributes import attributes_from_json, memo_from_json
+from tallyho.storage.batch_listing import (
+    DEFAULT_LIST_LIMIT,
+    MAX_LIST_LIMIT,
+    list_batches_statement,
+)
 from tallyho.storage.item_scan import (
     DEFAULT_ITEMS_SCAN_WINDOW,
     item_window_statement,
@@ -76,6 +89,8 @@ _WindowRow: TypeAlias = tuple[
     datetime | None,
 ]
 """Граница окна (``last_id``, ``scanned``) и колонки ``ITEM_VIEW_FIELDS``."""
+_ListRow: TypeAlias = tuple[UUID, str, str | None, int, datetime, datetime | None, object]
+"""Колонки ``BATCH_INFO_FIELDS`` и jsonb ``attributes``."""
 
 _NON_POSITIVE_LIMIT = "limit должен быть положительным целым числом"
 _ROOT_NOT_FOUND = "корневой батч не найден"
@@ -84,6 +99,12 @@ _NO_ITEM_FILTER = "handle.items() требует хотя бы один филь
 _EMPTY_ITEM_FILTER = "фильтр handle.items() не может быть пустой коллекцией"
 _BAD_STATES = "states должен быть коллекцией ItemState"
 _BAD_LABELS = "labels должен быть коллекцией строк, а не одной строкой"
+_BAD_KINDS = "kinds должен быть коллекцией строк, а не одной строкой"
+_BAD_BATCH_STATES = "states должен быть коллекцией BatchState"
+_BAD_CURSOR = "cursor листинга не распознан: передавайте BatchPage.next_cursor без изменений"
+_BAD_LIST_LIMIT = f"limit листинга должен быть целым от 1 до {MAX_LIST_LIMIT}"
+_BAD_BOUND = "created_after и created_before должны быть datetime с часовым поясом"
+_CURSOR_VERSION = b"\x01"
 
 
 @dataclass(frozen=True, slots=True)
@@ -384,6 +405,60 @@ class Reads:
             if scanned < window:
                 return
 
+    async def list_batches(  # ruff: ignore[too-many-arguments]  # фильтры листинга именованные (ARCHITECTURE §11.2)
+        self,
+        *,
+        kinds: Collection[str] | None = None,
+        states: Collection[BatchState] | None = None,
+        attributes: Mapping[str, AttributeValue] | None = None,
+        created_after: datetime | None = None,
+        created_before: datetime | None = None,
+        limit: int = DEFAULT_LIST_LIMIT,
+        cursor: str | None = None,
+    ) -> BatchPage:
+        """List root batches from newest to oldest with keyset pagination.
+
+        ``attributes`` must already be normalized. Counters are not read.
+
+        Returns:
+            One page and an opaque cursor for the next one.
+
+        Raises:
+            ConfigurationError: A filter, the limit or the cursor is malformed.
+        """
+        if isinstance(limit, bool) or not 1 <= limit <= MAX_LIST_LIMIT:
+            raise ConfigurationError(_BAD_LIST_LIMIT)
+        for bound in (created_after, created_before):
+            if bound is not None and bound.tzinfo is None:
+                raise ConfigurationError(_BAD_BOUND)
+        statement = list_batches_statement(
+            self.tables,
+            kinds=_collection(kinds, str, _BAD_KINDS),
+            states=_collection(states, BatchState, _BAD_BATCH_STATES),
+            attributes=attributes,
+            created_after=created_after,
+            created_before=created_before,
+            before_id=_decode_cursor(cursor),
+            # Лишняя строка говорит, есть ли следующая страница.
+            limit=limit + 1,
+        )
+        async with self.engine.connect() as conn:
+            rows = cast("list[_ListRow]", (await conn.execute(statement)).all())
+        items = tuple(
+            BatchInfo(
+                id=batch_id,
+                kind=kind,
+                key=key,
+                state=BatchState(state),
+                attributes=attributes_from_json(raw_attributes),
+                created_at=created_at,
+                finished_at=finished_at,
+            )
+            for batch_id, kind, key, state, created_at, finished_at, raw_attributes in rows[:limit]
+        )
+        more = len(rows) > limit
+        return BatchPage(items=items, next_cursor=_encode_cursor(items[-1].id) if more else None)
+
     async def find(self, kind: str, key: str) -> UUID:
         """Find a root batch by its idempotency key.
 
@@ -632,6 +707,32 @@ def _collection(value: object, member: type[_MemberT], message: str) -> tuple[_M
     if len(checked) != len(members):
         raise ConfigurationError(message)
     return checked
+
+
+def _encode_cursor(batch_id: UUID) -> str:
+    return base64.urlsafe_b64encode(_CURSOR_VERSION + batch_id.bytes).decode("ascii").rstrip("=")
+
+
+def _decode_cursor(cursor: object) -> UUID | None:
+    """Разобрать курсор листинга.
+
+    Returns:
+        Последний id предыдущей страницы или ``None`` для первой.
+
+    Raises:
+        ConfigurationError: Курсор не строка или не создан ``list_batches``.
+    """
+    if cursor is None:
+        return None
+    if not isinstance(cursor, str):
+        raise ConfigurationError(_BAD_CURSOR)
+    try:
+        raw = base64.b64decode(cursor + "=" * (-len(cursor) % 4), altchars=b"-_", validate=True)
+    except ValueError as exc:
+        raise ConfigurationError(_BAD_CURSOR) from exc
+    if len(raw) != 1 + 16 or raw[:1] != _CURSOR_VERSION:
+        raise ConfigurationError(_BAD_CURSOR)
+    return UUID(bytes=raw[1:])
 
 
 def _item_view(row: _WindowRow) -> ItemView:

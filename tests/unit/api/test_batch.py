@@ -17,15 +17,17 @@ from tallyho.engine.public import BatchDefinition, BatchReference, BatchWriter, 
 from tallyho.model.calls import TaskCall
 from tallyho.model.errors import ConfigurationError
 from tallyho.model.states import BatchState, ItemState, OnFeederFailed
+from tallyho.model.views import BatchPage
 from tallyho.protocols.broker import Dispatcher
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Callable, Collection, Sequence
+    from collections.abc import AsyncIterator, Callable, Collection, Mapping, Sequence
     from types import TracebackType
 
     from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession
 
     from tallyho.engine.public import MaintenanceRunner
+    from tallyho.model.attributes import AttributeValue
     from tallyho.model.views import BatchView, InFlightItem, ItemView
     from tallyho.protocols.broker import Message, WorkerFactory
 
@@ -196,6 +198,26 @@ class Facade(EngineFacade):
     ) -> AsyncIterator[ItemView]:
         self.calls.append(("items", (batch_id, states, labels)))
         return no_items()
+
+    @override
+    async def list_batches(
+        self,
+        *,
+        kinds: Collection[str] | None = None,
+        states: Collection[BatchState] | None = None,
+        attributes: Mapping[str, AttributeValue] | None = None,
+        created_after: datetime | None = None,
+        created_before: datetime | None = None,
+        limit: int = 100,
+        cursor: str | None = None,
+    ) -> BatchPage:
+        self.calls.append(
+            (
+                "list_batches",
+                (kinds, states, attributes, created_after, created_before, limit, cursor),
+            )
+        )
+        return BatchPage(items=())
 
     @override
     async def find(self, kind: str, key: str) -> UUID:

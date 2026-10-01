@@ -24,7 +24,7 @@ from tallyho.protocols.ids import UuidV7Factory
 from tallyho.protocols.observer import NullObserver
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable, Iterable, Mapping
+    from collections.abc import Awaitable, Callable, Collection, Iterable, Mapping
     from datetime import datetime
     from uuid import UUID
 
@@ -33,6 +33,8 @@ if TYPE_CHECKING:
     from tallyho.engine.public import EngineFacade, MaintenanceRunner
     from tallyho.hooks.registry import FinalizedT, PolicyBreachT, ProgressT
     from tallyho.model.calls import TaskCall
+    from tallyho.model.states import BatchState
+    from tallyho.model.views import BatchPage
     from tallyho.protocols.broker import Dispatcher
     from tallyho.protocols.clock import Clock
     from tallyho.protocols.ids import IdFactory
@@ -390,6 +392,40 @@ class Tallyho:
             Handle найденного корня.
         """
         return self.handle(await self._engine.find(kind, key))
+
+    async def list_batches(  # ruff: ignore[too-many-arguments]  # публичный API задан ARCHITECTURE §11.2
+        self,
+        *,
+        kinds: Collection[str] | None = None,
+        states: Collection[BatchState] | None = None,
+        attributes: Mapping[str, object] | None = None,
+        created_after: datetime | None = None,
+        created_before: datetime | None = None,
+        limit: int = 100,
+        cursor: str | None = None,
+    ) -> BatchPage:
+        """Перечислить корневые батчи от новых к старым.
+
+        Все фильтры необязательны и объединяются по «и». ``attributes`` —
+        пары, которые должны совпасть с атрибутами корня; значения
+        нормализуются так же, как при создании (``UUID`` → строка, типы не
+        приводятся). Счётчики не читаются: за прогрессом —
+        ``th.handle(info.id).view()``. Фильтр по тенанту — обязанность
+        приложения.
+
+        Returns:
+            Страница ``BatchInfo`` и непрозрачный ``next_cursor``; ``None`` —
+            страниц больше нет.
+        """
+        return await self._engine.list_batches(
+            kinds=kinds,
+            states=states,
+            attributes=normalize_attributes(attributes, limits=self.settings.attribute_limits()),
+            created_after=created_after,
+            created_before=created_before,
+            limit=limit,
+            cursor=cursor,
+        )
 
     def call(
         self,

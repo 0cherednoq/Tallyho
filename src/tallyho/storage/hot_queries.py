@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Protocol, TypeVar, final
 from sqlalchemy import any_, literal, select
 
 from tallyho.model.states import TERMINAL_THRESHOLD, BatchState, ItemState
+from tallyho.storage.batch_listing import DEFAULT_LIST_LIMIT, list_batches_statement
 from tallyho.storage.item_scan import DEFAULT_ITEMS_SCAN_WINDOW, item_window_statement
 from tallyho.storage.tables import PROGRESS_HOOK
 
@@ -29,6 +30,8 @@ __all__ = ["HOT_QUERIES", "HotQuery", "HotQueryProbe", "HotQueryRegistry"]
 
 _OPEN_OR_SEALED = (int(BatchState.OPEN), int(BatchState.SEALED))
 _PAGE = 1_000
+# Листинг идёт по индексу до LIMIT: узел скана оценивается всеми корнями одного kind.
+_LISTED_ROOTS = 10_000
 
 
 @dataclass(frozen=True, slots=True)
@@ -196,6 +199,20 @@ def _retention(tables: Tables, probe: HotQueryProbe) -> Select[UUID]:
         )
         .order_by(batch.c.finished_at)
         .limit(_PAGE)
+    )
+
+
+@HOT_QUERIES.register("batch.list_by_kind", max_plan_rows=_LISTED_ROOTS)
+def _list_by_kind(tables: Tables, probe: HotQueryProbe) -> Select[*tuple[object, ...]]:
+    return list_batches_statement(
+        tables, kinds=(probe.kind,), before_id=probe.root_id, limit=DEFAULT_LIST_LIMIT + 1
+    )
+
+
+@HOT_QUERIES.register("batch.list_by_attributes", max_plan_rows=_LISTED_ROOTS)
+def _list_by_attributes(tables: Tables, probe: HotQueryProbe) -> Select[*tuple[object, ...]]:
+    return list_batches_statement(
+        tables, attributes={"key": probe.key}, limit=DEFAULT_LIST_LIMIT + 1
     )
 
 

@@ -20,8 +20,8 @@ if TYPE_CHECKING:
     from tallyho.model.attributes import AttributeValue
     from tallyho.model.calls import TaskCall
     from tallyho.model.policy import FailurePolicy
-    from tallyho.model.states import ItemState
-    from tallyho.model.views import BatchView, InFlightItem, ItemView
+    from tallyho.model.states import BatchState, ItemState
+    from tallyho.model.views import BatchPage, BatchView, InFlightItem, ItemView
     from tallyho.protocols.broker import Dispatcher, WorkerFactory
     from tallyho.protocols.clock import Clock
     from tallyho.protocols.ids import IdFactory
@@ -177,6 +177,20 @@ class EngineFacade(Protocol):
         labels: Collection[str] | None = None,
     ) -> AsyncIterator[ItemView]:
         """Поток Items батча по состояниям, меткам или их пересечению."""
+        ...
+
+    async def list_batches(  # ruff: ignore[too-many-arguments]  # фильтры листинга именованные (ARCHITECTURE §11.2)
+        self,
+        *,
+        kinds: Collection[str] | None = None,
+        states: Collection[BatchState] | None = None,
+        attributes: Mapping[str, AttributeValue] | None = None,
+        created_after: datetime | None = None,
+        created_before: datetime | None = None,
+        limit: int = 100,
+        cursor: str | None = None,
+    ) -> BatchPage:
+        """Страница листинга корневых батчей."""
         ...
 
     async def find(self, kind: str, key: str) -> UUID:

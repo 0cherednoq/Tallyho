@@ -38,7 +38,7 @@ pytestmark = [
 ITEM_COUNT = 1_000_000
 BATCH_COUNT = 10_000
 CHILD_COUNT = 30_000
-FORBIDDEN_SEQ_SCAN = frozenset({"th_item", "th_batch", "th_counter"})
+FORBIDDEN_SEQ_SCAN = frozenset({"th_item", "th_batch", "th_counter", "th_batch_attr"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -175,6 +175,19 @@ async def _populate(connection: AsyncConnection) -> None:
         ),
         {"batches": BATCH_COUNT},
     )
+    await connection.execute(
+        text(
+            """
+            INSERT INTO th_batch_attr (batch_id, attributes)
+            SELECT
+                ('00000000-0000-0000-0000-' || lpad(g::text, 12, '0'))::uuid,
+                jsonb_build_object('key', g::text, 'tenant', 'tenant-' || (g % 50)::text)
+            FROM generate_series(1, :batches) AS g
+            """
+        ),
+        {"batches": BATCH_COUNT},
+    )
+    await connection.execute(text("ANALYZE th_batch_attr"))
     await connection.execute(text("ANALYZE th_batch"))
     await connection.execute(text("ANALYZE th_item"))
     await connection.execute(text("ANALYZE th_counter"))
@@ -234,7 +247,7 @@ async def test_hot_path_plans_have_no_large_or_sequential_scans(
 ) -> None:
     database = populated_database
     queries = HOT_QUERIES.build(database.tables, database.probe)
-    assert len(queries) == 13
+    assert len(queries) == 15
     assert len({query.name for query in queries}) == len(queries)
     async with schema_connection(database.engine, database.schema) as connection:
         await _set_search_path(connection, database.schema)
