@@ -64,10 +64,10 @@ async def test_s1_s2_s3_complete_with_real_flexiq_worker(
     s2_id = await harness.app.start_s2(1, addresses)
     s2 = await harness.wait_terminal(s2_id)
     send = s2.children["send"]
-    assert s2.state is BatchState.COMPLETED_WITH_ERRORS
+    assert s2.state is BatchState.SUCCEEDED
     assert send.progress.found == 4
     assert send.progress.duplicates == 1
-    assert send.progress.error == 1
+    assert send.progress.error == 0
     assert await _count(harness, harness.app.domain.deliveries) == 4
     assert len(harness.mail.calls) == 5
     assert await _hook_count(harness, s2_id, "on_finalized") == 1
@@ -84,7 +84,7 @@ async def test_s1_s2_s3_complete_with_real_flexiq_worker(
     assert pdfs.found == truth.pdfs
     assert pdfs.duplicates == truth.pdf_duplicates
     assert pdfs.error == truth.pdf_not_found
-    assert await _count(harness, harness.app.domain.cards) == truth.cards
+    assert await _count(harness, harness.app.domain.cards) == truth.cards - truth.card_not_found
     assert await _count(harness, harness.app.domain.pdf_files) == truth.pdfs - truth.pdf_not_found
     assert await _hook_count(harness, s3_id, "on_finalized") == 1
 

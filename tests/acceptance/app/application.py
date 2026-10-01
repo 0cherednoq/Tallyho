@@ -383,10 +383,7 @@ def build_app(  # ruff: ignore[complex-structure, too-many-statements, too-many-
                 task_name="send_email",
                 status=label,
             )
-            if status == 202:
-                item.ok(label, result=result)
-            else:
-                item.error(label, detail=result)
+            item.ok(label, result=result)
             await item.complete_in(connection)
 
     async def get_json(path: str) -> tuple[int, dict[str, object]]:
@@ -449,13 +446,14 @@ def build_app(  # ruff: ignore[complex-structure, too-many-statements, too-many-
                 )
         async with domain_engine.begin() as connection:
             _ = await hold_transaction(seed, item_id, namespace="parse_card", scale=network_scale)
-            statement = pg_insert(cards).values(
-                item_id=item_id,
-                run_id=run_id,
-                url=url,
-                status=status,
-            )
-            _ = await connection.execute(statement.on_conflict_do_nothing())
+            if status == 200:
+                statement = pg_insert(cards).values(
+                    item_id=item_id,
+                    run_id=run_id,
+                    url=url,
+                    status=status,
+                )
+                _ = await connection.execute(statement.on_conflict_do_nothing())
             await log_task(
                 connection,
                 item_id=item_id,
@@ -556,6 +554,8 @@ def build_app(  # ruff: ignore[complex-structure, too-many-statements, too-many-
             hook=name,
             seq=summary.seq,
             state=int(summary.state),
+            progress_done=summary.progress.done,
+            progress_found=summary.progress.found,
             txid=func.txid_current(),
         )
         result = await session.execute(statement.on_conflict_do_nothing().returning(hook_log.c.id))

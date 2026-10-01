@@ -142,6 +142,8 @@ hook_log = Table(
     Column("hook", String, nullable=False),
     Column("seq", BigInteger, nullable=False),
     Column("state", Integer, nullable=False),
+    Column("progress_done", BigInteger, nullable=False),
+    Column("progress_found", BigInteger, nullable=False),
     Column("txid", BigInteger, nullable=False),
     Column("at", DateTime(timezone=True), nullable=False, server_default=func.now()),
     UniqueConstraint("batch_id", "hook", "seq", name="uq_hook_log_event"),
