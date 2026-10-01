@@ -2382,7 +2382,12 @@ xychart-beta
 * tx-хуки `on_finalized / on_progress / on_policy_breach`, retention + release;
 * миграции, адаптер flexiq, `tallyho.testing`, бенчмарк-стенд.
 
-**v1.x**: `watch()` + SSE-хелпер, CLI `inspect`, admin read-only эндпоинты.
+**v1.x**: `watch()` + SSE-хелпер, admin read-only эндпоинты.
+
+CLI v1 предоставляет `migrate`, отдельный процесс `maintenance` и read-only
+`inspect` дерева. CLI maintenance не подтверждает outbox без явно установленного
+broker-процесса: recovery, финализация и tx-хуки продолжают работать, а сообщения
+остаются для relay процесса с настоящим адаптером.
 
 OpenTelemetry поставляется отдельным верхнеуровневым пакетом
 `tallyho.observability` (extra `otel`): он реализует `Observer`, не участвует в
