@@ -15,6 +15,7 @@ from tallyho.engine.public import (
     load_worker_factory,
 )
 from tallyho.hooks.registry import HookRegistry, import_hook_modules
+from tallyho.model.attributes import AttributeLimits, normalize_attributes, normalize_memo
 from tallyho.model.errors import ConfigurationError
 from tallyho.model.policy import FailurePolicy as FailurePolicyModel
 from tallyho.model.progress import ProgressSettings
@@ -23,7 +24,7 @@ from tallyho.protocols.ids import UuidV7Factory
 from tallyho.protocols.observer import NullObserver
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable, Iterable
+    from collections.abc import Awaitable, Callable, Iterable, Mapping
     from datetime import datetime
     from uuid import UUID
 
@@ -97,6 +98,11 @@ class Settings:
     retention: timedelta | None = timedelta(days=14)
     watch_throttle: timedelta = timedelta(milliseconds=500)
     items_scan_window: int = 5000
+    attributes_max_keys: int = 32
+    attributes_max_key_bytes: int = 128
+    attributes_max_value_bytes: int = 512
+    attributes_max_bytes: int = 8192
+    memo_max_bytes: int = 16384
 
     def __post_init__(self) -> None:
         """Проверить все диапазоны.
@@ -132,6 +138,7 @@ class Settings:
         _optional_positive_int("max_items", self.max_items)
         if self.retention is not None:
             _positive("retention", self.retention)
+        _ = self.attribute_limits()
 
     def _positive_durations(self) -> dict[str, timedelta]:
         return {
@@ -147,6 +154,20 @@ class Settings:
             "lock_timeout": self.lock_timeout,
             "watch_throttle": self.watch_throttle,
         }
+
+    def attribute_limits(self) -> AttributeLimits:
+        """Собрать лимиты атрибутов и ``memo`` корня (ARCHITECTURE §15).
+
+        Returns:
+            Проверенные лимиты для нормализации.
+        """
+        return AttributeLimits(
+            max_keys=self.attributes_max_keys,
+            max_key_bytes=self.attributes_max_key_bytes,
+            max_value_bytes=self.attributes_max_value_bytes,
+            max_bytes=self.attributes_max_bytes,
+            memo_max_bytes=self.memo_max_bytes,
+        )
 
     @classmethod
     def overridden(cls, values: dict[str, object]) -> Settings:
@@ -296,9 +317,15 @@ class Tallyho:
         deadline: datetime | timedelta | None = None,
         retention: timedelta | _Default | None = _DEFAULT,
         release_required: bool = False,
+        attributes: Mapping[str, object] | None = None,
+        memo: Mapping[str, object] | None = None,
         session: AsyncSession | AsyncConnection | None = None,
     ) -> BatchBuilder:
         """Создать транзакционный builder корневого батча.
+
+        ``attributes`` и ``memo`` — неизменяемый контекст корреляции корня
+        (ARCHITECTURE §5.1): проверяются здесь, до обращения к БД; повторный
+        вызов с тем же ``(kind, key)`` их не меняет.
 
         Returns:
             Builder, который нужно использовать как ``async with``.
@@ -320,6 +347,7 @@ class Tallyho:
             }.items()
             if call is not None
         }
+        limits = self.settings.attribute_limits()
         effective_max_items = (
             self.settings.max_items if isinstance(max_items, _Default) else max_items
         )
@@ -341,6 +369,8 @@ class Tallyho:
                 max_items=effective_max_items,
                 retention=effective_retention,
                 release_required=release_required,
+                attributes=normalize_attributes(attributes, limits=limits),
+                memo=normalize_memo(memo, limits=limits),
             ),
             _target=session,
         )

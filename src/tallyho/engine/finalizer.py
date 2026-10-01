@@ -30,6 +30,7 @@ from tallyho.model.states import (
 )
 from tallyho.model.views import BatchSummary
 from tallyho.protocols.observer import NullObserver
+from tallyho.storage.attributes import read_batch_attributes
 from tallyho.storage.counters import (
     CounterDelta,
     read_counters,
@@ -470,6 +471,7 @@ class Finalizer:
     ) -> BatchSummary:
         rows = await self._tree(conn, target.root_id)
         ids = [row.id for row in rows]
+        attributes = await read_batch_attributes(conn, self.tables, target.root_id)
         totals = await read_counters(conn, self.tables, ids)
         feeds = await self._feeds(conn, ids)
         in_flight = await self._in_flight(conn, ids)
@@ -519,6 +521,7 @@ class Finalizer:
                 seq=row.snap_seq + 1 if finalizing else row.snap_seq,
                 reason=row.cancel_reason,
                 finished_at=now if finalizing else row.finished_at,
+                attributes=attributes,
             )
 
         by_id = {row.id: row for row in rows}

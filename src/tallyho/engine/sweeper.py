@@ -33,6 +33,7 @@ from tallyho.model.states import (
     OutboxKind,
 )
 from tallyho.protocols.observer import NullObserver
+from tallyho.storage.attributes import delete_batch_attributes
 from tallyho.storage.counters import (
     CounterDelta,
     fold_delta_ids,
@@ -776,6 +777,7 @@ class Sweeper:
                 )
             )
         )
+        await delete_batch_attributes(conn, self.tables, leaves)
         _ = await conn.execute(delete(batch).where(batch.c.id.in_(leaves)))
         return len(leaves)
 

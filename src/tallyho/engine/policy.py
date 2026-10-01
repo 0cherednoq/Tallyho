@@ -23,6 +23,7 @@ from tallyho.model.progress import NodeCounters, compute_progress
 from tallyho.model.states import BatchState, CancelReason, ItemState, OutboxKind
 from tallyho.model.views import BatchSummary
 from tallyho.protocols.observer import NullObserver
+from tallyho.storage.attributes import read_batch_attributes
 from tallyho.storage.counters import CounterDelta, read_counters, upsert_metrics, upsert_slots
 from tallyho.storage.now import sql_now
 from tallyho.storage.tx import (
@@ -297,6 +298,7 @@ class PolicyEnforcer:
         self, conn: AsyncConnection, *, rows: list[_Batch], root: _Batch
     ) -> BatchSummary:
         ids = [row.id for row in rows]
+        attributes = await read_batch_attributes(conn, self.tables, root.root_id)
         totals = await read_counters(conn, self.tables, ids)
         metrics = await self._metrics(conn, ids)
         in_flight_result = await conn.execute(
@@ -355,6 +357,7 @@ class PolicyEnforcer:
                 seq=row.snap_seq,
                 reason=row.cancel_reason,
                 finished_at=row.finished_at,
+                attributes=attributes,
             )
 
         return build(root)

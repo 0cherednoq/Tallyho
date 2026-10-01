@@ -17,6 +17,7 @@ if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, AsyncSession
 
     from tallyho.hooks.registry import HookRegistry
+    from tallyho.model.attributes import AttributeValue
     from tallyho.model.calls import TaskCall
     from tallyho.model.policy import FailurePolicy
     from tallyho.model.states import ItemState
@@ -54,6 +55,8 @@ class BatchDefinition:
     max_items: int | None = None
     retention: timedelta | None = None
     release_required: bool = False
+    attributes: Mapping[str, AttributeValue] = field(default_factory=dict[str, "AttributeValue"])
+    memo: Mapping[str, object] | None = None
     fed_by: Sequence[UUID] = ()
     on_feeder_failed: OnFeederFailed = OnFeederFailed.SEAL
     max_depth: int | None = None

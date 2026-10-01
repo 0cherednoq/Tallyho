@@ -16,6 +16,7 @@ from tallyho.model.errors import BatchPurged, ConfigurationError, NotFoundError
 from tallyho.model.progress import NodeCounters, ProgressSettings, compute_progress
 from tallyho.model.states import BatchState, CancelReason, ItemState
 from tallyho.model.views import BatchSummary, BatchView, InFlightItem, ItemView
+from tallyho.storage.attributes import attributes_from_json, memo_from_json
 from tallyho.storage.item_scan import (
     DEFAULT_ITEMS_SCAN_WINDOW,
     item_window_statement,
@@ -30,6 +31,7 @@ if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
     from sqlalchemy.sql import ColumnElement, Select
 
+    from tallyho.model.attributes import AttributeValue
     from tallyho.protocols.clock import Clock
     from tallyho.storage.tables import Tables
 
@@ -95,6 +97,7 @@ class _ItemFilter:
 @dataclass(frozen=True, slots=True)
 class _Node:
     id: UUID
+    root_id: UUID
     parent_id: UUID | None
     kind: str
     key: str | None
@@ -112,6 +115,8 @@ class _Node:
     hook_error: str | None
     counters: NodeCounters
     values: Mapping[str, int]
+    attributes: Mapping[str, AttributeValue]
+    memo: Mapping[str, object] | None
 
 
 @final
@@ -157,8 +162,10 @@ class Reads:
             nodes = await self._tree(conn, batch_id)
         progress = compute_progress((node.counters for node in nodes), settings=self.progress)
         children = _children(nodes)
+        roots = _roots(nodes)
 
         def build(node: _Node) -> BatchView:
+            root = roots.get(node.root_id, node)
             return BatchView(
                 id=node.id,
                 kind=node.kind,
@@ -179,6 +186,8 @@ class Reads:
                 finished_at=node.finished_at,
                 hook_attempts=node.hook_attempts,
                 hook_error=node.hook_error,
+                attributes=root.attributes,
+                memo=root.memo,
             )
 
         return build(_target(nodes, batch_id))
@@ -223,6 +232,7 @@ class Reads:
             (node.counters for node in nodes), settings=self.progress, rates=rates
         )
         children = _children(nodes)
+        roots = _roots(nodes)
 
         def build(node: _Node, *, target_id: UUID) -> BatchSummary:
             return BatchSummary(
@@ -240,6 +250,7 @@ class Reads:
                 seq=node.snap_seq + int(next_seq and node.id == target_id),
                 reason=node.reason,
                 finished_at=node.finished_at,
+                attributes=roots.get(node.root_id, node).attributes,
             )
 
         by_id = {node.id: node for node in nodes}
@@ -431,6 +442,7 @@ class Reads:
         metric = self.tables.metric
         feed = self.tables.feed
         lease = self.tables.lease
+        attr = self.tables.batch_attr
         root_ids = select(batch.c.root_id).where(batch.c.id.in_(batch_ids))
 
         def counter_sum(column: ColumnElement[int]) -> ColumnElement[int]:
@@ -484,7 +496,11 @@ class Reads:
                 in_flight.label("in_flight"),
                 values.label("values"),
                 feeds.label("fed_by"),
+                # Строка есть только у корня с атрибутами: остальные узлы берут их у него.
+                attr.c.attributes.label("attributes"),
+                attr.c.memo.label("memo"),
             )
+            .select_from(batch.outerjoin(attr, attr.c.batch_id == batch.c.id))
             .where(batch.c.root_id.in_(root_ids))
             .order_by(batch.c.id)
         )
@@ -515,6 +531,7 @@ def _node(row: RowMapping) -> _Node:
     }
     return _Node(
         id=batch_id,
+        root_id=cast("UUID", row["root_id"]),
         parent_id=cast("UUID | None", row["parent_id"]),
         kind=cast("str", row["kind"]),
         key=cast("str | None", row["key"]),
@@ -548,7 +565,18 @@ def _node(row: RowMapping) -> _Node:
             fed_by=fed_by,
         ),
         values=values,
+        attributes=attributes_from_json(cast("object", row["attributes"])),
+        memo=memo_from_json(cast("object", row["memo"])),
     )
+
+
+def _roots(nodes: list[_Node]) -> Mapping[UUID, _Node]:
+    """Корни прочитанных деревьев: у них лежат атрибуты и ``memo`` всего дерева.
+
+    Returns:
+        Корень по ``root_id``.
+    """
+    return {node.id: node for node in nodes if node.parent_id is None}
 
 
 def _children(nodes: list[_Node]) -> Mapping[UUID, tuple[_Node, ...]]:

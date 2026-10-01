@@ -90,6 +90,11 @@ def test_defaults_match_architecture_table() -> None:
         "retention": timedelta(days=14),
         "watch_throttle": timedelta(milliseconds=500),
         "items_scan_window": 5000,
+        "attributes_max_keys": 32,
+        "attributes_max_key_bytes": 128,
+        "attributes_max_value_bytes": 512,
+        "attributes_max_bytes": 8192,
+        "memo_max_bytes": 16384,
     }
     assert {field.name: getattr(value, field.name) for field in fields(value)} == expected
 
@@ -100,6 +105,8 @@ def test_defaults_match_architecture_table() -> None:
         {"counter_slots": 0},
         {"counter_slots": True},
         {"items_scan_window": 0},
+        {"attributes_max_keys": 0},
+        {"memo_max_bytes": True},
         {"completer_backpressure": 10, "completer_max_batch": 11},
         {"heartbeat_every": timedelta(0)},
         {"relay_grace": timedelta(seconds=-1)},

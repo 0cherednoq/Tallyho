@@ -49,6 +49,7 @@ from tallyho.model.errors import (
     SpawnTargetError,
 )
 from tallyho.model.states import BatchState, ItemState, OnFeederFailed, OutboxKind
+from tallyho.storage.attributes import insert_batch_attributes
 from tallyho.storage.counters import CounterDelta, upsert_slots
 from tallyho.storage.now import sql_now
 
@@ -61,6 +62,7 @@ if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncConnection
 
     from tallyho.hooks.registry import HookRegistry
+    from tallyho.model.attributes import AttributeValue
     from tallyho.model.calls import TaskCall
     from tallyho.model.policy import FailurePolicy
     from tallyho.protocols.broker import CallOptionsValidator
@@ -224,6 +226,8 @@ class RootSpec(_BatchSpec):
     max_items: int | None = None
     retention: timedelta | None = None
     release_required: bool = False
+    attributes: Mapping[str, AttributeValue] = field(default_factory=dict[str, "AttributeValue"])
+    memo: Mapping[str, object] | None = None
 
     def __post_init__(self) -> None:
         """Проверить параметры.
@@ -398,6 +402,10 @@ class Producer:
         )
         inserted = await conn.scalar(stmt)
         if inserted is not None:
+            # Атрибуты неизменяемы: пишутся только вместе с новым корнем (D-038).
+            _ = await insert_batch_attributes(
+                conn, self.tables, inserted, attributes=spec.attributes, memo=spec.memo
+            )
             return BatchRef(id=inserted, root_id=inserted, created=True, kind=spec.kind)
         # Конфликт возможен только при заданном key: партиальный индекс его требует.
         found = await conn.execute(

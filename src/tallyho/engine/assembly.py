@@ -92,6 +92,8 @@ class _Writer:
                 max_items=spec.max_items,
                 retention=spec.retention,
                 release_required=spec.release_required,
+                attributes=spec.attributes,
+                memo=spec.memo,
             ),
         )
         if value.created:
