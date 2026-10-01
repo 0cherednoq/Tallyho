@@ -6,7 +6,7 @@
 ## Текущее состояние
 
 * **Ветка:** `impl/v1`
-* **Текущая волна:** T11.2
+* **Текущая волна:** Ф13 (T13.3 → T13.4 → T13.6), затем T11.3
 * **Последний зелёный коммит:** c462b29
 
 ## Задачи
@@ -56,7 +56,7 @@
 | T10.5 | CLI | T6.1 | done | d377dd7 |
 | T10.6 | Мутационное тестирование | T10.2 | done | 66b1083 |
 | T11.1 | Эталонное приложение и генераторы | T8.2, T9.2 | done | c462b29 |
-| T11.2 | Оракул инвариантов | T11.1 | todo | |
+| T11.2 | Оракул инвариантов | T11.1 | done | 1561d69 |
 | T11.3 | Хаос-контроллер, A-CH | T11.2 | todo | |
 | T11.4 | Сценарии A-UC на стенде | T11.2, T13.6 | todo | |
 | T11.5 | Бенчмарк-харнесс A-PERF | T11.1 | todo | |
@@ -64,12 +64,12 @@
 | T12.2 | CI nightly и матрица | T11.4 | todo | |
 | T12.3 | Подписание релиза | всё | human | |
 | T13.0 | Расширения: решения в ARCHITECTURE / ACCEPTANCE / DECISIONS | — | done | 0bef78d, 5e31753, 6bc17d1 |
-| Fix-2 | retry_failed() сбрасывает released_at | T13.0 | todo | |
-| T13.1 | model: атрибуты и memo | T13.0 | todo | |
-| T13.2 | storage: схема v3 (th_batch_attr, индекс листинга) | T13.0 | todo | |
+| Fix-2 | retry_failed() сбрасывает released_at | T13.0 | in_progress | 03594a3 |
+| T13.1 | model: атрибуты и memo | T13.0 | done | 115b8d8 |
+| T13.2 | storage: схема v3 (th_batch_attr, индекс листинга) | T13.0 | in_progress | fe2bb77 |
 | T13.3 | engine + api: запись и чтение атрибутов | T13.1, T13.2 | todo | |
 | T13.4 | Листинг батчей | T13.3 | todo | |
-| T13.5 | handle.items(states=, labels=) | T13.0 | todo | |
+| T13.5 | handle.items(states=, labels=) | T13.0 | in_progress | 5330030 |
 | T13.6 | Рецепт финального экспорта: пример, тесты, документация | Fix-2, T13.4, T13.5 | todo | |
 
 ## Журнал
@@ -80,6 +80,23 @@
 - Отклонения от плана/доков: … (или «нет»)
 - Узнали / на что обратить внимание дальше: …
 -->
+### 2026-10-01 · Fix-2, T13.2, T13.5 · код закоммичен, G2 ожидает · 03594a3, fe2bb77, 5330030
+- **Fix-2 (`03594a3`).** `retry_failed()` обнуляет `released_at` у всех переоткрываемых батчей (сам батч и предки, включая корень); `_retry_items` не тронут. Три интеграционных теста в `test_retry_release.py`: полный цикл на корне, повтор на под-батче, rollback пользовательской транзакции. Не покрыта граница: корень в состоянии, которое `retry_failed` не переоткрывает (например, `CANCELLED` при упавшем под-батче), сохраняет прежний `released_at`.
+- **T13.2 (`fe2bb77`).** `Tables.batch_attr` (`th_batch_attr`), индексы `th_batch_attr_attributes_idx` (GIN `jsonb_path_ops`) и `th_batch_kind_idx` (`(kind, id) WHERE parent_id IS NULL`), `SCHEMA_VERSION = 3`, миграция `_v3`, Alembic `version=3`. Операции и golden версий 1 и 2 не изменились. Тест пути v2 → v3 на непустой БД сверяет каталог с `create_all`.
+- **T13.5 (`5330030`).** `Reads.items` / `EngineFacade.items` / `BatchHandle.items(states=, labels=)`; запросы окна — `storage/item_scan.py`, в реестре EXPLAIN-гарда теперь 13 запросов; настройка `items_scan_window`. Замер A-AT-09 (`tests/integration/stress/test_items_scan.py`): батч на 1 000 000 Items, 1 000 совпадений — 202 запроса, 3,0 с всего, самый медленный запрос 49 мс.
+- Проверка: `poe check` зелёный (1063 быстрых теста); точечные интеграционные наборы storage, CLI, reads, EXPLAIN-гард, API, examples — зелёные. **G2 (`poe test-all`) для трёх задач ещё не выполнялся**: один общий прогон запланирован после T13.4, чтобы не гонять 50-минутный набор четыре раза. До него статус — `in_progress`.
+- Узнали: строго типизированный `select` требует `list[ColumnElement[object]]`; `FromClause` и `CTE` в аннотациях дают `explicit-any` — окно строится в одной функции с выводом типов. В pre-commit нельзя коммитить часть рабочего дерева, если остаток нужен mypy: коммитить задачу целиком.
+
+### 2026-10-01 · T13.1 · done · 115b8d8
+- Сделано: `tallyho.model.attributes` — `AttributeLimits`, `normalize_attributes`, `normalize_memo`, `AttributeValue`; `InvalidAttributesError(ConfigurationError)`; `BatchSummary.attributes`, `BatchView.attributes/memo`, новые `BatchInfo` и `BatchPage`. Сверх карточки отклоняются NUL и одиночные суррогаты (jsonb их не хранит), подклассы `str`/`int` приводятся к базовому типу, тексты ошибок не содержат значений.
+- Проверка: `poe check` зелёный; покрытие нового модуля 100%.
+- Отклонения: нет.
+
+### 2026-10-01 · T11.2 · done · 1561d69
+- Сделано: `tests/acceptance/oracle.py` — I-01…I-14 отдельными функциями с числовым `InvariantReport`, `recovery_timeout`; `test_oracle.py` проходит оракул на согласованном стенде и для каждого инварианта ломает данные и проверяет, что нарушение найдено. `hook_log` получил `progress_done`/`progress_found`; эталонное приложение пишет доменную строку только для успешных задач.
+- Работа начата другой сессией и осталась незакоммиченной; проверена и закоммичена здесь: acceptance — 4 passed, ruff/mypy/basedpyright чистые, `poe check` зелёный. `engine/` и `storage/` не менялись.
+- Дальше: T11.3 (хаос-контроллер); T11.4 теперь ждёт T13.6.
+
 ### 2026-10-01 · T13.0 · done · 0bef78d, 5e31753, 6bc17d1
 - Сделано: по [V1_EXTENSIONS_PLAN.md](V1_EXTENSIONS_PLAN.md) зарегистрирована фаза Ф13 и задача Fix-2. ARCHITECTURE получила критерий границ (§1), термины Attributes/Memo, таблицу `th_batch_attr` и два индекса (§5), правило «`retry_failed` отменяет `release`» (§7.6, UC-14, UC-16), `th.list_batches` и `handle.items(states=, labels=)` (§11.2), рецепт «строка на каждого получателя» (§12.9), лимиты (§15) и таблицу отложенного (§16). ACCEPTANCE: уточнён I-14, добавлены A-UC-21/22 и группа A-AT-01…12. DECISIONS: D-038…D-042.
 - Отклонения от плана/доков: документы T13.0 готовились в отдельной ветке параллельно с T10.6 и T11.1 и перенесены в `impl/v1` cherry-pick-ом; дальше Ф13 идёт прямо в `impl/v1`. T11.1 к этому моменту уже выполнена, поэтому зависимость от T13.6 перенесена с неё на T11.4 (сценарии A-UC-21/22 на стенде).
