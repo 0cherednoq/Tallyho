@@ -24,6 +24,7 @@ DOCUMENTS = (ROOT / "README.md", ROOT / "docs" / "ARCHITECTURE.md")
 EXPECTED = {
     "readme-quickstart",
     "architecture-mailing",
+    "architecture-delivery",
     "architecture-catalog",
 }
 MARKER = re.compile(r"^\s*<!--\s*tallyho-example:\s*([a-z0-9-]+)\s*-->\s*$")

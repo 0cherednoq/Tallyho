@@ -2297,7 +2297,39 @@ async def settle_campaign(campaign_id: int) -> None:
 
 Что рецепт не даёт: инфраструктурные исходы видны в домене только после финализации батча, а не по мере появления. Доставка исходов «по ходу» отложена (§16).
 
-Исполняемая версия — отдельный сценарий на малом объёме в `tests/examples/mailing/`.
+Исполняемая версия — отдельное приложение `tests/examples/mailing/delivery_app.py` и сценарии `test_delivery_export.py`: исчерпанные ретраи, отмена посреди разворачивания, падение колбэка посередине и повтор, `retry_failed()` после экспорта. Эталонный сценарий §12.6 при этом не меняется. Smoke-блок ниже извлекается из документа и выполняется в CI.
+
+<!-- tallyho-example: architecture-delivery -->
+```python
+from tallyho.model.states import BatchState, ItemState
+from tests.examples.mailing.delivery_app import KIND, DeliveryApp
+
+app = await DeliveryApp.create(engine, schema)
+try:
+    campaign_id = await app.create_campaign(
+        ["ada@ok.test", "grace@ok.test", "gone@bounce.test", "later@down.test"]
+    )
+    batch_id = await app.start(campaign_id)
+    await app.drain()
+
+    campaign = await app.campaign(campaign_id)
+    assert campaign["status"] == "completed_with_errors"  # терминальный статус поставил settle
+    assert await app.delivery(campaign_id, "ada@ok.test") == ("sent", None)
+    # hard_bounce записала сама задача, exhausted — колбэк экспорта:
+    assert await app.delivery(campaign_id, "gone@bounce.test") == ("failed", "hard_bounce")
+    assert await app.delivery(campaign_id, "later@down.test") == ("failed", "exhausted")
+
+    send = await app.th.handle(batch_id).child("send")
+    failed = [entry.key async for entry in send.items(states={ItemState.ERROR})]
+    assert sorted(failed) == ["gone@bounce.test", "later@down.test"]
+
+    page = await app.th.list_batches(kinds=[KIND], attributes={"campaign_id": campaign_id})
+    assert [(info.id, info.state) for info in page.items] == [
+        (batch_id, BatchState.COMPLETED_WITH_ERRORS)
+    ]
+finally:
+    await app.close()
+```
 
 ---
 

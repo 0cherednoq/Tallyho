@@ -53,6 +53,16 @@ finally:
     await broker.close()
 ```
 
+## Что ещё умеет
+
+* **Атрибуты и листинг.** `th.batch(..., attributes={"tenant": "acme", "campaign_id": 42})` сохраняет
+  неизменяемый контекст корня; `await th.list_batches(kinds=[...], attributes={...})` находит батчи
+  по нему, постранично и без чтения счётчиков.
+* **Исходы каждой задачи.** `handle.items(states={ItemState.ERROR, ItemState.CANCELLED})` перечисляет
+  Items батча, включая отменённые и упавшие без участия кода задачи. Как перенести их в свою таблицу
+  до удаления по retention — рецепт «строка на каждого получателя» в
+  [ARCHITECTURE §12.9](docs/ARCHITECTURE.md#129-вариант-строка-на-каждого-получателя).
+
 ## Разработка
 
 Нужен [uv](https://docs.astral.sh/uv/) и (для интеграционных тестов) Docker.
