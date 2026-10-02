@@ -152,6 +152,7 @@ CREATE TABLE th_lease (
 	attempt SMALLINT NOT NULL,
 	progress_done BIGINT,
 	progress_total BIGINT,
+	redelivered BOOLEAN DEFAULT false NOT NULL,
 	PRIMARY KEY (item_id)
 )
  WITH (autovacuum_vacuum_scale_factor = 0, autovacuum_vacuum_threshold = 1000);

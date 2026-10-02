@@ -233,6 +233,8 @@ class LeaseColumns(TypedColumns):
     attempt = _small()
     progress_done = _big(nullable=True)
     progress_total = _big(nullable=True)
+    redelivered = _bool(default=False)
+    """Брокеру подтверждён дубль доставки при живом lease: ретрая от него не будет (UC-04)."""
 
 
 @final
@@ -352,7 +354,12 @@ class Tables:
     meta: Table[MetaColumns]
 
 
-def build_metadata(prefix: str = DEFAULT_PREFIX, *, _delta_timestamps: bool = True) -> Tables:
+def build_metadata(
+    prefix: str = DEFAULT_PREFIX,
+    *,
+    _delta_timestamps: bool = True,
+    _lease_redelivery: bool = True,
+) -> Tables:
     """Описать таблицы tallyho с префиксом ``prefix`` в новом ``MetaData``.
 
     Args:
@@ -369,7 +376,7 @@ def build_metadata(prefix: str = DEFAULT_PREFIX, *, _delta_timestamps: bool = Tr
         batch_attr=_batch_attr(metadata, prefix),
         item=_item(metadata, prefix),
         outbox=_outbox(metadata, prefix),
-        lease=_lease(metadata, prefix),
+        lease=_lease(metadata, prefix, redelivery=_lease_redelivery),
         feed=_feed(metadata, prefix),
         counter=Table(
             f"{prefix}counter",
@@ -479,9 +486,29 @@ def _outbox(metadata: MetaData, prefix: str) -> Table[OutboxColumns]:
     return outbox
 
 
-def _lease(metadata: MetaData, prefix: str) -> Table[LeaseColumns]:
+def _lease(metadata: MetaData, prefix: str, *, redelivery: bool) -> Table[LeaseColumns]:
     name = f"{prefix}lease"
-    lease = Table(name, metadata, LeaseColumns, postgresql_with=_AGGRESSIVE_AUTOVACUUM)
+    lease: Table[LeaseColumns]
+    if redelivery:
+        lease = Table(name, metadata, LeaseColumns, postgresql_with=_AGGRESSIVE_AUTOVACUUM)
+    else:
+        # Схема до версии 4 заморожена без redelivered; колонку добавляет
+        # миграция v4. Этот путь используется только генератором миграций v1-v3.
+        lease = cast(
+            "Table[LeaseColumns]",
+            Table(
+                name,
+                metadata,
+                Column("item_id", Uuid(), primary_key=True),
+                Column("batch_id", Uuid(), nullable=False),
+                Column("lease_until", DateTime(timezone=True), nullable=False),
+                Column("worker_id", Text(), nullable=False),
+                Column("attempt", SmallInteger(), nullable=False),
+                Column("progress_done", BigInteger(), nullable=True),
+                Column("progress_total", BigInteger(), nullable=True),
+                postgresql_with=_AGGRESSIVE_AUTOVACUUM,
+            ),
+        )
     Index(f"{name}_until_idx", lease.c.lease_until)
     Index(f"{name}_batch_idx", lease.c.batch_id)
     return lease

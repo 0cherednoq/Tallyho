@@ -17,7 +17,8 @@
 добавляет timestamp и индекс для ограниченной по возрасту свёртки Sweeper;
 Версия 3 создаёт ``th_batch_attr`` с GIN-индексом по ``attributes`` и индекс
 листинга корней ``th_batch (kind, id)``; в операции версии 1 эти объекты не
-попадают. ``build_metadata`` всегда описывает итоговую актуальную схему.
+попадают. Версия 4 добавляет ``th_lease.redelivered`` — отметку подтверждённого
+дубля доставки. ``build_metadata`` всегда описывает итоговую актуальную схему.
 """
 
 from __future__ import annotations
@@ -56,7 +57,7 @@ __all__ = [
     "validate_schema",
 ]
 
-SCHEMA_VERSION: Final = 3
+SCHEMA_VERSION: Final = 4
 """Версия схемы, которую знает эта версия библиотеки."""
 
 VERSION_KEY: Final = "schema_version"
@@ -70,6 +71,7 @@ _PREFIX_RE: Final = re.compile(r"[a-z_][a-z0-9_]{0,15}")
 _MAX_IDENTIFIER_BYTES: Final = 63
 _LOCK_NAMESPACE: Final = "tallyho.migrate"
 _DELTA_TIMESTAMP_VERSION: Final = 2
+_LEASE_REDELIVERY_VERSION: Final = 4
 
 _PREFIX_ERROR: Final = "Префикс должен соответствовать ^[a-z_][a-z0-9_]{0,15}$"
 _SCHEMA_ERROR: Final = "Имя схемы должно быть непустым, без NUL и не длиннее 63 байт в UTF-8"
@@ -130,25 +132,32 @@ class _Installation:
     counter_delta: Table[TypedColumns]
     batch_attr: Table[TypedColumns]
     batch_kind_index: Index
+    lease: Table[TypedColumns]
 
 
 def _installation(
-    schema: str | None, prefix: str, *, delta_timestamps: bool = True
+    schema: str | None,
+    prefix: str,
+    *,
+    delta_timestamps: bool = True,
+    lease_redelivery: bool = True,
 ) -> _Installation:
     """Таблицы ``build_metadata(prefix)`` в схеме ``schema``.
 
     Returns:
         Таблицы установки; при ``schema=None`` — без квалификатора схемы.
     """
-    source = build_metadata(prefix, _delta_timestamps=delta_timestamps)
+    source = build_metadata(
+        prefix, _delta_timestamps=delta_timestamps, _lease_redelivery=lease_redelivery
+    )
     meta = source.meta
     batch: Table[TypedColumns] = source.batch
     batch_attr: Table[TypedColumns] = source.batch_attr
     counter_delta: Table[TypedColumns] = source.counter_delta
+    lease: Table[TypedColumns] = source.lease
     tables: list[Table[TypedColumns]] = [
         source.item,
         source.outbox,
-        source.lease,
         source.feed,
         source.counter,
         source.metric,
@@ -162,14 +171,16 @@ def _installation(
         batch = batch.to_metadata(target, schema=schema)
         batch_attr = batch_attr.to_metadata(target, schema=schema)
         counter_delta = counter_delta.to_metadata(target, schema=schema)
+        lease = lease.to_metadata(target, schema=schema)
         tables = [table.to_metadata(target, schema=schema) for table in tables]
     return _Installation(
         schema=schema,
-        tables=sorted([*tables, batch, counter_delta, meta], key=lambda t: t.name),
+        tables=sorted([*tables, batch, counter_delta, lease, meta], key=lambda t: t.name),
         meta=meta,
         counter_delta=counter_delta,
         batch_attr=batch_attr,
         batch_kind_index=_index(batch, "_kind_idx"),
+        lease=lease,
     )
 
 
@@ -255,10 +266,34 @@ def _v3(installation: _Installation) -> list[Executable]:
     ]
 
 
+class _AddLeaseRedelivered(ExecutableDDLElement):
+    """Добавить ``th_lease.redelivered`` с безопасно скомпилированным именем таблицы."""
+
+    table: Table[TypedColumns]
+
+    def __init__(self, table: Table[TypedColumns]) -> None:
+        self.table = table
+
+
+@compiles(_AddLeaseRedelivered, "postgresql")
+def _compile_add_lease_redelivered(
+    element: _AddLeaseRedelivered, compiler: object, **_: object
+) -> str:
+    preparer = cast("DDLCompiler", compiler).preparer
+    table = preparer.format_table(element.table)
+    # Константный DEFAULT не переписывает таблицу; он остаётся и в итоговой схеме.
+    return f"ALTER TABLE {table} ADD COLUMN redelivered BOOLEAN DEFAULT false NOT NULL"
+
+
+def _v4(installation: _Installation) -> list[Executable]:
+    return [_AddLeaseRedelivered(installation.lease)]
+
+
 _MIGRATIONS: Final[Mapping[int, Callable[[_Installation], list[Executable]]]] = {
     1: _v1,
     2: _v2,
     3: _v3,
+    4: _v4,
 }
 
 
@@ -315,6 +350,7 @@ def migration_statements(
         schema,
         prefix,
         delta_timestamps=version >= _DELTA_TIMESTAMP_VERSION,
+        lease_redelivery=version >= _LEASE_REDELIVERY_VERSION,
     )
     return [
         _lock_timeout_statement(lock_timeout),
