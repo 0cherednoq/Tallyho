@@ -7,6 +7,7 @@ import asyncio
 
 from tallyho.cli.app import serve_maintenance
 from tests.acceptance.app.application import build_app
+from tests.acceptance.app.options import add_tuning_arguments, tuning_from
 
 __all__ = ["main"]
 
@@ -21,6 +22,7 @@ async def _run(values: argparse.Namespace) -> None:
         mail_url=values.mail_url,
         seed=values.seed,
         network_scale=values.network_scale,
+        tuning=tuning_from(values),
     )
     try:
         await app.migrate()
@@ -40,6 +42,7 @@ def main() -> None:
     parser.add_argument("--mail-url", required=True)
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--network-scale", type=float, default=1.0)
+    add_tuning_arguments(parser)
     asyncio.run(_run(parser.parse_args()))
 
 

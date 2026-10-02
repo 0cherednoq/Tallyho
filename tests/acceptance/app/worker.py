@@ -6,6 +6,7 @@ import argparse
 from pathlib import Path
 
 from tests.acceptance.app.application import build_app
+from tests.acceptance.app.options import add_tuning_arguments, tuning_from
 
 __all__ = ["main"]
 
@@ -25,6 +26,7 @@ def main() -> None:
     parser.add_argument("--permanent-rate", type=float, default=0.01)
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--ready", type=Path)
+    add_tuning_arguments(parser)
     values = parser.parse_args()
     app = build_app(
         dsn=values.dsn,
@@ -38,6 +40,7 @@ def main() -> None:
         transient_rate=values.transient_rate,
         permanent_rate=values.permanent_rate,
         worker_count=values.workers,
+        tuning=tuning_from(values),
     )
     if values.ready is not None:
         values.ready.write_text("ready", encoding="utf-8")

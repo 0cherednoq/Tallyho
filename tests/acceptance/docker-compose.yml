@@ -1,10 +1,64 @@
+# Приёмочный стенд (ACCEPTANCE §2): PostgreSQL 16, toxiproxy, 4 воркера flexiq, 2 реплики API.
+#
+# У каждого процесса свой прокси toxiproxy до PostgreSQL, чтобы хаос-контроллер мог рвать
+# сеть одному воркеру (A-CH-05). Порты хоста не фиксируются: их выдаёт Docker, а контроллер
+# узнаёт через `docker compose port`. Имя проекта задаётся снаружи (`-p`), поэтому несколько
+# стендов работают на одной машине одновременно.
 name: tallyho-acceptance
 
 x-app: &app
-  image: tallyho-acceptance-app:latest
-  environment:
-    PYTHONUNBUFFERED: "1"
+  image: ${APP_IMAGE:-tallyho-acceptance-app:latest}
   restart: unless-stopped
+
+x-env: &env
+  PYTHONUNBUFFERED: "1"
+  DONT_FAKE_MONOTONIC: "1"
+  SEED: ${SEED:-1}
+  THREADS_PER_WORKER: ${THREADS_PER_WORKER:-8}
+  TRANSIENT_RATE: ${TRANSIENT_RATE:-0.05}
+  PERMANENT_RATE: ${PERMANENT_RATE:-0.01}
+  LEASE_TTL: ${LEASE_TTL:-60}
+  HEARTBEAT_EVERY: ${HEARTBEAT_EVERY:-20}
+  SWEEP_INTERVAL: ${SWEEP_INTERVAL:-5}
+  DRAIN_TIMEOUT: ${DRAIN_TIMEOUT:-20}
+  HOOK_DELAY: ${HOOK_DELAY:-0}
+
+x-worker: &worker
+  <<: *app
+  depends_on:
+    migrate:
+      condition: service_completed_successfully
+  # exec: python остаётся PID 1 и получает SIGKILL/SIGTERM от `docker kill` напрямую.
+  entrypoint: ["/bin/sh", "-c"]
+  command:
+    - >-
+      exec python -m tests.acceptance.app.worker
+      --dsn "postgresql+asyncpg://tallyho:tallyho@toxiproxy:$${PG_PORT}/tallyho"
+      --tallyho-schema th --flexiq-schema flexiq --domain-schema app
+      --site-url http://external-services:8081 --mail-url http://external-services:8082
+      --seed "$${SEED}" --workers "$${THREADS_PER_WORKER}"
+      --transient-rate "$${TRANSIENT_RATE}" --permanent-rate "$${PERMANENT_RATE}"
+      --application-name "$${APP_NAME}" --lease-ttl "$${LEASE_TTL}"
+      --heartbeat-every "$${HEARTBEAT_EVERY}" --sweep-interval "$${SWEEP_INTERVAL}"
+      --drain-timeout "$${DRAIN_TIMEOUT}" --hook-delay "$${HOOK_DELAY}"
+      --ready /tmp/worker.ready
+
+x-api: &api
+  <<: *app
+  depends_on:
+    migrate:
+      condition: service_completed_successfully
+  entrypoint: ["/bin/sh", "-c"]
+  command:
+    - >-
+      exec python -m tests.acceptance.app.api
+      --dsn "postgresql+asyncpg://tallyho:tallyho@toxiproxy:$${PG_PORT}/tallyho"
+      --tallyho-schema th --flexiq-schema flexiq --domain-schema app
+      --site-url http://external-services:8081 --mail-url http://external-services:8082
+      --seed "$${SEED}"
+      --application-name "$${APP_NAME}" --lease-ttl "$${LEASE_TTL}"
+      --heartbeat-every "$${HEARTBEAT_EVERY}" --sweep-interval "$${SWEEP_INTERVAL}"
+      --hook-delay "$${HOOK_DELAY}"
 
 services:
   postgres:
@@ -17,6 +71,15 @@ services:
       - synchronous_commit=on
       - -c
       - full_page_writes=on
+      - -c
+      - max_connections=300
+      # Оракул I-08 сравнивает хуки по времени commit, а не по началу транзакции.
+      - -c
+      - track_commit_timestamp=on
+      # Без syncfs восстановление после kill на Docker Desktop начинается с ~10 с fsync
+      # всего каталога данных, и простой БД выходит заметно дольше запланированного.
+      - -c
+      - recovery_init_sync_method=syncfs
     environment:
       POSTGRES_DB: tallyho
       POSTGRES_USER: tallyho
@@ -32,7 +95,8 @@ services:
   toxiproxy:
     image: ghcr.io/shopify/toxiproxy:2.12.0
     ports:
-      - "8474:8474"
+      - "127.0.0.1::8474"   # HTTP API toxiproxy
+      - "127.0.0.1::8660"   # прокси control: хаос-контроллер, нагрузка, оракул (без toxics)
 
   toxiproxy-init:
     image: curlimages/curl:8.16.0
@@ -47,15 +111,26 @@ services:
       - -ec
       - |
         until curl -fsS http://toxiproxy:8474/version; do sleep 1; done
-        curl -fsS -X POST http://toxiproxy:8474/proxies \
+        curl -fsS -X POST http://toxiproxy:8474/populate \
           -H 'Content-Type: application/json' \
-          -d '{"name":"postgres","listen":"0.0.0.0:8666","upstream":"postgres:5432"}'
+          -d '[
+            {"name":"postgres","listen":"0.0.0.0:8666","upstream":"postgres:5432"},
+            {"name":"control","listen":"0.0.0.0:8660","upstream":"postgres:5432"},
+            {"name":"worker-1","listen":"0.0.0.0:8701","upstream":"postgres:5432"},
+            {"name":"worker-2","listen":"0.0.0.0:8702","upstream":"postgres:5432"},
+            {"name":"worker-3","listen":"0.0.0.0:8703","upstream":"postgres:5432"},
+            {"name":"worker-4","listen":"0.0.0.0:8704","upstream":"postgres:5432"},
+            {"name":"api-1","listen":"0.0.0.0:8711","upstream":"postgres:5432"},
+            {"name":"api-2","listen":"0.0.0.0:8712","upstream":"postgres:5432"}
+          ]'
 
   external-services:
     <<: *app
     build:
       context: ../..
       dockerfile: tests/acceptance/Dockerfile
+    environment:
+      PYTHONUNBUFFERED: "1"
     command:
       - python
       - -m
@@ -64,12 +139,16 @@ services:
       - ${SEED:-1}
       - --pages
       - ${PAGES:-50}
+    ports:
+      - "127.0.0.1::8081"   # фейковый сайт каталога (+ /journal)
+      - "127.0.0.1::8082"   # фейковый почтовый провайдер (+ /journal)
     healthcheck:
       test:
         - CMD
         - python
         - -c
-        - "import urllib.request; urllib.request.urlopen('http://localhost:8081/pages/1').read()"
+        # Журнал почты поднимается последним и не попадает в учёт внешних вызовов I-11.
+        - "import urllib.request; urllib.request.urlopen('http://localhost:8082/journal').read()"
       interval: 2s
       timeout: 2s
       retries: 30
@@ -77,6 +156,8 @@ services:
   migrate:
     <<: *app
     restart: "no"
+    environment:
+      PYTHONUNBUFFERED: "1"
     depends_on:
       toxiproxy-init:
         condition: service_completed_successfully
@@ -101,61 +182,54 @@ services:
       - --seed
       - ${SEED:-1}
 
-  worker:
-    <<: *app
-    depends_on:
-      migrate:
-        condition: service_completed_successfully
-    deploy:
-      replicas: ${WORKERS:-4}
-    command:
-      - python
-      - -m
-      - tests.acceptance.app.worker
-      - --dsn
-      - postgresql+asyncpg://tallyho:tallyho@toxiproxy:8666/tallyho
-      - --tallyho-schema
-      - th
-      - --flexiq-schema
-      - flexiq
-      - --domain-schema
-      - app
-      - --site-url
-      - http://external-services:8081
-      - --mail-url
-      - http://external-services:8082
-      - --seed
-      - ${SEED:-1}
-      - --workers
-      - ${THREADS_PER_WORKER:-4}
+  # FAKETIME_n / FAKETIME_LIB_n: сдвиг часов воркера n (A-CH-09), например
+  # FAKETIME_1="+5m" FAKETIME_LIB_1=/usr/local/lib/libfaketime.so.1. Пусто — часы настоящие.
+  worker-1:
+    <<: *worker
+    environment:
+      <<: *env
+      APP_NAME: worker-1
+      PG_PORT: "8701"
+      FAKETIME: ${FAKETIME_1:-}
+      LD_PRELOAD: ${FAKETIME_LIB_1:-}
+
+  worker-2:
+    <<: *worker
+    environment:
+      <<: *env
+      APP_NAME: worker-2
+      PG_PORT: "8702"
+      FAKETIME: ${FAKETIME_2:-}
+      LD_PRELOAD: ${FAKETIME_LIB_2:-}
+
+  worker-3:
+    <<: *worker
+    environment:
+      <<: *env
+      APP_NAME: worker-3
+      PG_PORT: "8703"
+      FAKETIME: ${FAKETIME_3:-}
+      LD_PRELOAD: ${FAKETIME_LIB_3:-}
+
+  worker-4:
+    <<: *worker
+    environment:
+      <<: *env
+      APP_NAME: worker-4
+      PG_PORT: "8704"
+      FAKETIME: ${FAKETIME_4:-}
+      LD_PRELOAD: ${FAKETIME_LIB_4:-}
 
   api-1:
-    <<: *app
-    depends_on:
-      migrate:
-        condition: service_completed_successfully
-    command: &api-command
-      - python
-      - -m
-      - tests.acceptance.app.api
-      - --dsn
-      - postgresql+asyncpg://tallyho:tallyho@toxiproxy:8666/tallyho
-      - --tallyho-schema
-      - th
-      - --flexiq-schema
-      - flexiq
-      - --domain-schema
-      - app
-      - --site-url
-      - http://external-services:8081
-      - --mail-url
-      - http://external-services:8082
-      - --seed
-      - ${SEED:-1}
+    <<: *api
+    environment:
+      <<: *env
+      APP_NAME: api-1
+      PG_PORT: "8711"
 
   api-2:
-    <<: *app
-    depends_on:
-      migrate:
-        condition: service_completed_successfully
-    command: *api-command
+    <<: *api
+    environment:
+      <<: *env
+      APP_NAME: api-2
+      PG_PORT: "8712"
