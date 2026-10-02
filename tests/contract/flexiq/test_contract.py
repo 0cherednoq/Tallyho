@@ -3,28 +3,34 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import time
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from importlib.metadata import version
 from typing import TYPE_CHECKING, cast
 from uuid import UUID
 
 import pytest
-from sqlalchemy import text
+from sqlalchemy import select, text
 
 from tallyho import Tallyho
 from tallyho.adapters.flexiq import FlexiqAdapter
+from tallyho.engine.dead_letters import CURSOR_KEY
 from tallyho.model.errors import ConfigurationError, UnsupportedOption
 from tallyho.model.states import BatchState, OutboxKind
 from tallyho.protocols.broker import Message
+from tallyho.storage.tables import build_metadata
 from tests.contract.flexiq.contract_app import DataClassPayload, ModelPayload
+from tests.helpers.db import schema_connection
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable
+    from collections.abc import AsyncGenerator, Awaitable, Callable
 
     from flexiq import Queue
 
     from tests.contract.flexiq.conftest import FlexiqContract
+    from tests.contract.flexiq.contract_app import ContractApp
 
 __all__: list[str] = []
 
@@ -430,6 +436,106 @@ async def test_a_ch_10_requeued_running_job_does_not_orphan_item_on_retry(
         app.queue.list_jobs, task_name=app.adapter.task_name(requeued), limit=10
     )
     assert sorted(job.status for job in jobs) == ["complete", "complete"]
+
+
+@asynccontextmanager
+async def _claim_outage(app: ContractApp) -> AsyncGenerator[None]:
+    """Пока контекст открыт, claim и finish падают: таблицы lease «нет» (отказ PostgreSQL)."""
+    schema = app.engine.dialect.identifier_preparer.quote(app.tallyho_schema)
+    async with app.engine.begin() as conn:
+        _ = await conn.execute(text(f"ALTER TABLE {schema}.th_lease RENAME TO th_lease_down"))
+    try:
+        yield
+    finally:
+        async with app.engine.begin() as conn:
+            _ = await conn.execute(text(f"ALTER TABLE {schema}.th_lease_down RENAME TO th_lease"))
+
+
+async def _item_rows(app: ContractApp, batch_id: UUID) -> list[tuple[int, str | None, object, int]]:
+    """``(state, label, error, generation)`` Items батча."""
+    item = build_metadata().item
+    async with schema_connection(app.engine, app.tallyho_schema) as conn:
+        rows = await conn.execute(
+            select(item.c.state, item.c.label, item.c.error, item.c.generation).where(
+                item.c.batch_id == batch_id
+            )
+        )
+        return [(int(row[0]), row[1], row[2], int(row[3])) for row in rows]
+
+
+async def test_fix_6_dead_job_without_recorded_result_is_reconciled(  # ruff: ignore[too-many-locals]  # один сценарий: отказ, сверка, повтор, поздняя запись DLQ
+    flexiq_contract: FlexiqContract,
+) -> None:
+    """Fix-6: джоба умерла на claim, событие ``JOB_DEAD`` не записало итог — Item завершает сверка.
+
+    Очередь ``quarantine`` обслуживает отдельный воркер: его можно остановить,
+    чтобы повторно отправленная джоба осталась ждать в брокере.
+    """
+    app = flexiq_contract.app
+    doomed = app.tasks["doomed"]
+    task_name = app.adapter.task_name(doomed)
+    await flexiq_contract.start_worker("quarantine")
+
+    def dead_letters() -> list[dict[str, object]]:
+        entries = cast("list[dict[str, object]]", app.queue.dead_letters(20, 0))
+        return [entry for entry in entries if entry.get("task_name") == task_name]
+
+    worker_log = flexiq_contract.root / "worker-quarantine.log"
+    async with _claim_outage(app):
+        async with app.th.batch("fix-6", key="dlq") as batch:
+            await batch.add_calls([app.th.call(doomed, "one").opts(queue="quarantine")])
+        # Обе попытки падают на claim с CompleterError, flexiq отправляет джобу в DLQ;
+        # обработчик события JOB_DEAD в воркере тоже не может записать итог.
+        async with asyncio.timeout(20):
+            while True:
+                dead = await asyncio.to_thread(dead_letters)
+                if dead and "JOB_DEAD" in worker_log.read_text(encoding="utf-8", errors="replace"):
+                    break
+                await asyncio.sleep(0.05)
+        await flexiq_contract.stop_extra_workers()
+        # Дефект: Item active без lease, outbox и живой джобы; задача не вызывалась.
+        assert await _item_rows(app, batch.handle.id) == [(0, None, None, 0)]
+    (letter,) = dead
+    assert flexiq_contract.events("doomed") == []
+
+    # Сверка в цикле relay (и в run_maintenance_once) завершает Item и батч.
+    view = await flexiq_contract.wait_terminal(batch.handle)
+
+    assert view.state is BatchState.COMPLETED_WITH_ERRORS
+    assert (view.progress.error, view.labels) == (1, {"exhausted": 1})
+    ((state, label, error, generation),) = await _item_rows(app, batch.handle.id)
+    assert (state, label, generation) == (12, "exhausted", 0)
+    # Итог записала сверка, а не обработчик события: у него тип FlexiqDeadLetter.
+    assert cast("dict[str, object]", error)["type"] == "DeadLetter"
+    meta = build_metadata().meta
+    async with schema_connection(app.engine, app.tallyho_schema) as conn:
+        stored = await conn.scalar(select(meta.c.value).where(meta.c.key == CURSOR_KEY))
+    cursor = cast("dict[str, object]", json.loads(stored or ""))
+    # Водяной знак — failed_at самой новой разобранной записи; обход закончен.
+    assert cursor == {"w": letter["failed_at"], "h": None, "r": None}
+
+    # Повтор: новая джоба несёт поколение 1 и ждёт в очереди без воркера. По
+    # данным tallyho Item выглядит так же, как осиротевший, а запись DLQ прошлой
+    # отправки сверка перечитывает на каждом обходе — Item она трогать не должна.
+    assert await batch.handle.retry_failed() == 1
+    async with asyncio.timeout(10):
+        while True:
+            jobs = await asyncio.to_thread(app.queue.list_jobs, task_name=task_name)
+            if len(jobs) > 1:  # мёртвая джоба первой отправки и новая
+                break
+            await asyncio.sleep(0.05)
+    assert sorted(job.status for job in jobs) == ["dead", "pending"]
+    for _ in range(5):
+        _ = await app.th.run_maintenance_once()
+        await asyncio.sleep(0.1)
+    assert await _item_rows(app, batch.handle.id) == [(0, None, None, 1)]
+
+    await flexiq_contract.start_worker("quarantine")
+    final = await flexiq_contract.wait_terminal(batch.handle)
+
+    assert final.state is BatchState.SUCCEEDED
+    (run,) = flexiq_contract.events("doomed")
+    assert run["job_id"] != letter["original_job_id"]
 
 
 async def test_a_fq_11_flexiq_cancellation_finishes_item_cancelled(

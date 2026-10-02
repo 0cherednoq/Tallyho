@@ -139,6 +139,14 @@ class FlexiqContract:
                     raise AssertionError(message)
                 await asyncio.sleep(0.05)
 
+    async def stop_extra_workers(self) -> None:
+        """Stop the additional workers; their queues keep jobs pending afterwards."""
+        for extra in self.extra_workers:
+            await _stop_worker(extra)
+        self.extra_workers.clear()
+        for ready in self.root.glob("ready-*"):
+            ready.unlink()
+
 
 async def _stop_worker(worker: asyncio.subprocess.Process) -> None:
     if worker.returncode is not None:
