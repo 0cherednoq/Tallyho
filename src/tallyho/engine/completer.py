@@ -1416,7 +1416,10 @@ class Completer:
 
         Raises:
             ConfigurationError: Нужен spawn, но Completer создан без Producer.
+            ClosedError: Completer закрыт; транзакция пользователя не тронута.
         """
+        if self._closing:
+            raise ClosedError(_CLOSED)
         if (value.spawns or value.sub_batches) and self.triggers.producer is None:
             raise ConfigurationError(_SPAWN_SERVICES)
         conn = await resolve_connection(target)
@@ -1573,6 +1576,10 @@ class Completer:
         return folded
 
     def _schedule_external(self, applied: _Applied, delta_ids: set[int]) -> None:
+        if self._closing:
+            # Completer закрыли, пока транзакция пользователя шла к commit: дельты
+            # свернёт и финализацию проверит sweeper.
+            return
         loop = self._bind()
         task = loop.create_task(
             self._after_external_commit(applied, delta_ids),

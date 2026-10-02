@@ -4,17 +4,21 @@ from __future__ import annotations
 
 import asyncio
 import itertools
+import logging
 from typing import TYPE_CHECKING
 
 import pytest
 from sqlalchemy import func, select, text, update
+from sqlalchemy.ext.asyncio import AsyncSession
 
+from tallyho.engine.completer import FinishResult
 from tallyho.model.errors import ClosedError, CompleterError, InvalidStateError
-from tallyho.model.states import ItemState, OutboxKind
+from tallyho.model.states import ItemState, OutboxKind, ResultClass
 from tests.integration.engine.completer_env import (
     NOW,
     lease_row,
     open_completer,
+    schema_engine,
     seed,
     set_batch,
 )
@@ -116,6 +120,48 @@ async def test_closed_completer_rejects_new_operations(env: Env) -> None:
 
 async def _forever() -> None:
     _ = await asyncio.Event().wait()
+
+
+async def test_complete_in_after_close_is_rejected_before_any_write(env: Env) -> None:
+    seeded = await seed(env, 1)
+    ref = seeded.refs[0]
+    async with (
+        open_completer(env) as completer,
+        AsyncSession(schema_engine(env)) as session,
+    ):
+        assert (await completer.claim(ref)).run
+        await completer.close()
+        with pytest.raises(ClosedError):
+            _ = await completer.complete_in(session, ref, FinishResult(result_class=ResultClass.OK))
+        await session.commit()
+    assert await lease_row(env, ref.id) is not None
+    assert await env.count(env.tables.counter_delta) == 0
+
+
+async def test_commit_after_close_leaves_folding_to_the_sweeper(
+    env: Env, caplog: pytest.LogCaptureFixture
+) -> None:
+    seeded = await seed(env, 1)
+    ref = seeded.refs[0]
+    async with (
+        open_completer(env) as completer,
+        AsyncSession(schema_engine(env)) as session,
+    ):
+        assert (await completer.claim(ref)).run
+        assert await completer.complete_in(session, ref, FinishResult(result_class=ResultClass.OK))
+        # Установку закрыли, пока транзакция пользователя ещё не закоммичена.
+        await completer.close()
+        with caplog.at_level(logging.WARNING):
+            await session.commit()
+        await completer.settled()
+    # Commit прошёл без ошибок в логе; дельта ждёт sweeper, фоновой задачи нет.
+    assert caplog.records == []
+    assert await env.count(env.tables.counter_delta) == 1
+    assert [task for task in asyncio.all_tasks() if task.get_name() == "tallyho-complete-in"] == []
+    item = env.tables.item
+    async with env.connection() as conn:
+        state = await conn.scalar(select(item.c.state).where(item.c.id == ref.id))
+    assert state == int(ItemState.OK)
 
 
 async def test_close_cancels_attached_heartbeat_tasks(env: Env) -> None:
