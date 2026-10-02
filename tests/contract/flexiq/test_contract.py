@@ -390,6 +390,45 @@ async def test_a_fq_10_hard_and_soft_timeouts(flexiq_contract: FlexiqContract) -
     assert view.progress.error == 1
 
 
+async def test_a_ch_10_requeued_running_job_does_not_orphan_item_on_retry(
+    flexiq_contract: FlexiqContract,
+) -> None:
+    """Fix-7: ``requeue_job`` закрывает джобу no-op дублем, а исходная попытка падает."""
+    app = flexiq_contract.app
+    requeued = app.tasks["requeued"]
+    async with app.th.batch("a-ch-10", key="requeue") as batch:
+        await batch.add(requeued, "one")
+
+    started = await flexiq_contract.wait_events("requeue-start")
+    job_id = cast("str", started[0]["job_id"])
+    assert await asyncio.to_thread(app.queue.requeue_job, job_id)
+    # Повторная доставка той же джобы упирается в живой lease и возвращает успех:
+    # flexiq считает джобу завершённой, хотя задача ещё выполняется.
+    async with asyncio.timeout(15):
+        while True:
+            job = await app.queue.aget_job(job_id)
+            if job is not None and job.status == "complete":
+                break
+            flexiq_contract.assert_worker_alive()
+            await asyncio.sleep(0.05)
+    assert len(flexiq_contract.events("requeue-start")) == 1
+
+    # Исходное выполнение падает с повторяемой ошибкой; flexiq её уже не повторит.
+    _ = (flexiq_contract.root / "requeue-release-one").write_text("go", encoding="utf-8")
+    view = await flexiq_contract.wait_terminal(batch.handle, timeout_seconds=20)
+
+    assert view.state is BatchState.SUCCEEDED
+    assert view.progress.ok == 1
+    runs = flexiq_contract.events("requeue-start")
+    assert len(runs) == 2
+    # Item доделала новая джоба: исходная закрыта дублем и ретрая не получила.
+    assert runs[1]["job_id"] != job_id
+    jobs = await asyncio.to_thread(
+        app.queue.list_jobs, task_name=app.adapter.task_name(requeued), limit=10
+    )
+    assert sorted(job.status for job in jobs) == ["complete", "complete"]
+
+
 async def test_a_fq_11_flexiq_cancellation_finishes_item_cancelled(
     flexiq_contract: FlexiqContract,
 ) -> None:
