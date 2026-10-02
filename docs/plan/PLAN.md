@@ -465,8 +465,14 @@
 #### T11.3 — Хаос-контроллер и сценарии A-CH-01…12
 * **Зависит:** T11.2
 * **Док:** ACCEPTANCE §6
-* **Сделать:** контроллер (kill -9 воркеров, `docker kill`/`pg_ctl stop -m immediate`, toxiproxy toxics, libfaketime, SIGTERM, `requeue/replay/retry_dead`, долгая транзакция), расписание от seed, `make acceptance SEED=... SCENARIO=... CHAOS=...` (или `poe acceptance`), журнал хаоса.
-* **DoD:** каждый A-CH на S1/S2/S3 по 2 минуты локально зелёный. Длинные прогоны (10/60 мин, 2 ч) — `human`.
+* **Сделать:** контроллер (kill -9 воркеров, `docker kill`/`pg_ctl stop -m immediate`, toxiproxy toxics, libfaketime, SIGTERM, `requeue/replay/retry_dead`, долгая транзакция), расписание от seed, `uv run poe acceptance --seed N --scenario S --chaos A-CH-NN --duration 120`, журнал хаоса.
+* **DoD:** каждый A-CH на S1/S2/S3 по 2 минуты запускается локально и даёт вердикт оракула; дефекты библиотеки помечены `xfail` с задачей-владельцем. Длинные прогоны (10/60 мин, 2 ч) — `human`.
+
+#### T11.3b — Все A-CH зелёные без xfail
+* **Зависит:** T11.3, Fix-5, Fix-6, Fix-7, Fix-8, Fix-11
+* **Док:** ACCEPTANCE §6; журнал PROGRESS от 2026-10-02 (матрица волны 8)
+* **Сделать:** снять все `xfail` в `tests/acceptance/test_chaos.py`, прогнать матрицу 12 × 3 на двух seed; оставшиеся красные ячейки — новые `Fix-N` с воспроизведением. Проверить Fix-8 на `LEASE_TTL=15 SWEEP_INTERVAL=1`.
+* **DoD:** `uv run poe acceptance --seed 1 --duration 120 --jobs 4` и то же с `--seed 2` — без xfailed и failed.
 
 #### T11.4 — Сценарии A-UC-01…22 на стенде
 * **Зависит:** T11.2, T13.6
@@ -479,6 +485,70 @@
 * **Док:** ACCEPTANCE §9, COUNTERS §4, ARCHITECTURE §14
 * **Сделать:** генераторы нагрузки P-01…P-11, сбор p50/p99 по операциям, графики, отчёт; локальный «дымовой» прогон на малых объёмах.
 * **DoD:** дымовой прогон формирует отчёт. Полные замеры на эталонном стенде — `human`.
+
+### Исправления по итогам волны 8
+
+Дефекты найдены хаос-стендом (T11.3) и прогоном примеров руководства (T12.1). Каждая задача: воспроизводящий тест, красный на старом коде, затем исправление; G2 обязателен. Если исправление меняет поведение, описанное в ARCHITECTURE, — сначала документ.
+
+#### Fix-5 — Sweeper учитывает `max_retries` из декоратора задачи
+* **Зависит:** —
+* **Док:** ARCHITECTURE UC-15, §11.3, D-012; ACCEPTANCE A-CH-01
+* **Сделать:** `Sweeper._max_retries` читает лимит только из `th_item.options`. Задача с `@fq.task(max_retries=3)` без `.opts(max_retries=…)` на первом истёкшем lease получает `error("lease_expired")` вместо переотправки. Эффективный лимит должен быть известен sweeper-у (записывать его в `th_item.options` при создании Item или спрашивать у адаптера).
+* **DoD:** интеграционный тест: лимит только в декораторе, lease истёк → Item возвращён в outbox, `attempt + 1`; `poe acceptance --seed 1 --scenario S1 --chaos A-CH-01` без xfail.
+
+#### Fix-6 — Движок периодически вызывает `reconcile_dead`
+* **Зависит:** —
+* **Док:** ARCHITECTURE §11.3, D-014; ACCEPTANCE A-CH-04, I-01, I-03, I-10
+* **Сделать:** `Runtime.reconcile_dead` реализован в адаптерах, но engine его не вызывает. Если claim упал с `CompleterError` (PostgreSQL недоступен), flexiq отправляет джобу в DLQ, обработчик `JOB_DEAD` тоже не может записать итог — Item навсегда `active` без lease, outbox и джобы. Добавить проход maintenance: курсор сверки хранится в `th_meta`, мёртвые джобы завершают Items как `error("exhausted")`.
+* **DoD:** интеграционный тест с `InlineBroker`: потерянное событие DLQ → один проход maintenance завершает Item; A-CH-04 на S1 без зависших Items.
+
+#### Fix-7 — Повторная доставка не оставляет Item без исполнителя
+* **Зависит:** —
+* **Док:** ARCHITECTURE UC-03, UC-04, §11.3 («чужой живой lease → успех»); ACCEPTANCE A-CH-10, A-FQ
+* **Сделать:** повторная доставка (`requeue_job`, реап «мёртвого» воркера) получает `DUPLICATE` и закрывает джобу как успешную; исходное выполнение затем падает с повторяемой ошибкой, вердикт `RETRY` → `release` удаляет lease, а повторять уже некому: Item `active` без lease, outbox и джобы. Решить и записать в DECISIONS: `release` возвращает Item в outbox, если повтор брокером невозможен, либо sweeper подбирает `active` Items без lease, outbox и expiry. Там же: `CompleterError` на claim не должен подпадать под пользовательский `retry_on` и сразу уводить джобу в DLQ.
+* **DoD:** интеграционный тест сценария «дубль → DUPLICATE → исходная попытка RETRY» завершает Item; A-CH-10 на S2 зелёный три прогона подряд.
+
+#### Fix-8 — `complete_in` учитывает результат CAS
+* **Зависит:** —
+* **Док:** ARCHITECTURE UC-08, §10; ACCEPTANCE I-04, A-DB-01
+* **Сделать:** `item.complete_in()` отбрасывает результат CAS (`runtime/context.py`). Если Item уже завершён (sweeper записал `lease_expired`), транзакция пользователя всё равно коммитит доменную строку. При CAS = 0 бросать ошибку (подкласс `TallyhoError`), чтобы транзакция пользователя откатилась.
+* **DoD:** интеграционный тест: Item завершён sweeper-ом → `complete_in` бросает, доменной строки нет; A-CH-02 и A-CH-05 на S1 с `LEASE_TTL=15 SWEEP_INTERVAL=1` без нарушений I-04.
+
+#### Fix-9 — Отменённый до старта батч не финализируется как `succeeded`
+* **Зависит:** —
+* **Док:** ARCHITECTURE §6.1 (флаг отмены, итог финализации), UC-12; ACCEPTANCE A-UC-11
+* **Сделать:** сценарий: `async with th.batch(...)` в своей транзакции, сразу `handle.cancel()` до отправки задач, затем `handle.wait()` — примерно в половине прогонов `state=SUCCEEDED` при `progress.cancelled=4, ok=0`. Гипотеза (не проверена): фоновая финализация после seal читает строку батча до commit отмены, а счётчики — после. Сначала воспроизвести детерминированно, затем исправить выбор итога.
+* **DoD:** детерминированный тест гонки «seal → финализация ↔ cancel»: итог всегда `cancelled`; 200 повторов сценария без `SUCCEEDED`.
+
+#### Fix-10 — Быстрая отправка relay после commit в каждом процессе
+* **Зависит:** —
+* **Док:** ARCHITECTURE §3.2, UC-01, §6.3; T10.5 (CLI maintenance)
+* **Сделать:** `Relay.run()` нигде не запускается, `kick()` только копит id, `flush_kicked()` вызывает лишь `InlineBroker`. В продакшне сообщения отправляет только `scan_once` лидера maintenance: задержка до `relay_grace + sweep_interval`. Запускать цикл relay в процессах, где установлен адаптер (жизненный цикл — вместе с `install`/закрытием, RUF006). CLI `tallyho maintenance` без брокера сообщения не отправляет (решение T10.5) — убедиться, что с fast-path установка не остаётся без отправки, и убрать ошибку в логе на каждом проходе.
+* **DoD:** интеграционный тест с адаптером без maintenance: сообщение отправлено быстрее `relay_grace`; потерянный kick по-прежнему подбирает scan.
+
+#### Fix-11 — Закрытие дожидается фоновых задач; SIGTERM возвращает удержанные Items
+* **Зависит:** —
+* **Док:** ARCHITECTURE §3.2, UC-04; ACCEPTANCE A-CH-08; AGENTS.md (RUF006)
+* **Сделать:** фоновые задачи `_Facade._spawn_finalize` и `Operations._background` никто не дожидается: `DROP SCHEMA` в teardown тестов сталкивается с ними дедлоком (виновник — `tests/integration/api/test_batch.py::test_schedule_example_builds_and_seals_pipeline`), в логе воркера на SIGTERM — «Task was destroyed but it is pending», `Completer.close(requeue_held=True)` не вызывается. Дать публичное закрытие (`aclose`), которое дожидается фоновых задач и возвращает удержанные Items; вызвать его из воркера стенда и фикстур.
+* **DoD:** тест: после закрытия нет незавершённых задач библиотеки; прогон `tests/integration` на PostgreSQL с логом — 0 дедлоков с участием `DROP SCHEMA`; A-CH-08 оставляет 0 lease при `drain_timeout` по умолчанию.
+
+#### Fix-12 — Запросы на соединении пользователя видят схему установки
+* **Зависит:** —
+* **Док:** ARCHITECTURE §11.1 (schema/prefix), UC-08; ACCEPTANCE A-NF-03, A-DB-12
+* **Сделать:** по отчёту T12.1 `th.batch(session=)` и `item.complete_in(session)` выполняют запросы на соединении пользователя без имени схемы: без `schema_translate_map={None: schema}` или `search_path` получается `relation "th_batch" does not exist`. Сначала воспроизвести тестом (установка в не-public схеме, движок пользователя без translate map). Если подтверждается — подставлять схему на стороне библиотеки; если так задумано — описать требование в ARCHITECTURE §11.1.
+* **DoD:** тест с пользовательской сессией без translate map и схемой, отличной от `search_path`, зелёный; страница установки в guide обновлена.
+
+#### Fix-13 — Публичный API ↔ ARCHITECTURE §11
+* **Зависит:** —
+* **Док:** ARCHITECTURE §11.2, §11.4, §13.2, UC-02; guide
+* **Сделать:** расхождения, найденные T12.1: `th.item` и `th.tracked` недоступны как атрибуты `Tallyho` (только `from tallyho import item, tracked, callback`); у `item.spawn` нет `opts=`; `into=` не принимает `BatchHandle`; `@fq.task(weight=2)` даёт `ConfigurationError`; `item.sub_batch` принимает `callbacks=`, а не `on_...=`; `CallbackContext.summary` всегда `None`; потоковое добавление UC-02 недостижимо через builder (выход из `async with` всегда делает seal). По каждому пункту: реализовать то, что обещает ARCHITECTURE, либо исправить документ с записью в DECISIONS. Затем обновить guide.
+* **DoD:** типовые тесты (`tests/typing/cases.py`) и исполняемые примеры покрывают каждый пункт; в ARCHITECTURE нет API, которого нет в коде.
+
+#### Fix-14 — Мелкие расхождения движка
+* **Зависит:** —
+* **Док:** ARCHITECTURE §7.3 (backoff хуков), §12.4 (`labels`), §3.2 (лидерство), D-024
+* **Сделать:** (1) `Settings.hook_backoff_initial` проверяется, но в engine не передаётся; (2) `view.labels` и `view.metrics` (и поля `BatchSummary`) — один словарь: метки итога вперемешку с метриками `item.incr`; (3) advisory lock лидера maintenance и миграции не учитывает `prefix` — две установки в одной схеме делят лидера; (4) у корня конвейера `progress.found` равен числу под-батчей, хотя D-024 говорит о вычитании виртуальных Items.
+* **DoD:** по тесту на каждый пункт.
 
 ### Ф12. Документация и релиз
 
