@@ -17,7 +17,7 @@ from tallyho.engine.completer import ItemRef
 from tallyho.engine.installation import RuntimeServices
 from tallyho.model.errors import ConfigurationError
 from tallyho.model.states import OutboxKind
-from tallyho.protocols.broker import DeadLetters, Dispatcher, Runtime, Verdict
+from tallyho.protocols.broker import DeadLetters, Dispatcher, RetryLimits, Runtime, Verdict
 from tallyho.protocols.serialization import JsonSerializer, PayloadCodec, SerializerCodec
 
 if TYPE_CHECKING:
@@ -68,7 +68,7 @@ class _Attempt:
 
 
 @final
-class InlineBroker(Dispatcher, Runtime, PayloadCodec):
+class InlineBroker(Dispatcher, Runtime, PayloadCodec, RetryLimits):
     """Очередь в памяти, исполняющая сообщения через настоящий ``TaskRuntime``.
 
     Брокер последовательный и полностью управляется тестом: :meth:`step`
@@ -81,9 +81,15 @@ class InlineBroker(Dispatcher, Runtime, PayloadCodec):
         duplicate_delivery_rate: float = 0.0,
         seed: int | None = None,
         serializer: Serializer | None = None,
+        max_retries: int = 0,
     ) -> None:
-        """Создать пустой брокер."""
+        """Создать пустой брокер.
+
+        ``max_retries`` — лимит повторов для вызовов без своей опции
+        ``max_retries``: аналог лимита в декораторе задачи настоящего брокера.
+        """
         self.duplicate_delivery_rate = _rate(duplicate_delivery_rate)
+        self._default_retries = _retries(max_retries)
         self.seed = seed
         self._random = random.Random(seed)  # ruff: ignore[suspicious-non-cryptographic-random-usage]  # воспроизводимая инъекция дублей, не криптография
         self._codec = SerializerCodec(serializer or JsonSerializer())
@@ -148,7 +154,7 @@ class InlineBroker(Dispatcher, Runtime, PayloadCodec):
             if message.task_name not in self._tasks:
                 detail = f"{_UNKNOWN_TASK}: {message.task_name!r}"
                 raise ConfigurationError(detail)
-            _ = self._max_retries(message)
+            _ = self._message_retries(message)
         for message in messages:
             delivery = _Delivery(message)
             self._queue.append(delivery)
@@ -179,6 +185,16 @@ class InlineBroker(Dispatcher, Runtime, PayloadCodec):
         if attempt.retry_count < attempt.max_retries:
             return Verdict.RETRY
         return Verdict.FINAL
+
+    @override
+    def max_retries(self, task_name: str) -> int:
+        """Отдать sweeper-у лимит повторов брокера для вызовов без опции.
+
+        Returns:
+            ``max_retries`` из конструктора: задачи брокера своих лимитов не имеют.
+        """
+        _ = task_name
+        return self._default_retries
 
     @override
     async def reconcile_dead(self, since: str | None) -> DeadLetters:
@@ -300,7 +316,7 @@ class InlineBroker(Dispatcher, Runtime, PayloadCodec):
         task = self._tasks[message.task_name]
         args, kwargs = self.decode(message.task_name, message.payload)
         kwargs["_th"] = self._marker(message)
-        maximum = self._max_retries(message)
+        maximum = self._message_retries(message)
         token = self._attempt.set(_Attempt(delivery.retry_count, maximum))
         try:
             wrapped = self._require_runtime().wrap(task)
@@ -388,12 +404,8 @@ class InlineBroker(Dispatcher, Runtime, PayloadCodec):
             return {"c": str(message.id), "b": str(message.batch_id), "s": None}
         return {"i": str(message.id), "b": str(message.batch_id)}
 
-    @staticmethod
-    def _max_retries(message: Message) -> int:
-        value = message.options.get("max_retries", 0)
-        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-            raise ConfigurationError(_BAD_RETRIES)
-        return value
+    def _message_retries(self, message: Message) -> int:
+        return _retries(message.options.get("max_retries", self._default_retries))
 
     @staticmethod
     def _check_steps(deliveries: object, *, positive: bool = False) -> None:
@@ -405,6 +417,12 @@ class InlineBroker(Dispatcher, Runtime, PayloadCodec):
     def _check_concurrency(value: object) -> None:
         if isinstance(value, bool) or not isinstance(value, int) or value < 1:
             raise ConfigurationError(_BAD_CONCURRENCY)
+
+
+def _retries(value: object) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ConfigurationError(_BAD_RETRIES)
+    return value
 
 
 def _rate(value: object) -> float:

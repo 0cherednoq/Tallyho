@@ -11,7 +11,14 @@ from uuid import UUID
 import pytest
 
 from tallyho.model.states import OutboxKind
-from tallyho.protocols.broker import DeadLetters, Dispatcher, Message, Runtime, Verdict
+from tallyho.protocols.broker import (
+    DeadLetters,
+    Dispatcher,
+    Message,
+    RetryLimits,
+    Runtime,
+    Verdict,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Sequence
@@ -50,6 +57,18 @@ class _CountingRuntime:
 
     async def reconcile_dead(self, since: str | None) -> DeadLetters:
         return DeadLetters((ITEM,), cursor=since or "c1")
+
+
+class _FixedLimits:
+    def max_retries(self, task_name: str) -> int:
+        return 3 if task_name == "app.send" else 0
+
+
+def test_retry_limits_is_an_optional_adapter_protocol() -> None:
+    limits: RetryLimits = _FixedLimits()
+    assert isinstance(limits, RetryLimits)
+    assert not isinstance(_RecordingDispatcher(), RetryLimits)
+    assert (limits.max_retries("app.send"), limits.max_retries("app.other")) == (3, 0)
 
 
 async def _double(value: int) -> int:

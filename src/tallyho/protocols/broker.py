@@ -27,6 +27,7 @@ __all__ = [
     "DeadLetters",
     "Dispatcher",
     "Message",
+    "RetryLimits",
     "Runtime",
     "RuntimeInstaller",
     "Verdict",
@@ -132,6 +133,31 @@ class CancellationClassifier(Protocol):
 
     def is_cancelled(self, exc: BaseException) -> bool:
         """Return whether ``exc`` means that the running broker job was cancelled."""
+        ...
+
+
+@runtime_checkable
+class RetryLimits(Protocol):
+    """Необязательная часть адаптера: умолчание лимита повторов задачи.
+
+    Опция вызова ``max_retries`` хранится в ``th_item.options``, а умолчание
+    задачи (декоратор или настройка брокера) знает только адаптер. Sweeper
+    спрашивает его, когда решает, вернуть ли Item с истёкшим lease в outbox
+    (ARCHITECTURE UC-15, D-012).
+    """
+
+    def max_retries(self, task_name: str) -> int:
+        """Лимит повторов задачи, когда у вызова нет опции ``max_retries``.
+
+        Значение должно совпадать с тем, что адаптер передаёт брокеру при
+        ``dispatch``. Метод не бросает исключений: для незнакомой задачи — 0.
+
+        Args:
+            task_name: имя задачи у брокера (:meth:`Dispatcher.task_name`).
+
+        Returns:
+            Неотрицательное число повторов.
+        """
         ...
 
 
