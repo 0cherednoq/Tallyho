@@ -92,21 +92,56 @@ th.install(adapter)  # адаптер брокера: FlexiqAdapter или Inlin
 
 ### Схема в ваших сессиях
 
-В собственных транзакциях tallyho сам направляет запросы в `schema`. Но когда вы передаёте свою
-сессию или соединение — в `th.batch(session=...)`, в операции `handle.pause(session=...)` и
-подобные, в `item.complete_in(session)`, — запросы к таблицам tallyho выполняются **на вашем
-соединении и без имени схемы**. Соединение должно находить эти таблицы само. Есть три способа:
+Имя схемы записано в каждом запросе tallyho. Поэтому библиотека находит свои таблицы на любом
+соединении этой базы: и в собственных транзакциях, и когда вы передаёте свою сессию или
+соединение — в `th.batch(session=...)`, в операции `handle.pause(session=...)` и подобные, в
+`item.complete_in(session)`. Настраивать `search_path` или `schema_translate_map` ради tallyho не
+нужно, и настройки вашего соединения библиотека не меняет.
 
-| Способ | Как |
-|---|---|
-| Отображение схемы в движке | `app_engine = engine.execution_options(schema_translate_map={None: "app"})` и сессии поверх `app_engine`. Ваши таблицы, объявленные без схемы, при этом тоже адресуются в `app` |
-| `search_path` | схема tallyho входит в `search_path` роли или базы: `ALTER ROLE app SET search_path = app, public` |
-| Без схемы | `Tallyho(engine, schema=None)`: таблицы создаются и ищутся в схеме из `search_path` |
+<!-- tallyho-example: guide-install-session -->
+```python
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession
 
-Иначе первый же вызов с `session=` завершится ошибкой PostgreSQL `relation "th_batch" does not exist`.
+from tallyho import Tallyho
+from tallyho.model.states import BatchState
+from tallyho.testing import InlineBroker
 
-В [tx-хуках](hooks.md) действует то же отображение: сессия хука адресует таблицы без схемы в схему
-tallyho. Доменные таблицы, лежащие в другой схеме, объявляйте с явным `schema=`.
+broker = InlineBroker()
+th = Tallyho(engine, schema=schema)  # таблицы tallyho лежат в схеме schema
+th.install(broker.adapter)
+await th.migrate()
+
+
+async def notify(order_id: int) -> None:
+    assert order_id > 0
+
+
+# Обычная сессия приложения: схема tallyho не входит в её search_path.
+async with AsyncSession(engine) as session, session.begin():
+    search_path = await session.scalar(text("SHOW search_path"))
+    assert schema not in str(search_path)
+    async with th.batch("orders", key="order:1", session=session) as batch:
+        await batch.add(notify, 1)
+
+await broker.drain()
+assert (await batch.handle.view()).state is BatchState.SUCCEEDED
+await broker.close()
+```
+
+Ваши таблицы tallyho не трогает — их адрес определяет ваш движок:
+
+* **В ваших транзакциях** всё работает как раньше: таблицы без схемы ищутся по `search_path` или
+  по вашей `schema_translate_map`.
+* **В [tx-хуках](hooks.md)** так же. Сессия хука работает на соединении движка, который вы
+  передали в `Tallyho(engine, ...)`, с его настройками. Если ваши таблицы адресует
+  `schema_translate_map`, передавайте в `Tallyho` движок с этим отображением — как в
+  [примере хуков](hooks.md#пример-статус-прогресс-и-авто-пауза).
+* **`Tallyho(engine, schema=None)`** описывает таблицы tallyho без схемы: их, как и ваши, ищет
+  соединение. Тогда все движки, через которые вы вызываете tallyho, должны быть настроены
+  одинаково.
+* Если в вашей `schema_translate_map` есть ключ, равный имени схемы tallyho, отображение
+  действует и на таблицы tallyho.
 
 ## Миграции
 
