@@ -8,10 +8,11 @@ from datetime import timedelta
 from typing import TYPE_CHECKING
 
 import pytest
-from sqlalchemy import select, update
+from sqlalchemy import delete, select, text, update
 from typing_extensions import override
 
 from tallyho.engine.finalizer import Finalizer, FinalizerSettings
+from tallyho.engine.operations import Operations
 from tallyho.engine.producer import CallbackName, RootSpec, SubBatchSpec
 from tallyho.hooks.registry import HookRegistry
 from tallyho.model.calls import TaskCall
@@ -577,6 +578,165 @@ async def test_feed_committed_before_batch_lock_restarts_finalization(
     assert calls == 2
     assert (await env.batch(source.id))["state"] == BatchState.SUCCEEDED
     assert (await env.batch(stage.id))["state"] == BatchState.SUCCEEDED
+
+
+def _recording_hook(
+    registry: HookRegistry, kind: str, *, hold_first: bool = False
+) -> tuple[list[tuple[BatchState, CancelReason | None]], asyncio.Event, asyncio.Event]:
+    """Хук ``kind``: пишет ``(state, reason)`` каждого вызова; первый вызов можно задержать."""
+    seen: list[tuple[BatchState, CancelReason | None]] = []
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    @registry.on_finalized(kind)
+    async def save(_session: AsyncSession, summary: BatchSummary) -> None:
+        seen.append((summary.state, summary.reason))
+        if hold_first and len(seen) == 1:
+            entered.set()
+            await release.wait()
+
+    return seen, entered, release
+
+
+async def test_cancel_between_batch_read_and_counters_finalizes_cancelled(
+    env: Env, registry: HookRegistry
+) -> None:
+    # Fix-9: финализация после seal прочитала строку батча (sealed, отмены нет) и
+    # ждёт чтения счётчиков; cancel() коммитит флаг и отменяет все Items. Счётчики
+    # дают pending = 0 при строке без флага отмены: раньше это давало succeeded.
+    # Итог обязан выбираться по строке, прочитанной под блокировкой.
+    seen, _entered, _release = _recording_hook(registry, "late-cancel")
+    async with env.transaction() as conn:
+        root = await env.producer.create_root(conn, RootSpec(kind="late-cancel"))
+        calls = [TaskCall(task_name="work", args=(index,), kwargs={}) for index in range(4)]
+        _ = await env.producer.add_items(conn, root.id, calls)
+        _ = await env.producer.seal(conn, root.id)
+
+    counter = f'"{env.schema}"."{env.tables.counter.name}"'
+    async with env.connection() as watcher, env.transaction() as holder:
+        _ = await holder.execute(text(f"LOCK TABLE {counter} IN ACCESS EXCLUSIVE MODE"))
+        running = asyncio.create_task(finalizer(env, registry).try_finalize(root.id))
+        await wait_blocked_by(watcher, await backend_pid(holder))
+        async with env.transaction() as conn:
+            assert await Operations(tables=env.tables, clock=SystemClock()).cancel(conn, root.id)
+
+    assert await asyncio.wait_for(running, timeout=10)
+    row = await env.batch(root.id)
+    assert row["state"] == BatchState.CANCELLED
+    # Первая попытка показала хуку итог по устаревшей строке и откатилась.
+    assert seen == [
+        (BatchState.SUCCEEDED, None),
+        (BatchState.CANCELLED, CancelReason.CANCEL),
+    ]
+    counters = await env.counters(root.id)
+    assert (counters.cancelled, counters.ok, counters.pending) == (4, 0, 0)
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        pytest.param((CancelReason.CANCEL, BatchState.CANCELLED), id="cancel"),
+        pytest.param((CancelReason.DEADLINE, BatchState.FAILED), id="deadline"),
+        pytest.param((CancelReason.FAIL_FAST, BatchState.FAILED), id="fail_fast"),
+        pytest.param((CancelReason.POLICY, BatchState.FAILED), id="policy"),
+    ],
+)
+async def test_cancel_request_while_hook_runs_restarts_finalization(
+    env: Env, registry: HookRegistry, case: tuple[CancelReason, BatchState]
+) -> None:
+    # Запрос отмены (cancel, дедлайн sweeper-а, fail_fast, политика) закоммичен между
+    # хуком и CAS: попытка повторяется, хук получает итог, который и будет записан.
+    reason, expected = case
+    seen, entered, release = _recording_hook(registry, "hook-cancel", hold_first=True)
+    async with env.transaction() as conn:
+        root = await env.producer.create_root(conn, RootSpec(kind="hook-cancel"))
+        _ = await env.producer.seal(conn, root.id)
+
+    running = asyncio.create_task(finalizer(env, registry).try_finalize(root.id))
+    await entered.wait()
+    async with env.transaction() as conn:
+        _ = await Operations(tables=env.tables, clock=SystemClock()).cancel(
+            conn, root.id, reason=reason
+        )
+    release.set()
+
+    assert await asyncio.wait_for(running, timeout=10)
+    assert seen == [(BatchState.SUCCEEDED, None), (expected, reason)]
+    row = await env.batch(root.id)
+    assert (row["state"], row["snap_seq"]) == (expected, 1)
+
+
+async def test_pause_while_hook_runs_does_not_restart_finalization(
+    env: Env, registry: HookRegistry
+) -> None:
+    # Пауза на итог не влияет (§6.1): повторять попытку и хук незачем.
+    seen, entered, release = _recording_hook(registry, "hook-pause", hold_first=True)
+    async with env.transaction() as conn:
+        root = await env.producer.create_root(conn, RootSpec(kind="hook-pause"))
+        _ = await env.producer.seal(conn, root.id)
+
+    running = asyncio.create_task(finalizer(env, registry).try_finalize(root.id))
+    await entered.wait()
+    async with env.transaction() as conn:
+        await Operations(tables=env.tables, clock=SystemClock()).pause(conn, root.id)
+    release.set()
+
+    assert await asyncio.wait_for(running, timeout=10)
+    assert seen == [(BatchState.SUCCEEDED, None)]
+    row = await env.batch(root.id)
+    assert row["state"] == BatchState.SUCCEEDED
+    assert row["paused_at"] is not None
+
+
+async def test_child_retry_while_parent_hook_runs_keeps_parent_open(
+    env: Env, registry: HookRegistry
+) -> None:
+    # retry_failed() потомка вернул виртуальный Item родителя в active, пока шёл хук
+    # родителя: под блокировкой pending уже не 0, родитель не финализируется, а
+    # изменения хука откатываются вместе с транзакцией.
+    probe = await create_probe(env.engine, env.schema)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    @registry.on_finalized("reopened")
+    async def save(session: AsyncSession, _summary: BatchSummary) -> None:
+        await insert_id(await session.connection(), probe, 1)
+        entered.set()
+        await release.wait()
+
+    async with env.transaction() as conn:
+        root = await env.producer.create_root(conn, RootSpec(kind="reopened"))
+        child = await env.producer.create_sub_batch(conn, root.id, SubBatchSpec(key="send"))
+        _ = await env.producer.add_items(
+            conn, child.id, [TaskCall(task_name="send", args=(), kwargs={})]
+        )
+        _ = await env.producer.seal(conn, child.id)
+        _ = await env.producer.seal(conn, root.id)
+        _ = await conn.execute(
+            update(env.tables.item)
+            .where(env.tables.item.c.batch_id == child.id)
+            .values(state=int(ItemState.ERROR), label="rejected", finished_at=NOW)
+        )
+        _ = await conn.execute(
+            delete(env.tables.outbox).where(env.tables.outbox.c.batch_id == child.id)
+        )
+        await upsert_slots(conn, env.tables, {(child.id, 9): CounterDelta(error=1, w_done=1)})
+
+    running = asyncio.create_task(finalizer(env, registry).try_finalize(child.id))
+    await entered.wait()
+    async with env.transaction() as conn:
+        retried = await Operations(tables=env.tables, clock=SystemClock()).retry_failed(
+            conn, child.id
+        )
+    assert retried == 1
+    release.set()
+
+    assert await asyncio.wait_for(running, timeout=10)
+    assert (await env.batch(child.id))["state"] == BatchState.SEALED
+    row = await env.batch(root.id)
+    assert (row["state"], row["snap_seq"]) == (BatchState.SEALED, 0)
+    assert (await env.counters(root.id)).pending == 1
+    assert await committed_ids(env.engine, probe) == []
 
 
 def test_finalizer_settings_validate_ranges() -> None:
