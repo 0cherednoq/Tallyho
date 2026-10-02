@@ -3,6 +3,11 @@
 ARCHITECTURE §6.1, §7.3, §7.5 и §8.1. Финализация выполняется в собственной
 транзакции. Пользовательский хук вызывается до CAS: проигравшая конкурентная
 попытка откатывает и доменные изменения хука вместе с транзакцией tallyho.
+
+Порядок блокировок в транзакции (§9.2): доменные строки хука → ``th_batch``
+(сам батч и этапы, которые он наполняет, одним ``FOR UPDATE`` по id) →
+``th_outbox`` → ``th_item`` (виртуальный Item родителя) → ``th_counter`` →
+``th_metric``. Тот же порядок у Completer и операций над поддеревом.
 """
 
 from __future__ import annotations
@@ -157,6 +162,15 @@ class _Batch:
 
 
 @dataclass(frozen=True, slots=True)
+class _Stage:
+    """Этап, который наполняет финализируемый батч; строка уже под ``FOR UPDATE``."""
+
+    id: UUID
+    state: BatchState
+    on_feeder_failed: OnFeederFailed
+
+
+@dataclass(frozen=True, slots=True)
 class _Committed:
     batch_id: UUID
     kind: str
@@ -237,27 +251,37 @@ class Finalizer:
                         await hook(session, summary)
             except Exception as exc:
                 raise _HookCallError(error=exc, batch_id=batch_id, kind=target.kind) from exc
-        won = await self._cas(conn, batch=target, state=final_state, now=now)
+        return await self._apply(conn, target, state=final_state, now=now)
+
+    async def _apply(
+        self, conn: AsyncConnection, target: _Batch, *, state: BatchState, now: datetime
+    ) -> _Committed:
+        # Порядок блокировок общий с Completer (§9.2, §10): сначала все строки
+        # th_batch в порядке id, потом th_outbox, th_item и th_counter. Хук уже
+        # отработал: под блокировкой батча его вызывать нельзя (A-DB-08).
+        stages = await self._lock_stages(conn, target.id)
+        won = await self._cas(conn, batch=target, state=state, now=now)
         if not won:
             current = await conn.scalar(
-                select(self.tables.batch.c.state).where(self.tables.batch.c.id == batch_id)
+                select(self.tables.batch.c.state).where(self.tables.batch.c.id == target.id)
             )
             if current is not None and not BatchState(current).is_terminal:
                 raise _SnapshotChangedError
             raise _CasLostError
-        callbacks = await self._write_callbacks(conn, batch=target, state=final_state, now=now)
+        if await self._fed_ids(conn, target.id) != {stage.id for stage in stages}:
+            # add_feed успел добавить этап до блокировки батча: повторить с начала.
+            raise _SnapshotChangedError
+        candidate_ids = set(await self._seal_downstream(conn, stages, now=now))
+        callbacks = await self._write_callbacks(conn, batch=target, state=state, now=now)
         parent_id = await self._finish_virtual(conn, target, now)
-        cascade = await self._seal_downstream(conn, feeder_id=target.id, now=now)
-        candidate_ids: set[UUID] = set(cascade)
         if parent_id is not None:
             candidate_ids.add(parent_id)
-        candidates = sorted(candidate_ids)
         return _Committed(
-            batch_id=batch_id,
+            batch_id=target.id,
             kind=target.kind,
-            state=final_state,
+            state=state,
             parent_id=parent_id,
-            cascade=tuple(candidates),
+            cascade=tuple(sorted(candidate_ids)),
             callbacks=callbacks,
         )
 
@@ -395,35 +419,50 @@ class Finalizer:
         await upsert_metrics(conn, self.tables, {(parent_id, "ok", self.settings.slot): 1})
         return parent_id
 
-    async def _seal_downstream(
-        self,
-        conn: AsyncConnection,
-        *,
-        feeder_id: UUID,
-        now: datetime,
-    ) -> list[UUID]:
+    async def _fed_ids(self, conn: AsyncConnection, feeder_id: UUID) -> set[UUID]:
         feed = self.tables.feed
-        fed_ids = sorted(
-            set(await conn.scalars(select(feed.c.fed_id).where(feed.c.feeder_id == feeder_id)))
-        )
+        return set(await conn.scalars(select(feed.c.fed_id).where(feed.c.feeder_id == feeder_id)))
+
+    async def _lock_stages(self, conn: AsyncConnection, batch_id: UUID) -> list[_Stage]:
+        """Заблокировать батч вместе с этапами, которые он наполняет.
+
+        Один ``FOR UPDATE`` в порядке id — глобальный порядок блокировок
+        ``th_batch``. Если этапов нет, строку батча блокирует сам CAS.
+
+        Returns:
+            Этапы, которые наполняет батч, по возрастанию id.
+        """
+        fed_ids = await self._fed_ids(conn, batch_id)
         if not fed_ids:
             return []
         batch = self.tables.batch
-        rows = (
-            await conn.execute(
-                select(batch.c.id, batch.c.state, batch.c.on_feeder_failed)
-                .where(batch.c.id.in_(fed_ids))
-                .order_by(batch.c.id)
-                .with_for_update()
-            )
-        ).all()
+        rows = await conn.execute(
+            select(batch.c.id, batch.c.state, batch.c.on_feeder_failed)
+            .where(batch.c.id.in_(sorted({batch_id, *fed_ids})))
+            .order_by(batch.c.id)
+            .with_for_update()
+        )
+        return [
+            _Stage(id=row_id, state=BatchState(state), on_feeder_failed=OnFeederFailed(behavior))
+            for row_id, state, behavior in rows
+            if row_id != batch_id
+        ]
+
+    async def _seal_downstream(
+        self,
+        conn: AsyncConnection,
+        stages: list[_Stage],
+        *,
+        now: datetime,
+    ) -> list[UUID]:
+        batch = self.tables.batch
         closed: list[UUID] = []
-        for fed_id, fed_state, behavior in rows:
-            all_terminal, failed = await self._feeder_status(conn, fed_id)
-            if BatchState(fed_state).is_terminal or not all_terminal:
+        for stage in stages:
+            all_terminal, failed = await self._feeder_status(conn, stage.id)
+            if stage.state.is_terminal or not all_terminal:
                 continue
             values: dict[str, object] = {"updated_at": now}
-            if failed and OnFeederFailed(behavior) is OnFeederFailed.CANCEL:
+            if failed and stage.on_feeder_failed is OnFeederFailed.CANCEL:
                 values |= {
                     "cancel_requested_at": now,
                     "cancel_reason": CancelReason.CANCEL.value,
@@ -431,9 +470,9 @@ class Finalizer:
             else:
                 values["state"] = int(BatchState.SEALED)
             _ = await conn.execute(
-                update(batch).where(batch.c.id == fed_id, batch.c.state == _OPEN).values(values)
+                update(batch).where(batch.c.id == stage.id, batch.c.state == _OPEN).values(values)
             )
-            closed.append(fed_id)
+            closed.append(stage.id)
         return closed
 
     async def _feeder_status(self, conn: AsyncConnection, fed_id: UUID) -> tuple[bool, bool]:
