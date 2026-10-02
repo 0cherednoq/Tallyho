@@ -219,7 +219,7 @@ try:
     assert final["status"] == "cancelled"  # поставил on_finalized, атомарно с финализацией
     assert (final["done"], final["failed"]) == (8, 2)
 finally:
-    await broker.close()
+    await th.aclose()
 ```
 
 ## Правила транзакции хука
@@ -337,7 +337,7 @@ try:
     assert final.state is BatchState.SUCCEEDED
     assert saved == [BatchState.SUCCEEDED]  # хук закоммичен ровно один раз
 finally:
-    await broker.close()
+    await th.aclose()
 ```
 
 ## Колбэк-задачи
@@ -537,7 +537,7 @@ try:
     assert purged
     assert (await statuses())["later@down.test"] == ("failed", "exhausted")  # ваши данные на месте
 finally:
-    await broker.close()
+    await th.aclose()
 ```
 
 Условия, без которых рецепт некорректен:
