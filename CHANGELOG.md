@@ -19,7 +19,8 @@
   `seal`.
 - Итог задачи через `item.ok / skip / error` с метками (labels), пользовательские метрики
   `item.incr`, собственный прогресс задачи `item.progress`, кооперативная отмена
-  `item.cancelled()`, завершение в транзакции пользователя `item.complete_in(session)`.
+  `item.cancelled()`, завершение в транзакции пользователя `item.complete_in(session)`; попытка,
+  потерявшая аренду, получает `LeaseLostError`, и её доменные записи откатываются.
 - Вызовы `th.call(fn, …).opts(key=, weight=, queue=, …)`: дедупликация по ключу, веса для
   прогресса, опции брокера.
 - Колбэк-задачи `on_succeeded`, `on_completed_with_errors`, `on_failed`, `on_cancelled`,

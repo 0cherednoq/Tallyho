@@ -155,7 +155,7 @@ async def schedule(session: AsyncSession, campaign_id: int) -> None:
 | `item.progress(done, total=None)` | собственный прогресс долгой задачи; виден в `handle.in_flight()` |
 | `item.cancelled()` | `True`, если батч отменяют: долгой задаче пора выйти |
 | `item.spawn(...)`, `item.spawn_call(...)`, `item.expect(...)`, `item.sub_batch(...)` | [динамический fan-out](#spawn-задачи-порождают-задачи) |
-| `await item.complete_in(session)` | завершить задачу [в вашей транзакции](hooks.md#итог-задачи-в-вашей-транзакции) |
+| `await item.complete_in(session)` | завершить задачу [в вашей транзакции](hooks.md#итог-задачи-в-вашей-транзакции); `LeaseLostError`, если задача [потеряла аренду](hooks.md#если-задача-потеряла-аренду) |
 | `item.id()`, `item.current()` | идентификатор и контекст текущей задачи; `None` вне задачи |
 
 Правила итога:
@@ -659,6 +659,7 @@ finally:
 | `HookTransactionError` | хук вызвал `commit()` или `rollback()` |
 | `HookMissingError` | батчу нужен хук, который не зарегистрирован в процессе |
 | `CompleterError` | запись завершений не прошла; задача вернётся брокеру и будет повторена |
+| `LeaseLostError` | `item.complete_in`: задача больше не принадлежит этой попытке (аренда истекла, батч отменён, задачу повторяет другой воркер); ничего не записано, ловить не нужно |
 
 ## Что дальше
 
