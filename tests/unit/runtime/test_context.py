@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from datetime import timedelta
 from typing import TYPE_CHECKING, cast
 from uuid import uuid4
@@ -205,9 +205,14 @@ def test_sub_batch_takes_callbacks_as_named_parameters() -> None:
     assert context.sub_batch("none").spec.callbacks == {}
 
 
+def test_callback_context_has_no_summary() -> None:
+    """Сводки в контексте колбэка нет: итог читается через handle (ARCHITECTURE §11.2)."""
+    assert [value.name for value in fields(CallbackContext)] == ["callback_id", "batch_id"]
+
+
 def test_facades_delegate_inside_scoped_context() -> None:
     context, completer = _context()
-    callback_context = CallbackContext(uuid4(), context.batch_id, {"ok": 1})
+    callback_context = CallbackContext(uuid4(), context.batch_id)
     with activate_item(context):
         assert item.current() is context
         assert item.id() == context.id

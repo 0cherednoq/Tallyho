@@ -15,7 +15,7 @@ from typing_extensions import override
 from tallyho.engine.spawn import TreeCache
 from tallyho.model.states import ItemState
 from tallyho.protocols.broker import DeadLetters, Runtime, Verdict
-from tallyho.runtime import TaskRuntime, callback, item
+from tallyho.runtime import CallbackContext, TaskRuntime, callback, item
 from tests.helpers.relay import RecordingDispatcher
 from tests.integration.engine.completer_env import open_completer, seed
 
@@ -23,7 +23,6 @@ if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
     from uuid import UUID
 
-    from tallyho.runtime import CallbackContext
     from tests.integration.engine.conftest import Env
 
 __all__: list[str] = []
@@ -152,12 +151,11 @@ async def test_callback_context_is_scoped_and_marker_is_hidden(env: Env) -> None
             seen_markers.append(kwargs.get("_th"))
 
         callback_id = seeded.batch_id
+        # Ключ "s" ставит адаптер flexiq (всегда None); маркер с ним принимается и
+        # игнорируется — сводки в контексте колбэка нет (ARCHITECTURE §11.2).
         await runtime.wrap(task)(_th={"c": callback_id, "b": seeded.batch_id, "s": {"ok": 1}})
 
-    context = seen_contexts[0]
-    assert context is not None
-    assert context.callback_id == callback_id
-    assert context.summary == {"ok": 1}
+    assert seen_contexts == [CallbackContext(callback_id=callback_id, batch_id=seeded.batch_id)]
     assert seen_markers == [None]
     assert callback.current() is None
 

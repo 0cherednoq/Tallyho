@@ -129,7 +129,6 @@ class TaskRuntime:
         context = CallbackContext(
             callback_id=_uuid(marker.get("c")),
             batch_id=_uuid(marker.get("b")),
-            summary=marker.get("s"),
         )
         with activate_callback(context):
             return await task(*args, **kwargs)

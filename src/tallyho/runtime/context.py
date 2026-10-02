@@ -64,11 +64,14 @@ class CallFactory(Protocol):
 
 @dataclass(frozen=True, slots=True)
 class CallbackContext:
-    """Служебная информация текущей callback-задачи."""
+    """Служебная информация текущей callback-задачи (ARCHITECTURE §11.2).
+
+    ``callback_id`` стабилен при повторной доставке — ключ идемпотентности.
+    Сводки здесь нет: итог батча читается через ``th.handle(batch_id).view()``.
+    """
 
     callback_id: UUID
     batch_id: UUID
-    summary: object = None
 
 
 @dataclass(slots=True)
