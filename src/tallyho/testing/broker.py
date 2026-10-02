@@ -17,7 +17,14 @@ from tallyho.engine.completer import ItemRef
 from tallyho.engine.installation import RuntimeServices
 from tallyho.model.errors import ConfigurationError
 from tallyho.model.states import OutboxKind
-from tallyho.protocols.broker import DeadLetters, Dispatcher, RetryLimits, Runtime, Verdict
+from tallyho.protocols.broker import (
+    DeadLetter,
+    DeadLetters,
+    Dispatcher,
+    RetryLimits,
+    Runtime,
+    Verdict,
+)
 from tallyho.protocols.serialization import JsonSerializer, PayloadCodec, SerializerCodec
 
 if TYPE_CHECKING:
@@ -207,10 +214,10 @@ class InlineBroker(Dispatcher, Runtime, PayloadCodec, RetryLimits):
 
     @override
     async def reconcile_dead(self, since: str | None) -> DeadLetters:
-        """Вернуть Item из локального DLQ после числового курсора.
+        """Вернуть Items из локального DLQ после числового курсора.
 
         Returns:
-            Новые Item ids и следующий курсор.
+            Новые мёртвые сообщения Items с их поколением отправки и следующий курсор.
 
         Raises:
             ConfigurationError: курсор не является целым числом.
@@ -220,10 +227,12 @@ class InlineBroker(Dispatcher, Runtime, PayloadCodec, RetryLimits):
         except ValueError as exc:
             message = "курсор InlineBroker должен быть целым числом"
             raise ConfigurationError(message) from exc
-        item_ids = tuple(
-            message.id for message in self._dead[offset:] if message.kind is OutboxKind.ITEM
+        entries = tuple(
+            DeadLetter(message.id, message.generation)
+            for message in self._dead[offset:]
+            if message.kind is OutboxKind.ITEM
         )
-        return DeadLetters(item_ids, str(len(self._dead)))
+        return DeadLetters(entries, str(len(self._dead)))
 
     @override
     def encode(

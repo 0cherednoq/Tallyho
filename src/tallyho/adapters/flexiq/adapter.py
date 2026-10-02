@@ -6,11 +6,14 @@ import asyncio
 import contextvars
 import functools
 import inspect
+import json
 import logging
-from collections import defaultdict
+import time
+from collections import OrderedDict, defaultdict
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
+from datetime import timedelta
 from importlib.metadata import version
 from typing import TYPE_CHECKING, ParamSpec, Protocol, TypeVar, cast, final, runtime_checkable
 from uuid import UUID
@@ -30,6 +33,7 @@ from tallyho.model.states import OutboxKind
 from tallyho.protocols.broker import (
     CallOptionsValidator,
     CancellationClassifier,
+    DeadLetter,
     DeadLetters,
     Dispatcher,
     RetryLimits,
@@ -62,7 +66,15 @@ _DISPATCH_FAILED = "flexiq не принял сообщения relay"
 _BAD_OPTIONS = "опции задачи flexiq имеют неверный тип"
 _FED_BY_HINT = "используйте под-батчи с fed_by вместо depends_on"
 _DEBOUNCE_HINT = "debounce/batch объединяют jobs и нарушают правило «один Item — одна job»"
+_BAD_OVERLAP = "dead_letter_overlap не может быть отрицательным"
 _CHUNK = 1_000
+_DLQ_PAGE = 200
+"""Сколько записей DLQ разбирает один вызов ``reconcile_dead``."""
+_DLQ_CACHE = 50_000
+"""Сколько соответствий «запись DLQ → Item» помнит процесс."""
+_DETAIL_LIMIT = 1_000
+"""Сколько символов ошибки flexiq попадает в ``th_item.error``."""
+_DEFAULT_OVERLAP = timedelta(minutes=15)
 _FLEXIQ_MAJOR = 2
 _PAIR_SIZE = 2
 _BATCH_OPTION = "batch"
@@ -199,6 +211,75 @@ class _EffectiveAttempt:
 
 
 @dataclass(frozen=True, slots=True)
+class _JobMarker:
+    """Служебный маркер ``_th`` джобы Item."""
+
+    item_id: UUID
+    batch_id: UUID
+    generation: int
+
+
+@dataclass(frozen=True, slots=True)
+class _DeadCursor:
+    """Положение сверки с DLQ flexiq (ARCHITECTURE §11.3).
+
+    flexiq листает DLQ от новых записей к старым, поэтому «дочитать новое»
+    его курсором нельзя. Обход каждый раз идёт от самой новой записи вниз до
+    ``watermark - overlap`` и может занять несколько вызовов.
+
+    Attributes:
+        watermark: ``failed_at`` (мс) самой новой записи, которую видел
+            последний законченный обход; ``None`` — обходов ещё не было.
+        high: кандидат в ``watermark`` для незаконченного обхода.
+        resume: курсор страницы flexiq, с которой обход продолжится;
+            ``None`` — следующий вызов начинает новый обход.
+    """
+
+    watermark: int | None = None
+    high: int | None = None
+    resume: str | None = None
+
+    @classmethod
+    def parse(cls, raw: str | None) -> _DeadCursor:
+        """Разобрать курсор из ``th_meta``; чужой или испорченный — начать сначала.
+
+        Returns:
+            Положение сверки.
+        """
+        if not raw:
+            return cls()
+        try:
+            loaded = cast("object", json.loads(raw))
+        except ValueError:
+            loaded = None
+        values = _mapping(loaded)
+        watermark, high, resume = values.get("w"), values.get("h"), values.get("r")
+        parsed = cls(
+            watermark=_stamp(watermark),
+            high=_stamp(high),
+            resume=resume if isinstance(resume, str) else None,
+        )
+        if not values or (parsed.watermark, parsed.high, parsed.resume) != (
+            watermark,
+            high,
+            resume,
+        ):
+            _log.warning("курсор сверки с DLQ flexiq не распознан; сверка начнётся сначала")
+            return cls()
+        return parsed
+
+    def dump(self) -> str:
+        """Непрозрачная для движка строка курсора.
+
+        Returns:
+            JSON с полями положения.
+        """
+        return json.dumps(
+            {"w": self.watermark, "h": self.high, "r": self.resume}, separators=(",", ":")
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class _Prepared:
     message: Message
     args: tuple[object, ...]
@@ -235,11 +316,33 @@ class FlexiqAdapter(
 ):
     """Двусторонний адаптер одной пользовательской ``flexiq.Queue``."""
 
-    def __init__(self, queue: Queue, *, pool: str = "thread") -> None:
-        """Связать адаптер с Queue; проверка совместимости идёт при install."""
+    def __init__(
+        self,
+        queue: Queue,
+        *,
+        pool: str = "thread",
+        dead_letter_overlap: timedelta = _DEFAULT_OVERLAP,
+    ) -> None:
+        """Связать адаптер с Queue; проверка совместимости идёт при install.
+
+        Args:
+            queue: ``flexiq.Queue`` приложения.
+            pool: пул воркера flexiq; поддерживается только ``"thread"``.
+            dead_letter_overlap: насколько глубже уже разобранного сверка с DLQ
+                перечитывает записи на каждом обходе. Должно покрывать
+                расхождение часов воркеров: ``failed_at`` записи DLQ ставит
+                воркер по своим часам (ARCHITECTURE §11.3).
+
+        Raises:
+            ConfigurationError: ``dead_letter_overlap`` отрицательный.
+        """
+        if dead_letter_overlap < timedelta(0):
+            raise ConfigurationError(_BAD_OVERLAP)
         self._raw_queue = cast("object", queue)
         self._queue = cast("_Queue", self._raw_queue)
         self._pool = pool
+        self._overlap_ms = dead_letter_overlap // timedelta(milliseconds=1)
+        self._dead_cache: OrderedDict[str, DeadLetter | None] = OrderedDict()
         self._runtime: WorkerRuntime | None = None
         self._services: WorkerServices | None = None
         self._tasks: dict[str, _TaskConfig] = {}
@@ -389,31 +492,54 @@ class FlexiqAdapter(
 
     @override
     async def reconcile_dead(self, since: str | None) -> DeadLetters:
-        """Прочитать одну страницу DLQ и извлечь Item ids из payload.
+        """Разобрать одну страницу DLQ: Item и поколение отправки из payload джоб.
+
+        Обход идёт от самой новой записи DLQ вниз до ``водяной знак -
+        dead_letter_overlap`` (первый обход — до конца истории), по странице
+        за вызов. Записи внутри перекрытия отдаются на каждом обходе повторно:
+        так находятся и записи воркеров с отстающими часами.
 
         Returns:
-            Найденные Item и непрозрачный курсор следующей страницы.
+            Мёртвые джобы Items со страницы, курсор и признак продолжения обхода.
 
         Raises:
-            _FlexiqDispatchError: flexiq не прочитал DLQ либо payload повреждён.
-            TallyhoError: payload DLQ не удалось декодировать.
+            _FlexiqDispatchError: flexiq не прочитал DLQ или джобу.
+            TallyhoError: flexiq не прочитал DLQ или джобу.
         """
+        state = _DeadCursor.parse(since)
         try:
-            raw_page = await self._queue.adead_letters_after(limit=_CHUNK, after=since)
+            raw_page = await self._queue.adead_letters_after(limit=_DLQ_PAGE, after=state.resume)
         except TallyhoError:
             raise
         except Exception as exc:
             raise _FlexiqDispatchError(_DISPATCH_FAILED) from exc
         page = cast("_Page", raw_page)
-        ids: list[UUID] = []
-        for raw in page.items:
-            entry = _mapping(raw)
-            job_id = entry.get("original_job_id")
-            if isinstance(job_id, str):
-                identity = await self._job_identity(job_id)
-                if identity is not None:
-                    ids.append(identity[0])
-        return DeadLetters(tuple(ids), page.next_cursor)
+        letters = [_mapping(raw) for raw in page.items]
+        stamps = [stamp for letter in letters if (stamp := _failed_at(letter)) is not None]
+        high = state.high
+        if state.resume is None:
+            # Новый обход: его водяной знак — самая новая запись. Часам воркера
+            # не доверяем сверх перекрытия: иначе одна запись «из будущего»
+            # спрятала бы под водяной знак все следующие.
+            newest = max(stamps, default=None)
+            if newest is not None:
+                newest = min(newest, _now_ms() + self._overlap_ms)
+            known = [value for value in (state.watermark, newest) if value is not None]
+            high = max(known, default=None)
+        floor = None if state.watermark is None else state.watermark - self._overlap_ms
+        entries: list[DeadLetter] = []
+        for letter in letters:
+            stamp = _failed_at(letter)
+            if floor is not None and stamp is not None and stamp < floor:
+                continue
+            entry = await self._dead_letter(letter)
+            if entry is not None:
+                entries.append(entry)
+        below_floor = floor is not None and any(stamp < floor for stamp in stamps)
+        if page.next_cursor is None or below_floor:
+            return DeadLetters(tuple(entries), _DeadCursor(watermark=high).dump())
+        cursor = _DeadCursor(watermark=state.watermark, high=high, resume=page.next_cursor)
+        return DeadLetters(tuple(entries), cursor.dump(), more=True)
 
     @override
     def encode(
@@ -600,20 +726,51 @@ class FlexiqAdapter(
             _log.exception("не удалось завершить Item из flexiq JOB_DEAD")
 
     async def _finish_dead_inner(self, job_id: str, detail: str) -> None:
-        identity = await self._job_identity(job_id)
-        if identity is None:
+        marker = await self._job_marker(job_id)
+        if marker is None:
             return
         services = self._services
         if services is None:
             raise ConfigurationError(_NOT_INSTALLED)
         await services.finish_dead(
-            identity[0],
-            identity[1],
+            marker.item_id,
+            marker.batch_id,
             error_type="FlexiqDeadLetter",
             detail=detail,
         )
 
-    async def _job_identity(self, job_id: str) -> tuple[UUID, UUID] | None:
+    async def _dead_letter(self, letter: Mapping[str, object]) -> DeadLetter | None:
+        # Запись DLQ → Item и поколение отправки; None — запись не про Item.
+        # Соответствие неизменно, поэтому кэшируется: запись внутри перекрытия
+        # сверка видит на каждом обходе, а читать её джобу нужно один раз.
+        job_id = letter.get("original_job_id")
+        if not isinstance(job_id, str):
+            return None
+        letter_id = letter.get("id")
+        key = letter_id if isinstance(letter_id, str) else job_id
+        if key in self._dead_cache:
+            self._dead_cache.move_to_end(key)
+            return self._dead_cache[key]
+        try:
+            marker = await self._job_marker(job_id)
+        except TallyhoError:
+            # Payload джобы не читается текущими кодеками: такая запись не
+            # должна останавливать сверку остальных.
+            _log.warning("сверка с DLQ: payload джобы %s не декодируется, запись пропущена", job_id)
+            marker = None
+        except Exception as exc:
+            raise _FlexiqDispatchError(_DISPATCH_FAILED) from exc
+        entry: DeadLetter | None = None
+        if marker is not None:
+            error = letter.get("error")
+            detail = error[:_DETAIL_LIMIT] if isinstance(error, str) and error else None
+            entry = DeadLetter(marker.item_id, marker.generation, detail)
+        self._dead_cache[key] = entry
+        if len(self._dead_cache) > _DLQ_CACHE:
+            _ = self._dead_cache.popitem(last=False)
+        return entry
+
+    async def _job_marker(self, job_id: str) -> _JobMarker | None:
         raw_job = await self._queue.aget_job(job_id)
         if raw_job is None:
             return None
@@ -627,7 +784,10 @@ class FlexiqAdapter(
         batch_id = _uuid_or_none(marker.get("b"))
         if item_id is None or batch_id is None:
             return None
-        return item_id, batch_id
+        generation = marker.get("g", 0)
+        if isinstance(generation, bool) or not isinstance(generation, int) or generation < 0:
+            return None
+        return _JobMarker(item_id, batch_id, generation)
 
     def _require_runtime(self) -> WorkerRuntime:
         if self._runtime is None:
@@ -643,7 +803,12 @@ class FlexiqAdapter(
                 "r": maximum,
                 "s": None,
             }
-        return {"i": str(message.id), "b": str(message.batch_id), "r": maximum}
+        marker: dict[str, object] = {"i": str(message.id), "b": str(message.batch_id), "r": maximum}
+        if message.generation:
+            # Первая отправка — поколение 0, ключа нет: payload горячего пути не растёт,
+            # а джобы, поставленные до появления поколений, читаются так же.
+            marker["g"] = message.generation
+        return marker
 
     @staticmethod
     def _reject_decorated_options(options: Mapping[str, object]) -> None:
@@ -729,6 +894,19 @@ def _mapping(value: object) -> Mapping[str, object]:
         return {}
     raw = cast("Mapping[object, object]", value)
     return {key: item for key, item in raw.items() if isinstance(key, str)}
+
+
+def _now_ms() -> int:
+    # Часы процесса нужны только как верхняя граница для failed_at из DLQ.
+    return time.time_ns() // 1_000_000
+
+
+def _stamp(value: object) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _failed_at(letter: Mapping[str, object]) -> int | None:
+    return _stamp(letter.get("failed_at"))
 
 
 def _marker_retries(value: object, default: int) -> int:

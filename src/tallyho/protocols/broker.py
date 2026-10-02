@@ -24,6 +24,7 @@ if TYPE_CHECKING:
 __all__ = [
     "CallOptionsValidator",
     "CancellationClassifier",
+    "DeadLetter",
     "DeadLetters",
     "Dispatcher",
     "Message",
@@ -84,17 +85,45 @@ class Verdict(StrEnum):
 
 
 @dataclass(frozen=True, slots=True)
+class DeadLetter:
+    """Одна джоба Item, которую брокер окончательно отправил в DLQ.
+
+    Attributes:
+        item_id: Item из служебного маркера джобы.
+        generation: поколение отправки из маркера — :attr:`Message.generation`
+            сообщения, по которому джоба создана. Сверка завершает Item, только
+            если это его текущее поколение (ARCHITECTURE UC-15).
+        detail: текст ошибки брокера для ``th_item.error``; ``None`` — нет.
+    """
+
+    item_id: UUID
+    generation: int = 0
+    detail: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class DeadLetters:
     """Результат одного шага сверки с DLQ брокера.
 
     Attributes:
-        item_ids: Items, чьи задачи брокер окончательно отправил в DLQ.
+        entries: мёртвые джобы этой порции. Одна и та же джоба может прийти
+            повторно: движок применяет её идемпотентно.
         cursor: непрозрачный курсор для следующего вызова
-            :meth:`Runtime.reconcile_dead`; ``None`` — начать сначала.
+            :meth:`Runtime.reconcile_dead`; ``None`` — начать сначала. Движок
+            хранит его в БД и сдвигает в транзакции, которая применила
+            ``entries``.
+        more: порция не последняя: движку стоит сразу вызвать
+            :meth:`Runtime.reconcile_dead` с новым курсором.
     """
 
-    item_ids: tuple[UUID, ...]
+    entries: tuple[DeadLetter, ...]
     cursor: str | None
+    more: bool = False
+
+    @property
+    def item_ids(self) -> tuple[UUID, ...]:
+        """Items порции в порядке ``entries``."""
+        return tuple(entry.item_id for entry in self.entries)
 
 
 @runtime_checkable
@@ -216,13 +245,20 @@ class Runtime(Protocol):
         ...
 
     async def reconcile_dead(self, since: str | None) -> DeadLetters:
-        """Найти Items, чьи задачи брокер отправил в DLQ после курсора ``since``.
+        """Отдать следующую порцию джоб Items из DLQ брокера.
+
+        Движок вызывает метод периодически из процессов с адаптером и хранит
+        курсор между вызовами (ARCHITECTURE UC-15). Порция должна быть
+        ограничена: остаток адаптер отдаёт следующими вызовами, выставляя
+        :attr:`DeadLetters.more`. Курсор не должен возвращаться назад: джоба,
+        попавшая в DLQ до вызова, рано или поздно отдаётся хотя бы один раз.
+        Повторная выдача той же джобы допустима.
 
         Args:
             since: курсор из прошлого :class:`DeadLetters` или ``None``.
 
         Returns:
-            Items из DLQ и курсор для следующего вызова.
+            Мёртвые джобы Items и курсор для следующего вызова.
         """
         ...
 
