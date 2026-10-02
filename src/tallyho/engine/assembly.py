@@ -319,6 +319,7 @@ class _Facade:
                 snapshot_tick=settings.snapshot_tick,
                 watch_throttle=settings.watch_throttle,
             ),
+            lock_identity=value.maintenance_identity,
         )
         self._install_worker(
             adapter,

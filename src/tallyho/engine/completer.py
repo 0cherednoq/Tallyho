@@ -1281,7 +1281,7 @@ class Completer:
         observer: Observer | None = None,
         triggers: CompleterTriggers | None = None,
     ) -> None:
-        """Completer поверх ``engine`` (со ``schema_translate_map`` установки).
+        """Completer поверх ``engine``; схема установки записана в ``tables``.
 
         Args:
             tables: Таблицы установки.

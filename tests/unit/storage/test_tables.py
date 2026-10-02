@@ -7,7 +7,16 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 import pytest
-from sqlalchemy import Column, Index, MetaData, SmallInteger, Table, Uuid, create_mock_engine
+from sqlalchemy import (
+    Column,
+    Index,
+    MetaData,
+    SmallInteger,
+    Table,
+    Uuid,
+    create_mock_engine,
+    select,
+)
 from sqlalchemy.schema import CreateIndex, CreateTable
 from sqlalchemy.sql import visitors
 
@@ -105,10 +114,21 @@ def test_each_call_builds_independent_metadata() -> None:
 
 
 def test_tables_have_no_schema_and_no_foreign_keys(tables: Tables) -> None:
-    # Схему подставляет schema_translate_map; целостность держит библиотека.
+    # Без schema= адрес таблиц определяет соединение; целостность держит библиотека.
     for table in tables.metadata.sorted_tables:
         assert table.schema is None
         assert not table.foreign_keys
+
+
+def test_schema_is_written_into_every_table_and_query() -> None:
+    # Fix-12: имя схемы — в самом запросе, а не в опциях соединения.
+    tables = build_metadata("acme_", schema="app")
+    assert {table.schema for table in tables.metadata.sorted_tables} == {"app"}
+    assert set(tables.metadata.tables) == {f"app.acme_{suffix}" for suffix in TABLE_SUFFIXES}
+    statement = select(tables.item.c.id).join(tables.batch, tables.batch.c.id == tables.item.c.id)
+    dialect = create_mock_engine("postgresql+asyncpg://", executor=print).dialect
+    sql = str(statement.compile(dialect=dialect))
+    assert "FROM app.acme_item JOIN app.acme_batch" in sql
 
 
 def test_item_indexes_skip_mutable_columns(tables: Tables) -> None:

@@ -99,7 +99,7 @@ from tallyho.model.states import BatchState
 from tallyho.model.views import BatchSummary
 from tallyho.testing import FakeClock, InlineBroker
 
-# Движок приложения: имена таблиц без схемы — и ваших, и tallyho — ведут в схему приложения.
+# Движок приложения: ваши таблицы без схемы лежат в схеме приложения. Хуки получат сессию этого движка.
 app_engine = engine.execution_options(schema_translate_map={None: schema})
 
 # Доменная таблица приложения — в той же базе, что и таблицы tallyho.
@@ -230,6 +230,9 @@ finally:
 
 * **Сессия хука — `AsyncSession` на соединении и в транзакции tallyho.** Вызывать `commit()` и
   `rollback()` внутри хука нельзя: будет `HookTransactionError`, и финализация откатится.
+* **Соединение хука взято из движка, переданного в `Tallyho(engine, ...)`.** Ваши таблицы хук
+  находит так же, как остальной код на этом движке: по `search_path` или по
+  `schema_translate_map` движка. Подробнее — [«Схема в ваших сессиях»](installation.md#схема-в-ваших-сессиях).
 * **Только работа с базой.** HTTP-запросы, письма, обращения к брокеру из хука не делайте: они не
   откатятся вместе с транзакцией. Для них есть [колбэк-задачи](#колбэк-задачи).
 * **Хук должен быть идемпотентным по смыслу.** Пишите «установить итог», а не «прибавить к итогу».
@@ -509,7 +512,7 @@ from tallyho.model.states import ItemState
 from tallyho.model.views import BatchSummary
 from tallyho.testing import FakeClock, InlineBroker
 
-# Движок приложения: имена таблиц без схемы — и ваших, и tallyho — ведут в схему приложения.
+# Движок приложения: ваши таблицы без схемы лежат в схеме приложения. Хуки получат сессию этого движка.
 app_engine = engine.execution_options(schema_translate_map={None: schema})
 
 metadata = MetaData()

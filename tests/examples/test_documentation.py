@@ -47,6 +47,7 @@ EXPECTED = {
     "architecture-delivery",
     "architecture-catalog",
     "guide-install-migrate",
+    "guide-install-session",
     "guide-batches-basics",
     "guide-batches-pipeline",
     "guide-batches-policy",

@@ -280,7 +280,7 @@ class Relay:
     """Отправка ``th_outbox`` брокеру: fast-path :meth:`kick` и страховочный :meth:`scan_once`.
 
     Attributes:
-        engine: Движок БД; схема установки — в ``schema_translate_map``.
+        engine: Движок БД; схема установки записана в ``tables``.
         tables: Таблицы установки.
         clock: Часы: «сейчас» в SQL (D-002) и длительности для Observer.
         dispatcher: Адаптер брокера.

@@ -11,8 +11,8 @@
 слотов и несвёрнутых дельт), и запросы к таблицам счётчиков.
 
 Функции принимают ``AsyncConnection`` в открытой транзакции (D-004) и
-:class:`~tallyho.storage.tables.Tables` установки; схему подставляет
-``schema_translate_map`` соединения. Строки ``th_counter`` и ``th_metric``
+:class:`~tallyho.storage.tables.Tables` установки; схема записана в самих
+таблицах. Строки ``th_counter`` и ``th_metric``
 блокируются в порядке первичного ключа (ARCHITECTURE §9.2).
 """
 
