@@ -343,7 +343,9 @@ class Sweeper:
         return changed
 
     async def enforce_deadlines(self) -> int:
-        """Поставить просроченным деревьям запрос отмены ``deadline``.
+        """Поставить просроченным батчам и их поддеревьям запрос отмены ``deadline``.
+
+        Батчи, у которых флаг уже есть, сохраняют свою причину (§6.1).
 
         Returns:
             Число немедленно отменённых Items.
@@ -617,8 +619,8 @@ class Sweeper:
         now = await self._now(conn)
         result = await conn.scalars(
             select(batch.c.id)
+            # Дедлайн есть у любого узла (§6.1): под-батч отменяется со своим поддеревом.
             .where(
-                batch.c.id == batch.c.root_id,
                 batch.c.state < TERMINAL_THRESHOLD,
                 batch.c.cancel_requested_at.is_(None),
                 batch.c.deadline_at.is_not(None),
