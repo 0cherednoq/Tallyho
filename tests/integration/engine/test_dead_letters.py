@@ -325,6 +325,23 @@ async def test_window_slot_is_released_and_relay_is_kicked(env: Env) -> None:
     assert env_rig.relay.calls == [[seeded.batch_id]]
 
 
+async def test_reconciler_without_relay_still_releases_window(env: Env) -> None:
+    seeded = await seed(env, 1)
+    ref = seeded.refs[0]
+    async with env.transaction() as conn:
+        _ = await conn.execute(
+            insert(env.tables.window).values(item_id=ref.id, batch_id=seeded.batch_id)
+        )
+    env_rig = rig(env, [DeadLetter(ref.id)])
+    env_rig.reconciler.relay = None
+
+    assert await env_rig.reconciler.reconcile_once() == 1
+
+    # Подсказать некому, но место освобождено: его подберёт scan relay.
+    assert await env.count(env.tables.window) == 0
+    assert env_rig.relay.calls == []
+
+
 async def test_failed_portion_keeps_cursor_and_is_applied_by_next_pass(env: Env) -> None:
     seeded = await seed(env, 1)
     ref = seeded.refs[0]
