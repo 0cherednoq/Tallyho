@@ -10,7 +10,7 @@ import logging
 from collections import defaultdict
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from importlib.metadata import version
 from typing import TYPE_CHECKING, ParamSpec, Protocol, TypeVar, cast, final, runtime_checkable
 from uuid import UUID
@@ -20,7 +20,12 @@ from flexiq.exceptions import TaskCancelledError
 from flexiq.notes import validate_and_encode_notes
 from typing_extensions import override
 
-from tallyho.model.errors import ConfigurationError, TallyhoError, UnsupportedOption
+from tallyho.model.errors import (
+    CompleterError,
+    ConfigurationError,
+    TallyhoError,
+    UnsupportedOption,
+)
 from tallyho.model.states import OutboxKind
 from tallyho.protocols.broker import (
     CallOptionsValidator,
@@ -64,6 +69,8 @@ _BATCH_OPTION = "batch"
 _ENCODE_PAYLOAD = "_encode_payload"
 _DECODE_PAYLOAD = "_deserialize_payload"
 _PY_JOB = "_py_job"
+_INFRASTRUCTURE_ERRORS: tuple[type[Exception], ...] = (CompleterError,)
+"""Ошибки tallyho, которые брокер повторяет независимо от ``retry_on`` задачи."""
 
 _CALL_OPTIONS = frozenset(
     {
@@ -258,7 +265,10 @@ class FlexiqAdapter(
             if not inspect.iscoroutinefunction(fn):
                 raise ConfigurationError(_SYNC_TASK)
             runtime = self._require_runtime()
-            config = self._task_config(options)
+            config = _with_infrastructure_retries(self._task_config(options))
+            broker_options = dict(options)
+            if config.retry_on:
+                broker_options["retry_on"] = list(config.retry_on)
             tracked = runtime.wrap(fn)
             dynamic = cast("_AsyncTask", tracked)
 
@@ -273,7 +283,7 @@ class FlexiqAdapter(
 
             wrapped = functools.update_wrapper(invoke, fn)
             try:
-                registered = self._queue.task(**options)(wrapped)
+                registered = self._queue.task(**broker_options)(wrapped)
             except Exception as exc:
                 raise ConfigurationError(_BAD_OPTIONS) from exc
             name = registered.name
@@ -670,6 +680,27 @@ class FlexiqAdapter(
             retry_on=_exception_types(options.get("retry_on"), "retry_on"),
             dont_retry_on=_exception_types(options.get("dont_retry_on"), "dont_retry_on"),
         )
+
+
+def _with_infrastructure_retries(config: _TaskConfig) -> _TaskConfig:
+    """Дополнить белый список ``retry_on`` ошибками самой библиотеки.
+
+    ``retry_on`` во flexiq — белый список: исключение не из него сразу уводит
+    джобу в DLQ. Отказ PostgreSQL на claim, release или finish
+    (:class:`CompleterError`) — не ошибка задачи, и терять на нём джобу нельзя,
+    поэтому он повторяется наравне с ошибками из списка пользователя. Пустой
+    список («повторять всё») и список, уже покрывающий эти ошибки, не меняются.
+    ``dont_retry_on`` пользователя остаётся сильнее.
+
+    Returns:
+        Конфигурация с дополненным ``retry_on``.
+    """
+    if not config.retry_on:
+        return config
+    missing = tuple(
+        error for error in _INFRASTRUCTURE_ERRORS if not issubclass(error, config.retry_on)
+    )
+    return replace(config, retry_on=(*config.retry_on, *missing)) if missing else config
 
 
 def _major_version() -> int:

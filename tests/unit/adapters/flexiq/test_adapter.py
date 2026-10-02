@@ -13,14 +13,19 @@ from flexiq.exceptions import TaskCancelledError
 import tallyho.adapters.flexiq.adapter as adapter_module
 from tallyho.adapters.flexiq import FlexiqAdapter
 from tallyho.engine import RuntimeServices
-from tallyho.model.errors import ConfigurationError, TallyhoError, UnsupportedOption
+from tallyho.model.errors import (
+    CompleterError,
+    ConfigurationError,
+    TallyhoError,
+    UnsupportedOption,
+)
 from tallyho.model.states import OutboxKind
 from tallyho.protocols.broker import Dispatcher, Message, RetryLimits, Runtime, Verdict
 from tallyho.protocols.serialization import PayloadCodec
 from tallyho.runtime.tracked import TaskRuntime, bind_runtime
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable, Mapping
+    from collections.abc import Awaitable, Callable, Mapping, Sequence
 
     from flexiq import Queue
 
@@ -436,6 +441,65 @@ async def test_retry_verdict_uses_effective_limit_and_filters(
     await probe(ValueError())
 
     assert verdicts == [Verdict.RETRY, Verdict.FINAL, Verdict.FINAL, Verdict.FINAL]
+    await adapter.close()
+
+
+@pytest.mark.parametrize(
+    ("retry_on", "registered"),
+    [
+        # Белый список пользователя дополняется: отказ PostgreSQL на claim — не повод для DLQ.
+        ([ValueError], [ValueError, CompleterError]),
+        ((ValueError, KeyError), [ValueError, KeyError, CompleterError]),
+        # Список уже покрывает CompleterError — остаётся как есть.
+        ([TallyhoError], [TallyhoError]),
+        ([Exception], [Exception]),
+    ],
+)
+def test_task_retry_on_also_retries_completer_errors(
+    retry_on: Sequence[type[Exception]], registered: list[type[Exception]]
+) -> None:
+    adapter, queue = _adapter()
+
+    _ = adapter.task(max_retries=2, retry_on=retry_on, dont_retry_on=[KeyError])(_echo)
+
+    assert queue.task_options == [
+        {"max_retries": 2, "retry_on": registered, "dont_retry_on": [KeyError]}
+    ]
+
+
+@pytest.mark.parametrize("options", [{}, {"retry_on": None}, {"retry_on": []}])
+def test_task_without_retry_filter_is_registered_unchanged(options: dict[str, object]) -> None:
+    # Пустой retry_on во flexiq значит «повторять всё»: дополнять нечего.
+    adapter, queue = _adapter()
+
+    _ = adapter.task(**options)(_echo)
+
+    assert queue.task_options == [options]
+
+
+async def test_retry_verdict_matches_registered_filter_for_completer_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter, _queue = _adapter()
+    verdicts: list[Verdict] = []
+
+    @adapter.task(max_retries=5, retry_on=[ValueError])
+    async def retried(exc: BaseException) -> None:
+        await asyncio.sleep(0)
+        verdicts.append(adapter.retry_verdict(exc))
+
+    @adapter.task(max_retries=5, retry_on=[ValueError], dont_retry_on=[TallyhoError])
+    async def forbidden(exc: BaseException) -> None:
+        await asyncio.sleep(0)
+        verdicts.append(adapter.retry_verdict(exc))
+
+    monkeypatch.setattr(adapter_module, "current_job", _CurrentJob(retry_count=1))
+    await retried(CompleterError())
+    await retried(TypeError())
+    # dont_retry_on пользователя сильнее: его решение не переопределяется.
+    await forbidden(CompleterError())
+
+    assert verdicts == [Verdict.RETRY, Verdict.FINAL, Verdict.FINAL]
     await adapter.close()
 
 

@@ -71,3 +71,14 @@ def test_version_three_offline_script_is_safe_and_complete() -> None:
     # "th_" встречается внутри jsonb_path_ops, поэтому проверяются имена объектов.
     assert ".th_" not in sql
     assert " th_" not in sql
+
+
+def test_version_four_offline_script_is_safe_and_complete() -> None:
+    sql = offline_sql(version=4, schema='we"ird', prefix="acme_")
+    assert sql.startswith("SET LOCAL lock_timeout = '5000ms';")
+    assert (
+        'ALTER TABLE "we""ird".acme_lease ADD COLUMN redelivered BOOLEAN DEFAULT false NOT NULL;'
+    ) in sql
+    assert "VALUES ('schema_version', '4')" in sql
+    assert "%(" not in sql
+    assert "th_" not in sql

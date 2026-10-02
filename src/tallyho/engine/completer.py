@@ -21,7 +21,10 @@ Completer привязывается к event loop при первой опер�
 * ``CLAIMED`` — lease взят, задачу надо выполнить;
 * ``DUPLICATE`` — у Item живой lease (чужой или свой): дубль доставки или
   ретрай брокера при живом lease (FLEXIQ_SPIKE факт 9a) — успех без выполнения,
-  Item остаётся за lease;
+  Item остаётся за lease. Брокер после такого успеха считает джобу завершённой,
+  поэтому lease помечается ``redelivered``: если его владелец потом отпустит
+  Item по вердикту ``RETRY``, повторять будет некому, и release сам вернёт
+  Item в outbox (UC-04);
 * ``TERMINAL`` — Item уже завершён или не найден (удалён retention);
 * ``PARKED`` — батч на паузе: Item возвращается в outbox с
   ``available_at = infinity``, ``dispatched -= 1``;
@@ -429,6 +432,7 @@ class _ItemRow:
 class _LeaseRow:
     worker_id: str
     live: bool
+    redelivered: bool = False
 
 
 @dataclass(slots=True)
@@ -441,6 +445,8 @@ class _Applied:
     beating: set[UUID] = field(default_factory=set["UUID"])
     """Items, чей lease продлён heartbeat'ом: lease всё ещё у этого процесса."""
     released: set[UUID] = field(default_factory=set["UUID"])
+    requeued: set[UUID] = field(default_factory=set["UUID"])
+    """Items, которые release вернул в outbox: дубль доставки уже закрыл джобу брокера."""
     finalize: set[UUID] = field(default_factory=set["UUID"])
     kick: set[UUID] = field(default_factory=set["UUID"])
     invalidate_trees: set[UUID] = field(default_factory=set["UUID"])
@@ -549,13 +555,20 @@ class _Tx:
             return
         lease = self.tables.lease
         result = await self.conn.execute(
-            select(lease.c.item_id, lease.c.worker_id, lease.c.lease_until > self.now)
+            select(
+                lease.c.item_id,
+                lease.c.worker_id,
+                lease.c.lease_until > self.now,
+                lease.c.redelivered,
+            )
             .where(lease.c.item_id == any_(_uuids(ids)))
             .order_by(lease.c.item_id)
             .with_for_update()
         )
-        for item_id, worker_id, live in result:
-            self.leases[item_id] = _LeaseRow(worker_id=worker_id, live=live)
+        for item_id, worker_id, live, redelivered in result:
+            self.leases[item_id] = _LeaseRow(
+                worker_id=worker_id, live=live, redelivered=redelivered
+            )
 
     async def expired(self, item_ids: Iterable[UUID]) -> set[UUID]:
         ids = sorted(set(item_ids))
@@ -694,6 +707,8 @@ class _Tx:
                 "attempt": stmt.excluded.attempt,
                 "progress_done": None,
                 "progress_total": None,
+                # Новая попытка: дубли, подтверждённые прежнему владельцу, к ней не относятся.
+                "redelivered": False,
             },
         )
         _ = await self.conn.execute(stmt)
@@ -702,6 +717,34 @@ class _Tx:
             self._result(item_id, ClaimOutcome.CLAIMED)
             row = self.items[item_id]
             self.applied.claimed.append((row.batch_id, item_id, row.attempt))
+
+    async def mark_redelivered(self, repeated: Iterable[UUID]) -> None:
+        """Запомнить в lease, что брокеру подтверждён дубль доставки (UC-04).
+
+        Дубль — claim с исходом ``DUPLICATE`` при живом lease и повторный claim
+        того же Item в этой же пачке (``repeated``): в обоих случаях обёртка
+        вернёт брокеру успех, и джоба будет закрыта, хотя Item ещё выполняется.
+        Строки lease уже заблокированы в :meth:`lock_leases`.
+        """
+        candidates = set(repeated)
+        candidates.update(
+            item_id
+            for item_id, result in self.applied.claims.items()
+            if result.outcome is ClaimOutcome.DUPLICATE
+        )
+        ids = sorted(
+            item_id
+            for item_id in candidates
+            if (row := self.leases.get(item_id)) is not None and row.live and not row.redelivered
+        )
+        if not ids:
+            return
+        lease = self.tables.lease
+        _ = await self.conn.execute(
+            update(lease).where(lease.c.item_id == any_(_uuids(ids))).values(redelivered=True)
+        )
+        for item_id in ids:
+            self.leases[item_id].redelivered = True
 
     async def _park(self, item_ids: list[UUID]) -> None:
         # Пауза (UC-11): Item обратно в outbox до resume; relay его снова отправит.
@@ -743,17 +786,31 @@ class _Tx:
         await self.lock_leases(ref.id for ref in refs)
         own = self._owned(ref.id for ref in refs)
         await self._delete_leases(own)
+        _ = await self._back_to_outbox(own)
+        self.applied.released.update(own)
+
+    async def _back_to_outbox(self, item_ids: Iterable[UUID]) -> set[UUID]:
+        """Вернуть активные Items в outbox; у батча на паузе — запаркованными.
+
+        Returns:
+            Батчи, чьи Items готовы к отправке сразу: их стоит передать relay.
+        """
         waiting: list[UUID] = []
         paused: list[UUID] = []
-        for item_id in own:
+        ready: set[UUID] = set()
+        for item_id in item_ids:
             row = self.items.get(item_id)
             if row is None or row.state.is_terminal:
                 continue
             flags = self.batches.get(row.batch_id)
-            (paused if flags is not None and flags.paused else waiting).append(item_id)
+            if flags is not None and flags.paused:
+                paused.append(item_id)
+            else:
+                waiting.append(item_id)
+                ready.add(row.batch_id)
         await self._to_outbox(waiting, self.now)
         await self._to_outbox(paused, _INFINITY)
-        self.applied.released.update(own)
+        return ready
 
     async def _delete_expiry(self, item_ids: list[UUID]) -> None:
         if not item_ids:
@@ -781,8 +838,14 @@ class _Tx:
             for item_id in own
             if (row := self.items.get(item_id)) is not None and not row.state.is_terminal
         ]
+        # Дубль доставки при живом lease уже вернул брокеру успех: джоба закрыта,
+        # ретрая не будет. Такой Item возвращаем в outbox сами, иначе он останется
+        # active без lease, outbox и джобы.
+        orphaned = [item_id for item_id in active if self.leases[item_id].redelivered]
         await self._bump_attempts(active)
         await self._delete_leases(own)
+        self.applied.kick.update(await self._back_to_outbox(orphaned))
+        self.applied.requeued.update(orphaned)
         self.applied.released.update(own)
 
     async def heartbeat(self, beats: dict[UUID, _Progress]) -> None:
@@ -1273,6 +1336,11 @@ class Completer:
     async def release(self, item: ItemRef) -> bool:
         """Отпустить lease перед ретраем брокера: ``attempt += 1`` (UC-04, вердикт RETRY).
 
+        Если за время выполнения брокеру был подтверждён дубль доставки этого
+        Item (``th_lease.redelivered``), джоба уже закрыта и ретрая не будет:
+        Item в той же транзакции возвращается в outbox, relay отправит его
+        заново.
+
         Args:
             item: Item, захваченный этим процессом.
 
@@ -1565,11 +1633,14 @@ class Completer:
     async def _apply(self, conn: AsyncConnection, ops: Sequence[_Op]) -> _Applied:
         tx = _Tx(self, conn)
         claims: dict[UUID, ItemRef] = {}
+        repeated: set[UUID] = set()
         beats: dict[UUID, _Progress] = {}
         releases: set[UUID] = set()
         finishes: dict[UUID, tuple[ItemRef, FinishResult]] = {}
         for op in ops:
             if isinstance(op, _Claim):
+                if op.item.id in claims:
+                    repeated.add(op.item.id)
                 _ = claims.setdefault(op.item.id, op.item)
             elif isinstance(op, _Heartbeat):
                 done, total = beats.get(op.item.id, (None, None))
@@ -1584,7 +1655,8 @@ class Completer:
                 _ = finishes.setdefault(op.item.id, (op.item, op.value))
         # Все блокировки строк — в начале и по порядку: batch → item → lease.
         batch_ids = [ref.batch_id for ref in claims.values()]
-        batch_ids.extend(op.item.batch_id for op in ops if isinstance(op, _Finish))
+        # release может вернуть Item в outbox, а там важна пауза батча.
+        batch_ids.extend(op.item.batch_id for op in ops if isinstance(op, _Finish | _Release))
         writes_structure = False
         for _, value in finishes.values():
             for spawn_request in value.spawns:
@@ -1612,6 +1684,7 @@ class Completer:
         # release раньше claim: ретрай брокера мог прийти в ту же пачку.
         await tx.release(releases)
         await tx.claim(claims)
+        await tx.mark_redelivered(repeated)
         await tx.heartbeat(beats)
         await tx.finish(finishes)
         await tx.expand(finishes)
@@ -1694,6 +1767,11 @@ class Completer:
         if self.triggers.tree_cache is not None:
             for root_id in applied.invalidate_trees:
                 self.triggers.tree_cache.invalidate(root_id)
+        if applied.requeued:
+            _log.info(
+                "release: %d Items возвращены в outbox после подтверждённого дубля доставки",
+                len(applied.requeued),
+            )
         if self.triggers.relay is not None and applied.kick:
             self.triggers.relay.kick(sorted(applied.kick))
         await self._publish_progress(applied.progress)

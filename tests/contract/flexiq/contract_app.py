@@ -254,6 +254,23 @@ def build_app(  # ruff: ignore[complex-structure, too-many-statements]  # one fa
         await asyncio.sleep(2)
         _record(root, "hard-finish", key=key, attempt=current_job.retry_count, at=time.time())
 
+    @adapter.task(max_retries=2, retry_delays=[0.01, 0.01], retry_on=[RetryableError])
+    async def requeued(key: str) -> None:
+        # Первое выполнение ждёт сигнала теста и падает с повторяемой ошибкой,
+        # следующее завершается успешно.
+        _record(root, "requeue-start", key=key, job_id=current_job.id)
+        failed = root / f"requeue-failed-{key}"
+        if failed.exists():
+            await asyncio.sleep(0)
+            return
+        release = root / f"requeue-release-{key}"
+        for _ in range(400):  # сигнал приходит из процесса теста файлом; ждём не дольше 20 с
+            if release.exists():
+                break
+            await asyncio.sleep(0.05)
+        _ = failed.write_text("failed", encoding="utf-8")
+        raise RetryableError(key)
+
     @adapter.task(max_retries=0)
     async def cancellable(key: str) -> None:
         _record(root, "cancel-start", key=key, job_id=current_job.id)
@@ -314,6 +331,7 @@ def build_app(  # ruff: ignore[complex-structure, too-many-statements]  # one fa
         "flaky": cast("Probe", flaky),
         "soft_timeout": cast("Probe", soft_timeout),
         "hard_timeout": cast("Probe", hard_timeout),
+        "requeued": cast("Probe", requeued),
         "cancellable": cast("Probe", cancellable),
         "limited": cast("Probe", limited),
         "rate_limited": cast("Probe", rate_limited),
