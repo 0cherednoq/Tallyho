@@ -78,7 +78,7 @@ try:
     again = await th.find("thumbnails", "album:1")
     assert again.id == batch.handle.id
 finally:
-    await broker.close()
+    await th.aclose()
 ```
 
 Что важно знать:
@@ -239,7 +239,7 @@ try:
     cards = view.children["cards"].progress
     assert (cards.found, cards.ok, cards.duplicates) == (4, 4, 1)  # карточка "b" встретилась дважды
 finally:
-    await broker.close()
+    await th.aclose()
 ```
 
 ### Правила конвейера
@@ -355,7 +355,7 @@ try:
     assert view.progress.cancelled >= 1  # оставшиеся задачи не выполнялись
     assert view.progress.done == view.progress.found == 10
 finally:
-    await broker.close()
+    await th.aclose()
 ```
 
 Провал по политике, дедлайну и `fail_fast` — не мгновенный переход, а запрос отмены: новые задачи
@@ -445,7 +445,7 @@ try:
     assert cancelled.state is BatchState.CANCELLED
     assert (cancelled.progress.ok, cancelled.progress.cancelled) == (1, 3)
 finally:
-    await broker.close()
+    await th.aclose()
 ```
 
 Замечания:
@@ -588,7 +588,7 @@ try:
     delivered = sorted([entry.key async for entry in handle.items(states={ItemState.OK})])
     assert delivered == ["ada@ok.test", "grace@ok.test"]
 finally:
-    await broker.close()
+    await th.aclose()
 ```
 
 ### Правила атрибутов
@@ -652,6 +652,7 @@ finally:
 | `NotFoundError` | батч не найден |
 | `BatchPurged` | батч удалён по retention |
 | `InvalidStateError` | операция недопустима в текущем состоянии батча |
+| `ClosedError` | установка закрыта `th.aclose()`: запись, операции над батчем и maintenance недоступны |
 | `SealError` | `seal()` этапа с `fed_by`; добавление в закрытый, завершённый или отменяемый батч |
 | `SpawnTargetError` | запись в этап, писателем которого вызывающий не является |
 | `DownstreamFinalized` | `retry_failed` этапа, чьи получатели уже финализированы |

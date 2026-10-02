@@ -112,8 +112,9 @@ class AcceptanceApp:
         _ = await self.th.migrate()
 
     async def close(self) -> None:
-        """Close process-local clients."""
-        await self.th.aclose()  # relay не должен отправлять через закрытый адаптер
+        """Close process-local clients; call it in the loop that used them (API, tests)."""
+        # Сначала установка: фоновые задачи дожидаются, relay не шлёт через закрытый адаптер.
+        await self.th.aclose()
         self.queue.close()
         await self.adapter.close()
         await self.engine.dispose()

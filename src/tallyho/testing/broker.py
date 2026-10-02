@@ -324,7 +324,12 @@ class InlineBroker(Dispatcher, Runtime, PayloadCodec, RetryLimits):
                 return done
 
     async def close(self) -> None:
-        """Дождаться внутренних операций Completer и остановить его."""
+        """Дождаться внутренних операций Completer и остановить его.
+
+        Останавливает только воркер. Установку целиком, вместе с
+        после-коммитными задачами продюсера, закрывает ``await th.aclose()`` —
+        в тестах достаточно его одного.
+        """
         runtime = self._runtime
         if runtime is not None:
             await runtime.completer.close()

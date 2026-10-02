@@ -25,10 +25,11 @@ from tallyho.engine.producer import CallbackName, Producer, RootSpec, SubBatchSp
 from tallyho.engine.public import BatchReference
 from tallyho.engine.reads import Reads
 from tallyho.engine.relay import Relay, RelaySettings
+from tallyho.engine.shutdown import Budget, close_services
 from tallyho.engine.snapshotter import Snapshotter, SnapshotterSettings
 from tallyho.engine.spawn import TreeCache
 from tallyho.engine.sweeper import Sweeper, SweeperSettings
-from tallyho.model.errors import ConfigurationError
+from tallyho.model.errors import ClosedError, ConfigurationError
 from tallyho.model.progress import ProgressSettings
 from tallyho.protocols.broker import (
     CallOptionsValidator,
@@ -179,9 +180,13 @@ class _Facade:
     _producer: Producer | None = None
     _relay: Relay | None = None
     _finalizer: Finalizer | None = None
+    _completer: Completer | None = None
+    _closing: bool = False
+    _closed: bool = False
     _background: set[asyncio.Task[None]] = field(default_factory=set, init=False)
 
     def install(self, adapter: Dispatcher | None, worker_factory: WorkerFactory) -> None:
+        self._ensure_open()
         value = self.installation
         settings = self.settings
         progress_settings = ProgressSettings(
@@ -253,6 +258,7 @@ class _Facade:
                 progress=notifier,
             ),
         )
+        self._completer = completer
         self._operations = Operations(
             tables=value.tables,
             clock=self.clock,
@@ -417,25 +423,43 @@ class _Facade:
         )
 
     def maintenance(self) -> Maintenance | None:
+        self._ensure_open()
         return self._maintenance
 
     async def run_maintenance_once(self) -> object:
-        maintenance = self._maintenance
+        maintenance = self.maintenance()
         if maintenance is None:
             return None
         return await run_maintenance_once(maintenance)
 
     async def close(self) -> None:
-        # Fix-11 добавит сюда ожидание _background и задач Operations.
-        relay = self._relay
-        if relay is not None:
-            await relay.close()
+        # Шаги и срок закрытия — ARCHITECTURE §11.1. Повторный вызов — no-op.
+        if self._closing:
+            return
+        self._closing = True
+        # Транзакция, закоммиченная прямо перед закрытием, создаёт свою задачу
+        # финализации через call_soon: даём ей появиться, чтобы дождаться и её.
+        await asyncio.sleep(0)
+        self._closed = True
+        if self._maintenance is not None:
+            self._maintenance.stop()
+        operations = self._operations
+        await close_services(
+            budget=Budget.start(self.clock, self.settings.close_timeout),
+            tasks=[*self._background, *(operations.shut() if operations is not None else ())],
+            completer=self._completer,
+            relay=self._relay,
+        )
+
+    def _ensure_open(self) -> None:
+        if self._closing:
+            raise ClosedError
 
     @asynccontextmanager
     async def writer(
         self, target: AsyncSession | AsyncConnection | None
     ) -> AsyncGenerator[BatchWriter]:
-        producer = self._require(self._producer)
+        producer = self._live(self._producer)
         if target is not None:
             yield _Writer(
                 producer,
@@ -473,6 +497,8 @@ class _Facade:
         loop.call_soon(self._spawn_finalize, batch_id)
 
     def _spawn_finalize(self, batch_id: UUID) -> None:
+        if self._closed:
+            return  # установка закрыта: финализацию выполнит sweeper (§11.1)
         task = asyncio.create_task(self._finalize(batch_id), name="tallyho-api-finalize")
         self._background.add(task)
         task.add_done_callback(self._background.discard)
@@ -529,7 +555,7 @@ class _Facade:
         return self._require(self._watcher).watch(batch_id)
 
     async def pause(self, target: AsyncSession | AsyncConnection | None, batch_id: UUID) -> None:
-        operations = self._require(self._operations)
+        operations = self._live(self._operations)
         if target is not None:
             await operations.pause(target, batch_id)
             return
@@ -537,7 +563,7 @@ class _Facade:
             await operations.pause(conn, batch_id)
 
     async def resume(self, target: AsyncSession | AsyncConnection | None, batch_id: UUID) -> None:
-        operations = self._require(self._operations)
+        operations = self._live(self._operations)
         if target is not None:
             await operations.resume(target, batch_id)
             return
@@ -545,7 +571,7 @@ class _Facade:
             await operations.resume(conn, batch_id)
 
     async def cancel(self, target: AsyncSession | AsyncConnection | None, batch_id: UUID) -> None:
-        operations = self._require(self._operations)
+        operations = self._live(self._operations)
         if target is not None:
             _ = await operations.cancel(target, batch_id)
             return
@@ -558,7 +584,7 @@ class _Facade:
         batch_id: UUID,
         start_at: datetime,
     ) -> int:
-        operations = self._require(self._operations)
+        operations = self._live(self._operations)
         if target is not None:
             return await operations.reschedule(target, batch_id, start_at)
         async with self.installation.engine.begin() as conn:
@@ -570,7 +596,7 @@ class _Facade:
         batch_id: UUID,
         labels: Sequence[str] | None,
     ) -> int:
-        operations = self._require(self._operations)
+        operations = self._live(self._operations)
         if target is not None:
             return await operations.retry_failed(target, batch_id, labels=labels)
         async with self.installation.engine.begin() as conn:
@@ -579,7 +605,7 @@ class _Facade:
     async def retry_finalize(
         self, target: AsyncSession | AsyncConnection | None, batch_id: UUID
     ) -> None:
-        operations = self._require(self._operations)
+        operations = self._live(self._operations)
         if target is not None:
             await operations.retry_finalize(target, batch_id)
             return
@@ -587,12 +613,17 @@ class _Facade:
             await operations.retry_finalize(conn, batch_id)
 
     async def release(self, target: AsyncSession | AsyncConnection | None, batch_id: UUID) -> None:
-        operations = self._require(self._operations)
+        operations = self._live(self._operations)
         if target is not None:
             await operations.release(target, batch_id)
             return
         async with self.installation.engine.begin() as conn:
             await operations.release(conn, batch_id)
+
+    def _live(self, value: _Service | None) -> _Service:
+        # Сервис, меняющий данные: после закрытия установки недоступен.
+        self._ensure_open()
+        return self._require(value)
 
     @staticmethod
     def _require(value: _Service | None) -> _Service:

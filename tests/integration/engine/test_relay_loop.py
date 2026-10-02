@@ -134,6 +134,35 @@ async def test_close_is_final(rel: RelayEnv) -> None:
     assert await rel.relay.flush_kicked() == 1
 
 
+async def test_stop_with_grace_cancels_a_stuck_pass(
+    rel: RelayEnv, caplog: pytest.LogCaptureFixture
+) -> None:
+    rel.dispatcher.delay = 3600  # брокер завис: мягкая остановка не дождётся прохода
+    batch_id = await add_batch(rel)
+    rel.relay.kick([batch_id])
+    await eventually(lambda: len(loop_tasks()) == 1)
+
+    with caplog.at_level(logging.WARNING, logger="tallyho.engine.relay"):
+        await rel.relay.close(grace=0.2)
+
+    assert loop_tasks() == []
+    assert "отменён" in caplog.text
+    # Сообщение не отправлено: запись вернётся после relay_claim_ttl.
+    assert rel.dispatcher.messages == []
+    assert await outbox_size(rel) == 1
+
+
+async def test_loop_names_the_event_loop_of_the_running_cycle(rel: RelayEnv) -> None:
+    owners = [rel.relay.loop]
+
+    rel.relay.start()
+    owners.append(rel.relay.loop)
+    await rel.relay.stop(grace=5)
+    owners.append(rel.relay.loop)
+
+    assert owners == [None, asyncio.get_running_loop(), None]
+
+
 async def test_manual_mode_does_not_send_behind_the_owner(rel: RelayEnv) -> None:
     manual = replace(rel.relay, autostart=False)
     batch_id = await add_batch(rel)

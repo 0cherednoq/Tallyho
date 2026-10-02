@@ -70,6 +70,7 @@ from sqlalchemy.dialects.postgresql import ARRAY, JSONB, insert
 
 from tallyho.engine.relay import release_window
 from tallyho.model.errors import (
+    ClosedError,
     CompleterError,
     ConfigurationError,
     InvalidStateError,
@@ -139,6 +140,7 @@ CANCELLED_LABEL: Final = "cancelled"
 _CLOSED = "Completer закрыт: новые операции не принимаются"
 _OTHER_LOOP = "Completer привязан к другому event loop: создайте свой экземпляр на loop"
 _FLUSH_FAILED = "групповая транзакция Completer не прошла"
+_ABORTED = "Completer остановлен до commit операции: закрытие не уложилось в срок"
 _SPAWN_SERVICES = "Completer не настроен для spawn: передайте Producer в CompleterTriggers"
 _SPAWN_ROUTE = "маршрут spawn не соответствует завершаемому Item или дереву"
 _SPAWN_TARGET_CLOSED = "целевой этап spawn уже закрыт"
@@ -1304,6 +1306,7 @@ class Completer:
         self._closing = False
         self._held: dict[UUID, ItemRef] = {}
         self._background: set[asyncio.Task[None]] = set()
+        self._attached: set[asyncio.Task[None]] = set()
         self._flushing = False
         self._idle = asyncio.Event()
         self._idle.set()
@@ -1320,6 +1323,23 @@ class Completer:
         """
         while not self._idle.is_set():
             _ = await self._idle.wait()
+
+    @property
+    def loop(self) -> asyncio.AbstractEventLoop | None:
+        """Event loop, к которому привязан Completer; ``None`` до первой операции."""
+        return self._loop
+
+    def attach(self, task: asyncio.Task[None]) -> None:
+        """Связать служебную задачу (heartbeat Item) с жизнью Completer.
+
+        :meth:`close` и :meth:`abort` отменяют такие задачи и дожидаются их:
+        после закрытия продлевать lease некому.
+
+        Args:
+            task: Задача в event loop Completer.
+        """
+        self._attached.add(task)
+        task.add_done_callback(self._attached.discard)
 
     @property
     def buffered(self) -> int:
@@ -1445,7 +1465,10 @@ class Completer:
 
         Raises:
             ConfigurationError: Нужен spawn, но Completer создан без Producer.
+            ClosedError: Completer закрыт; транзакция пользователя не тронута.
         """
+        if self._closing:
+            raise ClosedError(_CLOSED)
         if (value.spawns or value.sub_batches) and self.triggers.producer is None:
             raise ConfigurationError(_SPAWN_SERVICES)
         conn = await resolve_connection(target)
@@ -1515,9 +1538,10 @@ class Completer:
     async def close(self, *, requeue_held: bool = False) -> None:
         """Мягкая остановка: дослать буфер и остановить задачу сброса.
 
-        Новые операции после вызова бросают ``InvalidStateError``; операции,
-        принятые раньше, выполняются. Повторный вызов только досылает
-        ``requeue_held``.
+        Новые операции после вызова бросают ``ClosedError``; операции,
+        принятые раньше, выполняются. Привязанные heartbeat-задачи
+        отменяются. Повторный вызов только досылает ``requeue_held``.
+        Вызывается в event loop Completer.
 
         Args:
             requeue_held: Путь ``SIGTERM`` (A-CH-08): lease, которые процесс
@@ -1531,10 +1555,12 @@ class Completer:
         self._closing = True
         self._wakeup.set()
         self._full.set()
+        await self._stop(self._attached, cancel=True)
         if self._task is not None:
-            await self._task
-        if self._background:
-            await asyncio.gather(*tuple(self._background))
+            # wait, а не await task: отмена вызывающего не должна отменять сброс буфера.
+            _ = await asyncio.wait({self._task})
+            self._task.result()  # сбой самого цикла сброса не теряется
+        await self._stop(self._background, cancel=False)
         if not (requeue_held and self._held):
             return
         refs = list(self._held.values())
@@ -1548,6 +1574,44 @@ class Completer:
             )
         except Exception as exc:
             raise CompleterError(_FLUSH_FAILED) from exc
+
+    async def abort(self) -> None:
+        """Оборвать работу, не уложившуюся в срок закрытия (ARCHITECTURE §11.1).
+
+        Цикл сброса, после-коммитные и heartbeat-задачи отменяются, и метод
+        дожидается их. Операции, не попавшие в commit, получают
+        ``CompleterError``. Lease остаются в БД: их вернёт sweeper по
+        истечении ``lease_ttl``. Вызывается в event loop Completer.
+        """
+        self._closing = True
+        tasks = {*self._attached, *self._background}
+        if self._task is not None:
+            tasks.add(self._task)
+        await self._stop(tasks, cancel=True)
+        self._task = None
+        buffered, self._buffer = self._buffer, []
+        self._fail(buffered, _ABORTED)
+        self._held.clear()
+        self._flushing = False
+        self._idle.set()
+
+    @staticmethod
+    async def _stop(tasks: Iterable[asyncio.Task[None]], *, cancel: bool) -> None:
+        pending = {task for task in tasks if not task.done()}
+        if not pending:
+            return
+        if cancel:
+            for task in pending:
+                _ = task.cancel()
+        _ = await asyncio.wait(pending)
+
+    @staticmethod
+    def _fail(ops: Iterable[_Op], message: str, cause: BaseException | None = None) -> None:
+        error = CompleterError(message)
+        error.__cause__ = cause
+        for op in ops:
+            if not op.future.done():
+                op.future.set_exception(error)
 
     async def _requeue(self, conn: AsyncConnection, refs: list[ItemRef]) -> None:
         tx = _Tx(self, conn)
@@ -1566,6 +1630,10 @@ class Completer:
         return folded
 
     def _schedule_external(self, applied: _Applied, delta_ids: set[int]) -> None:
+        if self._closing:
+            # Completer закрыли, пока транзакция пользователя шла к commit: дельты
+            # свернёт и финализацию проверит sweeper.
+            return
         loop = self._bind()
         task = loop.create_task(
             self._after_external_commit(applied, delta_ids),
@@ -1614,7 +1682,7 @@ class Completer:
 
     def _bind(self) -> asyncio.AbstractEventLoop:
         if self._closing:
-            raise InvalidStateError(_CLOSED)
+            raise ClosedError(_CLOSED)
         loop = asyncio.get_running_loop()
         if self._loop is None:
             self._loop = loop
@@ -1628,7 +1696,7 @@ class Completer:
         future.add_done_callback(lambda _: self._capacity.release())
         if self._closing:
             future.cancel()
-            raise InvalidStateError(_CLOSED)
+            raise ClosedError(_CLOSED)
         self._buffer.append(op)
         self._idle.clear()
         self._notify_buffer()
@@ -1673,12 +1741,12 @@ class Completer:
                 settings=self.settings.tx,
                 policy=self.settings.retry,
             )
+        except asyncio.CancelledError:
+            # abort: транзакция откатилась, ждущие операции не должны зависнуть.
+            self._fail(ops, _ABORTED)
+            raise
         except Exception as exc:  # ruff: ignore[blind-except]  # ошибка не глотается: уходит в futures операций
-            error = CompleterError(_FLUSH_FAILED)
-            error.__cause__ = exc
-            for op in ops:
-                if not op.future.done():
-                    op.future.set_exception(error)
+            self._fail(ops, _FLUSH_FAILED, exc)
             return
         self._resolve(ops, applied)
         self._notify(len(ops), self.clock.monotonic() - started, applied)

@@ -70,7 +70,7 @@ try:
     assert dict(view.labels) == {"greeted": 2}
     assert sorted(seen) == ["Ada", "Grace"]
 finally:
-    await broker.close()
+    await th.aclose()
 ```
 
 Что здесь произошло:

@@ -41,6 +41,7 @@ SEED = int(os.environ.get("SEED", "1"))
 DURATION = float(os.environ.get("DURATION", "120"))
 LEASE_TTL = float(os.environ.get("LEASE_TTL", "60"))
 SWEEP_INTERVAL = float(os.environ.get("SWEEP_INTERVAL", "5"))
+DRAIN_TIMEOUT = int(os.environ.get("DRAIN_TIMEOUT", "20"))
 KEEP_STAND = os.environ.get("KEEP_STAND", "") == "1"
 # Потолок pytest-timeout: подъём стенда, окно хаоса, доработка нагрузки и ожидание T_rec.
 # Сам прогон ограничивает себя раньше (hard_cap в runner), потолок — страховка от зависания.
@@ -149,6 +150,7 @@ async def _run(chaos: str, scenario: str) -> RunReport:
             duration=DURATION,
             lease_ttl=LEASE_TTL,
             sweep_interval=SWEEP_INTERVAL,
+            drain_timeout=DRAIN_TIMEOUT,
             keep_stand=KEEP_STAND,
         )
         try:

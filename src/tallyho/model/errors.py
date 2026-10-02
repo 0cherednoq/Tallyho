@@ -16,6 +16,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "BatchPurged",
+    "ClosedError",
     "CompleterError",
     "ConcurrentModification",
     "ConfigurationError",
@@ -47,6 +48,19 @@ class NotFoundError(TallyhoError):
 
 class InvalidStateError(TallyhoError):
     """Операция недопустима в текущем техническом состоянии батча."""
+
+
+class ClosedError(InvalidStateError):
+    """Установка закрыта ``Tallyho.aclose()`` и больше не принимает работу (§11.1).
+
+    Запись, операции над батчем, maintenance и операции Completer после
+    закрытия недоступны; чтение продолжает работать. Установка не
+    перезапускается: новому процессу нужен новый ``Tallyho``.
+    """
+
+    def __init__(self, message: str = "установка закрыта: Tallyho.aclose() уже вызван") -> None:
+        """Ошибка с сообщением по умолчанию либо уточнённым ``message``."""
+        super().__init__(message)
 
 
 class ConcurrentModification(TallyhoError):  # ruff: ignore[error-suffix-on-exception-name]  # имя из публичного API

@@ -16,7 +16,7 @@ from sqlalchemy import select
 
 from tallyho.engine.completer import FinishResult, ItemRef
 from tallyho.model.calls import TaskCall
-from tallyho.model.errors import ConfigurationError, LeaseLostError
+from tallyho.model.errors import ClosedError, ConfigurationError, LeaseLostError
 from tallyho.model.states import ResultClass
 from tallyho.protocols.broker import CancellationClassifier, Verdict
 from tallyho.runtime.context import (
@@ -161,6 +161,8 @@ class TaskRuntime:
         heartbeat = asyncio.create_task(
             self._heartbeat(context), name=f"tallyho-heartbeat-{ref.id}"
         )
+        # Закрытие установки отменит heartbeat: продлевать lease будет некому.
+        self.completer.attach(heartbeat)
         try:
             with activate_item(context):
                 return await self._invoke(task, args, kwargs, context=context)
@@ -181,7 +183,9 @@ class TaskRuntime:
             result = await task(*args, **kwargs)
         except asyncio.CancelledError:
             if not context.lease_lost:
-                _ = await self.completer.release(context.ref)
+                # Установка уже закрыта — Item вернул в outbox aclose; отмену не подменяем.
+                with contextlib.suppress(ClosedError):
+                    _ = await self.completer.release(context.ref)
             raise
         except BaseException as exc:
             if context.lease_lost:

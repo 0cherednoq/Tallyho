@@ -62,7 +62,7 @@ async def test_a_db_02_batch_and_domain_row_rollback_together(env: Env) -> None:
             _ = await batch.handle.view()
         assert await broker.drain() == 0
     finally:
-        await broker.close()
+        await th.aclose()
 
 
 async def test_a_db_03_all_handle_mutations_rollback_with_user_transaction(env: Env) -> None:
@@ -133,7 +133,7 @@ async def test_a_db_03_all_handle_mutations_rollback_with_user_transaction(env: 
         terminal_row = await _batch_row(env, terminal.id)
         assert terminal_row["released_at"] is None
     finally:
-        await broker.close()
+        await th.aclose()
 
 
 async def test_a_db_12_hook_writes_domain_table_in_another_schema(
@@ -171,4 +171,4 @@ async def test_a_db_12_hook_writes_domain_table_in_another_schema(
             assert view.state is BatchState.SUCCEEDED
             assert status == "succeeded"
         finally:
-            await broker.close()
+            await th.aclose()

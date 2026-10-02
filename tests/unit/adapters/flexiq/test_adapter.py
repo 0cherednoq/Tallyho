@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import itertools
 import json
 import logging
+import threading
 from dataclasses import dataclass, replace
 from datetime import timedelta
 from typing import TYPE_CHECKING, Protocol, cast, final
@@ -16,8 +18,10 @@ import tallyho.adapters.flexiq.adapter as adapter_module
 from tallyho.adapters.flexiq import FlexiqAdapter
 from tallyho.engine import RuntimeServices
 from tallyho.model.errors import (
+    ClosedError,
     CompleterError,
     ConfigurationError,
+    InvalidStateError,
     TallyhoError,
     UnsupportedOption,
 )
@@ -32,6 +36,7 @@ from tallyho.protocols.broker import (
 )
 from tallyho.protocols.serialization import PayloadCodec
 from tallyho.runtime.tracked import TaskRuntime, bind_runtime
+from tests.helpers.loops import LoopThread, library_tasks
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Mapping, Sequence
@@ -464,9 +469,12 @@ async def test_retry_verdict_uses_effective_limit_and_filters(
     ("retry_on", "registered"),
     [
         # Белый список пользователя дополняется: отказ PostgreSQL на claim — не повод для DLQ.
-        ([ValueError], [ValueError, CompleterError]),
-        ((ValueError, KeyError), [ValueError, KeyError, CompleterError]),
-        # Список уже покрывает CompleterError — остаётся как есть.
+        ([ValueError], [ValueError, CompleterError, ClosedError]),
+        ((ValueError, KeyError), [ValueError, KeyError, CompleterError, ClosedError]),
+        # Закрытие установки посреди задачи (Fix-11) дополняется отдельно.
+        ([CompleterError], [CompleterError, ClosedError]),
+        ([InvalidStateError], [InvalidStateError, CompleterError]),
+        # Список уже покрывает ошибки библиотеки — остаётся как есть.
         ([TallyhoError], [TallyhoError]),
         ([Exception], [Exception]),
     ],
@@ -511,11 +519,12 @@ async def test_retry_verdict_matches_registered_filter_for_completer_error(
 
     monkeypatch.setattr(adapter_module, "current_job", _CurrentJob(retry_count=1))
     await retried(CompleterError())
+    await retried(ClosedError())
     await retried(TypeError())
     # dont_retry_on пользователя сильнее: его решение не переопределяется.
     await forbidden(CompleterError())
 
-    assert verdicts == [Verdict.RETRY, Verdict.FINAL, Verdict.FINAL]
+    assert verdicts == [Verdict.RETRY, Verdict.RETRY, Verdict.FINAL, Verdict.FINAL]
     await adapter.close()
 
 
@@ -1044,3 +1053,44 @@ async def test_job_dead_event_is_best_effort_for_missing_job_and_finish_failure(
     await adapter.close()
 
     assert completer.finished == []
+
+
+async def test_close_does_not_wait_for_dlq_tasks_of_the_worker_loop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # DLQ-задачи живут в loop исполнителя flexiq, а close могут вызвать из другого loop.
+    adapter, queue = _adapter(completer=_FakeCompleter())
+    task = adapter.task(name="echo")(_echo)
+    entered = threading.Event()
+    release = threading.Event()
+
+    async def bind_worker_loop() -> None:
+        _ = await task("bind-loop")
+
+    async def held_job(job_id: str) -> object | None:
+        _ = job_id
+        entered.set()
+        for _ in itertools.count():
+            if release.is_set():
+                break
+            await asyncio.sleep(0.005)
+        return None
+
+    monkeypatch.setattr(queue, "aget_job", held_job)
+    worker = LoopThread()
+    try:
+        await worker.run(bind_worker_loop())
+        queue.events[EventType.JOB_DEAD](EventType.JOB_DEAD, {"job_id": "dead-job"})
+        assert await asyncio.to_thread(entered.wait, 5)
+
+        await asyncio.wait_for(adapter.close(), timeout=5)
+
+        assert library_tasks(worker.loop) == ["tallyho-flexiq-dlq"]
+    finally:
+        release.set()
+        async with asyncio.timeout(5):
+            for _ in itertools.count():
+                if not library_tasks(worker.loop):
+                    break
+                await asyncio.sleep(0.005)
+        worker.close()

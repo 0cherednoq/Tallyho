@@ -153,7 +153,7 @@ async def test_a_db_06_strict_isolation_has_no_tallyho_serialization_failures(
         views = await asyncio.gather(*(th.handle(batch_id).view() for batch_id in batch_ids))
         assert all(view.paused for view in views)
     finally:
-        await broker.close()
+        await th.aclose()
 
 
 async def test_a_db_07_long_user_transactions_do_not_wait_on_counter(env: Env) -> None:

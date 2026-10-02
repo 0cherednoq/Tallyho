@@ -2,22 +2,29 @@
 
 from __future__ import annotations
 
+import asyncio
+import itertools
+import logging
 from typing import TYPE_CHECKING
 
 import pytest
 from sqlalchemy import func, select, text, update
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from tallyho.model.errors import CompleterError
-from tallyho.model.states import ItemState, OutboxKind
+from tallyho.engine.completer import FinishResult
+from tallyho.model.errors import ClosedError, CompleterError, InvalidStateError
+from tallyho.model.states import ItemState, OutboxKind, ResultClass
 from tests.integration.engine.completer_env import (
     NOW,
     lease_row,
     open_completer,
+    schema_engine,
     seed,
     set_batch,
 )
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from datetime import datetime
     from uuid import UUID
 
@@ -112,3 +119,129 @@ async def test_failed_requeue_raises(env: Env) -> None:
             await completer.close(requeue_held=True)
     # Транзакция откатилась: lease остался, его вернёт sweeper.
     assert await lease_row(env, ref.id) is not None
+
+
+async def test_closed_completer_rejects_new_operations(env: Env) -> None:
+    seeded = await seed(env, 1)
+    ref = seeded.refs[0]
+    async with open_completer(env) as completer:
+        unbound = completer.loop
+        assert (await completer.claim(ref)).run
+        assert (unbound, completer.loop) == (None, asyncio.get_running_loop())
+        await completer.close()
+        # ClosedError — подкласс InvalidStateError: прежние обработчики продолжают работать.
+        with pytest.raises(ClosedError, match="Completer закрыт") as raised:
+            _ = await completer.heartbeat(ref)
+        assert isinstance(raised.value, InvalidStateError)
+
+
+async def _forever() -> None:
+    _ = await asyncio.Event().wait()
+
+
+async def test_complete_in_after_close_is_rejected_before_any_write(env: Env) -> None:
+    seeded = await seed(env, 1)
+    ref = seeded.refs[0]
+    async with (
+        open_completer(env) as completer,
+        AsyncSession(schema_engine(env)) as session,
+    ):
+        assert (await completer.claim(ref)).run
+        await completer.close()
+        with pytest.raises(ClosedError):
+            _ = await completer.complete_in(session, ref, FinishResult(result_class=ResultClass.OK))
+        await session.commit()
+    assert await lease_row(env, ref.id) is not None
+    assert await env.count(env.tables.counter_delta) == 0
+
+
+async def test_commit_after_close_leaves_folding_to_the_sweeper(
+    env: Env, caplog: pytest.LogCaptureFixture
+) -> None:
+    seeded = await seed(env, 1)
+    ref = seeded.refs[0]
+    async with (
+        open_completer(env) as completer,
+        AsyncSession(schema_engine(env)) as session,
+    ):
+        assert (await completer.claim(ref)).run
+        assert await completer.complete_in(session, ref, FinishResult(result_class=ResultClass.OK))
+        # Установку закрыли, пока транзакция пользователя ещё не закоммичена.
+        await completer.close()
+        with caplog.at_level(logging.WARNING):
+            await session.commit()
+        await completer.settled()
+    # Commit прошёл без ошибок в логе; дельта ждёт sweeper, фоновой задачи нет.
+    assert caplog.records == []
+    assert await env.count(env.tables.counter_delta) == 1
+    assert [task for task in asyncio.all_tasks() if task.get_name() == "tallyho-complete-in"] == []
+    item = env.tables.item
+    async with env.connection() as conn:
+        state = await conn.scalar(select(item.c.state).where(item.c.id == ref.id))
+    assert state == int(ItemState.OK)
+
+
+async def test_close_cancels_attached_heartbeat_tasks(env: Env) -> None:
+    async with open_completer(env) as completer:
+        beating = asyncio.create_task(_forever(), name="tallyho-heartbeat-probe")
+        finished = asyncio.create_task(asyncio.sleep(0), name="tallyho-heartbeat-done")
+        completer.attach(beating)
+        completer.attach(finished)
+        await finished
+
+        await completer.close()
+
+        assert beating.cancelled()
+
+
+async def test_abort_of_unused_completer_only_closes_it(env: Env) -> None:
+    seeded = await seed(env, 1)
+    async with open_completer(env) as completer:
+        await completer.abort()
+        await completer.settled()
+        with pytest.raises(ClosedError):
+            _ = await completer.claim(seeded.refs[0])
+
+
+async def test_abort_fails_operations_that_missed_the_commit(env: Env) -> None:
+    seeded = await seed(env, 3)
+    blocked, buffered, abandoned = seeded.refs
+    item = env.tables.item
+    async with open_completer(env) as completer:
+        async with env.transaction() as conn:
+            # Чужая блокировка строки Item: групповая транзакция claim ждёт её.
+            _ = await conn.execute(
+                select(item.c.id).where(item.c.id == blocked.id).with_for_update()
+            )
+            first = asyncio.create_task(completer.claim(blocked))
+            await _until(lambda: completer.buffered == 1)
+            await _until(lambda: completer.buffered == 0)  # операция ушла в транзакцию
+            second = asyncio.create_task(completer.claim(buffered))
+            third = asyncio.create_task(completer.claim(abandoned))
+            await _until(lambda: completer.buffered == 2)
+            # Вызывающий третьей операции уже отменён: её будущее ошибкой не затирается.
+            _ = third.cancel()
+            _ = await asyncio.wait({third})
+
+            await completer.abort()
+
+            for task in (first, second):
+                with pytest.raises(CompleterError, match="не уложилось в срок"):
+                    _ = await task
+            assert third.cancelled()
+        # Completer остановлен: простой наступил, повторное закрытие ничего не ждёт.
+        await completer.settled()
+        await completer.close(requeue_held=True)
+        with pytest.raises(ClosedError):
+            _ = await completer.claim(buffered)
+    assert await lease_row(env, blocked.id) is None
+    assert await lease_row(env, buffered.id) is None
+    assert await env.count(env.tables.outbox) == 0
+
+
+async def _until(condition: Callable[[], bool]) -> None:
+    async with asyncio.timeout(10):
+        for _ in itertools.count():
+            if condition():
+                return
+            await asyncio.sleep(0.001)

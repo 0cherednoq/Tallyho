@@ -53,10 +53,15 @@ async def send_email(campaign_id: int, contact_id: int) -> None:
 <!-- tallyho-noexec: точка входа процесса воркера; работает, пока его не остановят -->
 ```python
 # app/worker.py
-from app.tasks import queue
+import asyncio
 
-queue.run_worker(queues=["default", "mail"], pool="thread")
+from app.tasks import queue, th
+
+queue.run_worker(queues=["default", "mail"], pool="thread")  # до SIGINT или SIGTERM
+asyncio.run(th.aclose())  # дописать итоги и вернуть в очередь недоработавшие задачи
 ```
+
+Вторая строка обязательна — см. [Остановка](#остановка).
 
 Пул `prefork` не поддерживается — см. [ограничения](limitations.md#flexiq-только-poolthread). Чтобы
 ошибка конфигурации обнаружилась сразу, передайте адаптеру тот же пул, что и воркеру:
@@ -175,6 +180,7 @@ with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
     except ConfigurationError as error:
         assert "pool='thread'" in str(error)
 
+    await th.aclose()
     await fq.close()
 ```
 
@@ -210,16 +216,73 @@ with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as directory:
   джобу как успешную, хотя задача ещё выполняется. Если после этого задача упадёт с повторяемой
   ошибкой, flexiq её уже не повторит, поэтому tallyho сам ставит задачу батча заново — новой джобой
   со своим счётчиком попыток flexiq.
-* `retry_on` во flexiq — белый список. К непустому списку адаптер добавляет собственную ошибку
-  `CompleterError` (PostgreSQL недоступен в момент захвата или записи итога задачи): такой сбой
-  уходит в ретрай flexiq, а не сразу в DLQ. Чтобы отключить это, укажите `CompleterError` или её
-  базовый класс в `dont_retry_on`.
+* `retry_on` во flexiq — белый список. К непустому списку адаптер добавляет собственные ошибки
+  `CompleterError` (PostgreSQL недоступен в момент захвата или записи итога задачи) и `ClosedError`
+  (установка закрыта, пока задача ещё выполнялась): такой сбой уходит в ретрай flexiq, а не сразу
+  в DLQ. Чтобы отключить это, укажите эти ошибки или их базовый класс в `dont_retry_on`.
 * Кооперативная отмена flexiq (`TaskCancelledError`) записывается как итог `cancelled`.
 
 ## Остановка
 
-`await fq.close()` дожидается внутренних операций адаптера и останавливает его пул отправки.
-Вызывайте его при остановке API-процесса.
+**Воркер.** По `SIGTERM` flexiq перестаёт брать новые джобы, ждёт выполняющиеся не дольше
+`drain_timeout` и возвращает управление из `queue.run_worker(...)`. Свой event loop, в котором
+выполнялись задачи, он при этом останавливает, но не закрывает: в нём остаётся фоновая работа
+tallyho и задачи, не успевшие завершиться. Поэтому сразу после `run_worker` вызывайте
+`asyncio.run(th.aclose())`. Он доработает в этом loop: допишет итоги завершившихся задач, а
+незавершённые сразу вернёт в очередь, сняв с них аренду, — их выполнит другой воркер, не
+дожидаясь `lease_ttl`. Попытка при этом не тратится.
+
+Задача, которая не уложилась в `drain_timeout`, итог уже не запишет: при попытке она получит
+`ClosedError`. Её выполнит другой воркер, поэтому побочные эффекты задачи должны быть
+идемпотентными, как и при любом повторе.
+
+**Остановка под нагрузкой.** Во flexiq 2.0 есть ловушка (воспроизводится на Linux): если
+`drain_timeout` истёк, а все слоты `async_concurrency` ещё заняты, процесс воркера замирает —
+`run_worker` не возвращается, задачи не продвигаются, пока оркестратор не убьёт процесс. До `aclose` дело не доходит, и задачи такого
+воркера ждут `lease_ttl`. Если ваши задачи могут не уложиться в `drain_timeout`, запускайте
+`run_worker` в потоке и закрывайте установку сами — чуть раньше срока flexiq:
+
+<!-- tallyho-noexec: точка входа процесса воркера с собственным сроком остановки -->
+```python
+# app/worker.py
+import asyncio
+import os
+import signal
+import threading
+
+from app.tasks import queue, th
+
+DRAIN_TIMEOUT = 30  # тот же, что в Queue(drain_timeout=...)
+stop = threading.Event()
+
+
+def request_stop(signum: int, frame: object) -> None:
+    stop.set()
+    queue.shutdown()  # то же, что делает сам flexiq по SIGTERM
+
+
+signal.signal(signal.SIGTERM, request_stop)
+signal.signal(signal.SIGINT, request_stop)
+worker = threading.Thread(
+    target=queue.run_worker, kwargs={"queues": ["default"], "pool": "thread"}, daemon=True
+)
+worker.start()
+while worker.is_alive() and not stop.wait(0.2):
+    pass
+worker.join(timeout=DRAIN_TIMEOUT - 3)  # запас на закрытие до срока flexiq
+asyncio.run(th.aclose())  # итоги дописаны, недоработавшие задачи возвращены в очередь
+if worker.is_alive():
+    os._exit(0)  # flexiq ещё ждёт задачи: всё нужное уже записано
+```
+
+`aclose` здесь может быть вызван, пока loop flexiq ещё работает, — это допустимо. Недоработавшие
+задачи после него выполняются до выхода из процесса, но записать итог уже не могут.
+
+**API и maintenance.** `await th.aclose()`, затем `await fq.close()`: адаптер дожидается своих
+внутренних операций и останавливает пул отправки. Порядок важен: пока установка не закрыта, она
+ещё отправляет сообщения через адаптер.
+
+Общие правила — в разделе [Корректная остановка](operations.md#корректная-остановка).
 
 ## Что дальше
 

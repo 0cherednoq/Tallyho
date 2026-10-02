@@ -378,12 +378,24 @@ class Relay:
                 return
             self._spawn(asyncio.get_running_loop(), scan_now=scan_now)
 
-    async def stop(self) -> None:
+    @property
+    def loop(self) -> asyncio.AbstractEventLoop | None:
+        """Event loop работающего фонового цикла; ``None``, если цикла нет."""
+        pump = self._pump
+        return pump.task.get_loop() if pump is not None and pump.alive else None
+
+    async def stop(self, *, grace: float | None = None) -> None:
         """Остановить фоновый цикл и дождаться его; цикл можно запустить снова.
 
         Остановка мягкая: текущий проход завершается, уже полученные kick
         отправляются. Задача цикла из другого event loop только получает
-        просьбу остановиться — дождаться её можно лишь в её loop.
+        просьбу остановиться — дождаться её можно лишь в её loop
+        (:attr:`loop`).
+
+        Args:
+            grace: Сколько секунд ждать мягкой остановки; ``None`` — без
+                ограничения. По истечении задача цикла отменяется: захваченные
+                записи вернутся через ``relay_claim_ttl``.
         """
         with self._guard:
             pump = self._pump
@@ -392,15 +404,24 @@ class Relay:
             return
         pump.stopping = True
         pump.wake()
-        if pump.task.get_loop() is asyncio.get_running_loop():
-            # wait, а не await task: отмена самой задачи цикла не должна
-            # выглядеть отменой вызывающего.
-            _ = await asyncio.wait({pump.task})
+        if pump.task.get_loop() is not asyncio.get_running_loop():
+            return
+        # wait, а не await task: отмена самой задачи цикла не должна
+        # выглядеть отменой вызывающего.
+        _, late = await asyncio.wait({pump.task}, timeout=grace)
+        if late:
+            _log.warning("relay: цикл не остановился за %.1f с и отменён", grace)
+            _ = pump.task.cancel()
+            _ = await asyncio.wait(late)
 
-    async def close(self) -> None:
-        """Остановить цикл насовсем: после закрытия kick только копит id."""
+    async def close(self, *, grace: float | None = None) -> None:
+        """Остановить цикл насовсем: после закрытия kick только копит id.
+
+        Args:
+            grace: Срок мягкой остановки, как у :meth:`stop`.
+        """
         self._closed = True
-        await self.stop()
+        await self.stop(grace=grace)
 
     def _spawn(self, loop: asyncio.AbstractEventLoop, *, scan_now: bool) -> None:
         pump = _Pump(wakeup=asyncio.Event(), scan_due=scan_now)

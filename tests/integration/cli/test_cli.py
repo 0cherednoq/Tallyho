@@ -14,12 +14,14 @@ from sqlalchemy.ext.asyncio import create_async_engine
 from tallyho import Tallyho
 from tallyho.cli import app
 from tallyho.engine.maintenance import Maintenance
+from tallyho.model.errors import ClosedError
 from tallyho.storage.tables import build_metadata
 from tallyho.testing import InlineBroker
 from tests.helpers.db import schema_connection, schema_transaction
 from tests.helpers.relay import RecordingDispatcher
 
 if TYPE_CHECKING:
+    from collections.abc import Iterable
     from datetime import datetime
     from uuid import UUID
 
@@ -62,7 +64,7 @@ async def test_migrate_and_inspect_by_uuid_or_kind_key(
             pass
         _ = await batch.handle.wait()
     finally:
-        await broker.close()
+        await client.aclose()
         await engine.dispose()
 
     assert (
@@ -139,10 +141,11 @@ async def test_maintenance_without_broker_leaves_outbox_untouched(
         sender = Tallyho(engine, schema=schema, relay_grace=timedelta(0))
         sender.install(dispatcher)
         _ = await sender.run_maintenance_once()
+        await sender.aclose()
         assert sorted(dispatcher.ids) == [row_id for row_id, _at, _attempts in before]
         assert await outbox_rows(engine, schema) == []
     finally:
-        await broker.close()
+        await producer.aclose()
         await engine.dispose()
 
 
@@ -152,6 +155,7 @@ async def test_long_running_maintenance_uses_signal_service(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     served = False
+    clients: list[Tallyho] = []
 
     async def serve(runner: object) -> None:
         nonlocal served
@@ -159,7 +163,16 @@ async def test_long_running_maintenance_uses_signal_service(
         _ = runner
         served = True
 
+    def client(engine: AsyncEngine, *, schema: str, hook_modules: Iterable[str]) -> Tallyho:
+        clients.append(Tallyho(engine, schema=schema, hook_modules=hook_modules))
+        return clients[-1]
+
     monkeypatch.setattr(app, "serve_maintenance", serve)
+    monkeypatch.setattr(app, "Tallyho", client)
 
     assert await app.run(["maintenance", "--dsn", postgres_dsn, "--schema", schema]) == 0
     assert served
+    # Остановка закрывает установку: фоновые задачи дождались, повторно она не используется.
+    [closed] = clients
+    with pytest.raises(ClosedError):
+        _ = closed.maintenance()

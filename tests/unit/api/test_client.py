@@ -11,7 +11,7 @@ import pytest
 
 from tallyho import Call, Settings, Tallyho
 from tallyho.engine import RuntimeServices
-from tallyho.model.errors import ConfigurationError
+from tallyho.model.errors import ClosedError, ConfigurationError
 from tallyho.protocols.broker import DeadLetters, Verdict
 
 if TYPE_CHECKING:
@@ -87,6 +87,7 @@ def test_defaults_match_architecture_table() -> None:
         "max_items": None,
         "sweep_interval": timedelta(seconds=5),
         "lock_timeout": timedelta(seconds=5),
+        "close_timeout": timedelta(seconds=10),
         "retention": timedelta(days=14),
         "watch_throttle": timedelta(milliseconds=500),
         "items_scan_window": 5000,
@@ -109,6 +110,7 @@ def test_defaults_match_architecture_table() -> None:
         {"memo_max_bytes": True},
         {"completer_backpressure": 10, "completer_max_batch": 11},
         {"heartbeat_every": timedelta(0)},
+        {"close_timeout": timedelta(0)},
         {"relay_grace": timedelta(seconds=-1)},
         {"hook_backoff_initial": timedelta(minutes=6)},
         {"estimate_min_share": 2.0},
@@ -158,10 +160,24 @@ async def test_install_without_broker_serves_maintenance_but_not_producer() -> N
 
 async def test_aclose_without_started_relay_is_idempotent() -> None:
     client = _client()
-    await client.aclose()
     client.install(Adapter())
     await client.aclose()
     await client.aclose()
+
+
+async def test_closed_client_rejects_install_and_maintenance() -> None:
+    never_installed = _client()
+    await never_installed.aclose()
+    with pytest.raises(ClosedError, match="aclose"):
+        never_installed.install(Adapter())
+
+    client = _client()
+    client.install(None)
+    await client.aclose()
+    with pytest.raises(ClosedError):
+        _ = client.maintenance()
+    with pytest.raises(ClosedError):
+        _ = await client.run_maintenance_once()
 
 
 async def sample_task(value: int, *, mode: str) -> str:

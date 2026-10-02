@@ -108,7 +108,7 @@ async def test_successful_pipeline_emits_all_events_and_hides_payload(
             _ = await batch.handle.wait(timeout=timedelta(seconds=5))
             _ = await th.run_maintenance_once()
     finally:
-        await broker.close()
+        await th.aclose()
 
     assert spy.events == {
         "create",
