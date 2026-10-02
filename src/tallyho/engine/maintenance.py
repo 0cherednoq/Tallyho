@@ -61,6 +61,10 @@ class _Snapshotter(Protocol):
     async def tick(self) -> int: ...
 
 
+class _DeadLetters(Protocol):
+    async def reconcile_once(self) -> int: ...
+
+
 @runtime_checkable
 class _AsyncpgListener(Protocol):
     async def add_listener(
@@ -115,6 +119,8 @@ class MaintenanceResult:
     relayed: int
     swept: SweepResult
     snapshots: int
+    dead_letters: int = 0
+    """Items finished by the broker DLQ reconciliation (0 without a broker adapter)."""
 
 
 def _lock_key(identity: str) -> int:
@@ -142,12 +148,18 @@ class Maintenance:
     the relay loop of this process is kept running, leader or not. ``relay`` is
     ``None`` in a process without a broker adapter; such a process never claims
     the outbox.
+
+    The broker DLQ reconciliation (``dead_letters``, UC-15) needs the adapter
+    too and is therefore not leader-bound either: the relay loop runs it after
+    every safety scan, and :meth:`run_once` runs it explicitly. It is ``None``
+    in a process without a broker adapter.
     """
 
     engine: AsyncEngine
     sweeper: _Sweeper
     snapshotter: _Snapshotter
     relay: _Relay | None = None
+    dead_letters: _DeadLetters | None = None
     settings: MaintenanceSettings = field(default_factory=MaintenanceSettings)
     lock_identity: str | None = None
     _stop: asyncio.Event = field(init=False, default_factory=asyncio.Event)
@@ -165,7 +177,7 @@ class Maintenance:
         return self._leader_backend_pid
 
     async def run_once(self) -> MaintenanceResult:
-        """Run relay scan, all sweeper passes, and one snapshot tick once.
+        """Run relay scan, DLQ reconciliation, all sweeper passes, and one snapshot tick once.
 
         Returns:
             Counts and sweep details from the pass.
@@ -270,16 +282,21 @@ class Maintenance:
 async def run_maintenance_once(maintenance: Maintenance) -> MaintenanceResult:
     """Run one complete pass without leader election, primarily for deterministic tests.
 
-    A process without a broker adapter has no relay: the outbox is left untouched.
+    A process without a broker adapter has no relay and no DLQ reconciliation:
+    the outbox is left untouched and the broker DLQ is not read.
 
     Returns:
         Counts and sweep details from the pass.
     """
     relay = maintenance.relay
     relayed = 0 if relay is None else await relay.scan_once()
+    dead_letters = maintenance.dead_letters
+    reconciled = 0 if dead_letters is None else await dead_letters.reconcile_once()
     swept = await maintenance.sweeper.sweep()
     snapshots = await maintenance.snapshotter.tick()
-    return MaintenanceResult(relayed=relayed, swept=swept, snapshots=snapshots)
+    return MaintenanceResult(
+        relayed=relayed, swept=swept, snapshots=snapshots, dead_letters=reconciled
+    )
 
 
 @dataclass(eq=False, kw_only=True)

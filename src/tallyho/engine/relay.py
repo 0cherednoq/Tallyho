@@ -24,7 +24,9 @@ Relay не зависит от адаптера: он говорит тольк�
 стартует лениво в event loop первого ``kick`` либо явно — :meth:`Relay.start`
 (его зовёт ``Maintenance.run``); останавливают его :meth:`Relay.stop` и
 :meth:`Relay.close`. Scan не привязан к лидерству maintenance: параллельные
-проходы разных процессов расходятся по ``FOR UPDATE SKIP LOCKED``.
+проходы разных процессов расходятся по ``FOR UPDATE SKIP LOCKED``. После
+каждого scan цикл выполняет ``after_scan`` — сверку с DLQ брокера, которой
+тоже нужен адаптер (ARCHITECTURE UC-15).
 
 Окно ``max_in_flight`` считается по ``th_window``: строка на отправленный и
 не завершённый Item. Захват записей батча с окном сериализован
@@ -288,6 +290,10 @@ class Relay:
         autostart: Запускать ли фоновый цикл лениво при :meth:`kick`.
             ``False`` — проходы вызывает владелец (``InlineBroker``): цикл
             работает, только пока запущен явно через :meth:`start`.
+        after_scan: Проход, который фоновый цикл выполняет после каждого
+            страховочного scan, — сверка с DLQ брокера (ARCHITECTURE §3.2).
+            Как и scan, он нужен в каждом процессе с адаптером и не привязан
+            к лидерству maintenance. Явный :meth:`scan_once` его не вызывает.
     """
 
     engine: AsyncEngine
@@ -299,6 +305,7 @@ class Relay:
     tx_settings: TxSettings | None = None
     retry: RetryPolicy = field(default_factory=RetryPolicy)
     autostart: bool = True
+    after_scan: Callable[[], Awaitable[int]] | None = None
     _kicked: set[UUID] = field(init=False, default_factory=set[UUID])
     _pump: _Pump | None = field(init=False, default=None)
     _closed: bool = field(init=False, default=False)
@@ -419,6 +426,8 @@ class Relay:
             if pump.scan_due or loop.time() >= next_scan:
                 pump.scan_due = False
                 await self._pass(self.scan_once, "scan")
+                if self.after_scan is not None and not pump.stopping:
+                    await self._pass(self.after_scan, "сверка с DLQ")
                 next_scan = loop.time() + every
 
     @staticmethod

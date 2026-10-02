@@ -197,6 +197,38 @@ async def test_scan_now_does_not_wait_for_interval(rel: RelayEnv) -> None:
     assert len(loop_tasks()) == 1
 
 
+async def test_after_scan_pass_runs_with_every_scan_and_survives_failures(
+    env: Env, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Сверка с DLQ идёт в цикле relay после scan и не останавливает его своим сбоем."""
+    rel = relay_env(env, NOW, RelaySettings(scan_interval=FAST_SCAN))
+    calls: list[int] = []
+
+    async def reconcile() -> int:
+        await asyncio.sleep(0)
+        calls.append(len(calls))
+        if len(calls) == 1:
+            message = "DLQ недоступен"
+            raise RuntimeError(message)
+        return 0
+
+    rel.relay.after_scan = reconcile
+    try:
+        # Явный scan (InlineBroker, run_maintenance_once) сверку не запускает.
+        assert await rel.relay.scan_once() == 0
+        assert calls == []
+        with caplog.at_level(logging.ERROR, logger="tallyho.engine.relay"):
+            rel.relay.start(scan_now=True)
+            await eventually(lambda: len(calls) >= 3)
+        assert "проход сверка с DLQ упал" in caplog.text
+        assert rel.relay.running
+    finally:
+        await rel.relay.close()
+    seen = len(calls)
+    await asyncio.sleep(3 * FAST_SCAN.total_seconds())
+    assert len(calls) == seen
+
+
 async def test_loop_survives_failed_passes(env: Env, caplog: pytest.LogCaptureFixture) -> None:
     rel = relay_env(env, NOW, RelaySettings(scan_interval=FAST_SCAN))
     broken = rel.another_relay()

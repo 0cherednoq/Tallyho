@@ -81,6 +81,16 @@ class RecordingSnapshotter:
 
 
 @dataclass
+class RecordingDeadLetters:
+    events: list[str]
+
+    async def reconcile_once(self) -> int:
+        await asyncio.sleep(0)
+        self.events.append("dead_letters")
+        return 5
+
+
+@dataclass
 class FlakySweeper:
     subject: Maintenance | None = None
     calls: int = 0
@@ -157,7 +167,19 @@ async def test_run_once_has_deterministic_complete_order(env: Env) -> None:
     assert result.relayed == 2
     assert result.swept.leases == 3
     assert result.snapshots == 4
+    assert result.dead_letters == 0
     assert owned.relay.events == ["relay", "sweeper", "snapshotter"]
+
+
+async def test_run_once_reconciles_dead_letters_between_relay_and_sweeper(env: Env) -> None:
+    owned = services()
+    subject = maintenance(env, owned, identity="once-dlq")
+    subject.dead_letters = RecordingDeadLetters(owned.relay.events)
+
+    result = await run_maintenance_once(subject)
+
+    assert result.dead_letters == 5
+    assert owned.relay.events == ["relay", "dead_letters", "sweeper", "snapshotter"]
 
 
 async def test_exactly_one_leader_and_second_takes_over_after_backend_loss(env: Env) -> None:
@@ -277,6 +299,8 @@ async def test_process_without_broker_runs_leader_services_only(env: Env) -> Non
 
     result = await run_maintenance_once(subject)
     assert result.relayed == 0
+    # Без адаптера DLQ читать нечем: сверку выполняют процессы с брокером.
+    assert result.dead_letters == 0
     assert events == ["sweeper", "snapshotter"]
 
     task = asyncio.create_task(subject.run())
