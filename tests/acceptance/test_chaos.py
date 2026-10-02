@@ -97,13 +97,15 @@ _DUPLICATE_ORPHAN = _Defect(
 # (сдвиг часов, разрыв сети, отказ БД после commit) и исчерпывает попытки дублями-no-op.
 # Эффект один, данные согласованы, но DLQ брокера расходится с tallyho; что с этим делать
 # (уточнить I-10 или чистить DLQ), решает владелец вместе с Fix-6/Fix-7.
+#
+# Fix-7 исправлен: release после подтверждённого дубля возвращает Item в outbox. С A-CH-10
+# метка снята (S1/S2/S3 зелёные); A-CH-05 и A-CH-09 перепроверяет и снимает T11.3b.
 _INVARIANT_DEFECTS: Mapping[str, _Defect] = {
     "A-CH-02": _DEAD_JOB_ORPHAN,
     "A-CH-03": _DEAD_JOB_ORPHAN,
     "A-CH-04": _DEAD_JOB_ORPHAN,
     "A-CH-05": _DUPLICATE_ORPHAN,
     "A-CH-09": _DUPLICATE_ORPHAN,
-    "A-CH-10": _DUPLICATE_ORPHAN,
     "A-CH-12": _DEAD_JOB_ORPHAN,
 }
 # Невыполненные ожидания A-CH. В S1 max_retries задан только в декораторе задачи.
