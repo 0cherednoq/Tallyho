@@ -255,18 +255,20 @@ async def test_dead_letters_are_reconciled_by_process_with_adapter_not_by_leader
     broker = BrokerWithDeadLetters()
     th = clients(broker, sweep_interval=timedelta(milliseconds=50))
     try:
-        # Commit запускает цикл relay процесса: fast-path отправляет Items, а
-        # после каждого scan идёт сверка с DLQ.
-        batch_id = await create_batch(th, "dead", addresses=3)
-        handle = th.handle(batch_id)
-        view = await handle.wait(timeout=timedelta(seconds=15))
-    finally:
-        runner.stop()
-        await task
-        await leader.aclose()
+        try:
+            # Commit запускает цикл relay процесса: fast-path отправляет Items, а
+            # после каждого scan идёт сверка с DLQ.
+            batch_id = await create_batch(th, "dead", addresses=3)
+            handle = th.handle(batch_id)
+            view = await handle.wait(timeout=timedelta(seconds=15))
+        finally:
+            runner.stop()
+            await task
 
-    assert len(broker.messages) == 3
-    assert view.state is BatchState.COMPLETED_WITH_ERRORS
-    assert (view.progress.error, view.labels) == (3, {"exhausted": 3})
-    # В процессе без адаптера сверки нет вовсе.
-    assert getattr(await leader.run_maintenance_once(), "dead_letters", None) == 0
+        assert len(broker.messages) == 3
+        assert view.state is BatchState.COMPLETED_WITH_ERRORS
+        assert (view.progress.error, view.labels) == (3, {"exhausted": 3})
+        # В процессе без адаптера сверки нет вовсе; проверяем до закрытия установки.
+        assert getattr(await leader.run_maintenance_once(), "dead_letters", None) == 0
+    finally:
+        await leader.aclose()
