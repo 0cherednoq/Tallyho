@@ -19,6 +19,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
 
     from tallyho import BatchBuilder, BatchHandle
+    from tallyho.model.views import BatchSummary
     from tallyho.protocols.broker import Message
     from tests.integration.engine.conftest import Env
 
@@ -60,6 +61,12 @@ async def fail_after_add(builder: BatchBuilder) -> None:
     async with builder:
         await builder.add(parse_page, "url", page=1)
         raise ScenarioFailedError
+
+
+async def settle() -> None:
+    """Дождаться фоновых задач библиотеки, чтобы они не пересеклись с удалением схемы."""
+    own = [task for task in asyncio.all_tasks() if task.get_name().startswith("tallyho-")]
+    _ = await asyncio.gather(*own, return_exceptions=True)
 
 
 def client(env: Env) -> Tallyho:
@@ -158,3 +165,45 @@ async def test_empty_batch_is_finalized_immediately_after_commit(env: Env) -> No
     view = await root.handle.wait(timeout=timedelta(seconds=5))
     assert view.state is BatchState.SUCCEEDED
     assert view.progress.final
+
+
+async def test_cancel_right_after_seal_never_finalizes_succeeded(env: Env) -> None:
+    """Fix-9: отмена сразу после выхода из builder гонится с финализацией после seal."""
+    th = client(env)
+    for index in range(8):
+        async with th.batch(kind="cancelled-early", key=f"run:{index}") as root:
+            for page in range(4):
+                await root.add(parse_page, "url", page=page)
+        await root.handle.cancel()
+
+        view = await root.handle.wait(timeout=timedelta(seconds=10))
+        assert view.state is BatchState.CANCELLED
+        assert (view.progress.ok, view.progress.cancelled) == (0, 4)
+    await settle()
+
+
+async def test_cancel_during_finalization_hook_finalizes_cancelled(env: Env) -> None:
+    """Отмена, закоммиченная во время хука, определяет итог: хук вызывается заново."""
+    th = client(env)
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    seen: list[BatchState] = []
+
+    @th.on_finalized("cancelled-in-hook")
+    async def save(_session: AsyncSession, summary: BatchSummary) -> None:
+        seen.append(summary.state)
+        if len(seen) == 1:
+            entered.set()
+            await release.wait()
+
+    async with th.batch(kind="cancelled-in-hook", key="one") as root:
+        pass
+    await entered.wait()
+    await root.handle.cancel()
+    release.set()
+
+    view = await root.handle.wait(timeout=timedelta(seconds=10))
+    await settle()
+    assert view.state is BatchState.CANCELLED
+    assert seen[0] is BatchState.SUCCEEDED
+    assert set(seen[1:]) == {BatchState.CANCELLED}
