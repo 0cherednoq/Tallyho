@@ -1,4 +1,9 @@
-"""Command line interface for migrations, maintenance, and batch inspection."""
+"""Command line interface for migrations, maintenance, and batch inspection.
+
+The CLI has no broker configuration, so it installs the client without an
+adapter: such a process has no relay and never claims the outbox. Messages are
+dispatched by the relay of any process with a real adapter (ARCHITECTURE §3.2).
+"""
 
 from __future__ import annotations
 
@@ -7,30 +12,25 @@ import asyncio
 import signal
 import sys
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, ParamSpec, cast, final
+from typing import TYPE_CHECKING, cast
 from uuid import UUID
 
 from sqlalchemy.ext.asyncio import create_async_engine
-from typing_extensions import override
 
 from tallyho import Tallyho, __version__
 from tallyho.model.errors import ConfigurationError
-from tallyho.protocols.broker import Dispatcher
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Sequence
+    from collections.abc import Sequence
 
     from tallyho.api import BatchHandle
     from tallyho.engine.public import MaintenanceRunner
     from tallyho.model.views import BatchView
-    from tallyho.protocols.broker import Message
 
 __all__ = ["build_parser", "main", "run", "serve_maintenance"]
 
-P = ParamSpec("P")
 _BAD_COMMAND = "unknown CLI command"
 _BAD_TARGET = "inspect target must be a batch UUID or kind:key"
-_NO_BROKER = "CLI maintenance has no broker adapter; outbox was left untouched"
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,20 +57,6 @@ class _Inspect:
 _Command = _Migrate | _Maintenance | _Inspect
 
 
-@final
-class _RejectingDispatcher(Dispatcher):
-    """Keep outbox rows intact when CLI maintenance has no broker configuration."""
-
-    @override
-    def task_name(self, fn: Callable[P, object]) -> str:
-        return fn.__qualname__
-
-    @override
-    async def dispatch(self, messages: Sequence[Message]) -> None:
-        if messages:
-            raise ConfigurationError(_NO_BROKER)
-
-
 def _common(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--dsn", required=True, help="SQLAlchemy async PostgreSQL DSN")
     parser.add_argument("--schema", required=True, help="installation schema")
@@ -89,7 +75,9 @@ def build_parser() -> argparse.ArgumentParser:
     migrate = commands.add_parser("migrate", help="install or upgrade the schema")
     _common(migrate)
 
-    maintenance = commands.add_parser("maintenance", help="run leader maintenance")
+    maintenance = commands.add_parser(
+        "maintenance", help="run leader maintenance (no broker: messages are not dispatched)"
+    )
     _common(maintenance)
     maintenance.add_argument(
         "--hook-module",
@@ -202,7 +190,7 @@ async def run(argv: Sequence[str] | None = None) -> int:
             version = await client.migrate()
             _ = sys.stdout.write(f"schema={command.schema} version={version}\n")
             return 0
-        client.install(_RejectingDispatcher())
+        client.install(None)
         if isinstance(command, _Inspect):
             view = await (await _resolve(client, command.target)).view()
             _ = sys.stdout.write("\n".join(_render(view)) + "\n")

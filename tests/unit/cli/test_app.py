@@ -13,9 +13,8 @@ from typing_extensions import override
 
 from tallyho.cli import app
 from tallyho.model.errors import ConfigurationError
-from tallyho.model.states import BatchState, OutboxKind
+from tallyho.model.states import BatchState
 from tallyho.model.views import BatchView, Progress
-from tallyho.protocols.broker import Message
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -113,26 +112,6 @@ async def test_maintenance_without_signal_support_still_runs(
 
     assert runner.ran
     assert loop.removed == []
-
-
-async def test_rejecting_dispatcher_never_acknowledges_messages() -> None:
-    dispatcher = app._RejectingDispatcher()  # ruff: ignore[private-member-access]  # CLI safety boundary is tested directly
-
-    async def task() -> None:
-        await asyncio.sleep(0)
-
-    assert dispatcher.task_name(task).endswith("task")
-    await dispatcher.dispatch([])
-    message = Message(
-        id=UUID(int=1),
-        batch_id=UUID(int=2),
-        kind=OutboxKind.ITEM,
-        task_name="task",
-        payload=b"payload",
-        options={},
-    )
-    with pytest.raises(ConfigurationError):
-        await dispatcher.dispatch([message])
 
 
 async def test_invalid_inspect_target_is_rejected() -> None:
