@@ -210,20 +210,17 @@ class _Pump:
     scan_due: bool
     """Scan нужен в ближайшем проходе, не дожидаясь ``scan_interval``."""
     stopping: bool = False
-    task: asyncio.Task[None] | None = None
+    task: asyncio.Task[None] = field(init=False)
+    """Задача цикла; ``Relay._spawn`` задаёт её сразу после создания состояния."""
 
     @property
     def alive(self) -> bool:
         # Задача работает, а её event loop ещё не закрыт.
-        task = self.task
-        return task is not None and not task.done() and not task.get_loop().is_closed()
+        return not self.task.done() and not self.task.get_loop().is_closed()
 
     def wake(self) -> None:
         # Разбудить цикл из любого потока; закрытый loop будить уже некому.
-        task = self.task
-        if task is None:
-            return
-        owner = task.get_loop()
+        owner = self.task.get_loop()
         if owner is _running_loop():
             self.wakeup.set()
             return
@@ -381,7 +378,7 @@ class Relay:
         with self._guard:
             pump = self._pump
             self._pump = None
-        if pump is None or pump.task is None or not pump.alive:
+        if pump is None or not pump.alive:
             return
         pump.stopping = True
         pump.wake()

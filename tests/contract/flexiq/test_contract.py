@@ -52,7 +52,10 @@ async def test_a_fq_01_arguments_and_task_identity(flexiq_contract: FlexiqContra
     events = await flexiq_contract.wait_events("signature", count=2)
     view = await flexiq_contract.wait_terminal(batch.handle)
 
-    assert events[0] == {
+    # Порядок Items одного батча в брокере не гарантирован: fast-path после
+    # commit и страховочный scan могут отправить их разными пачками.
+    plain, rich = sorted(events, key=lambda event: str(event["required"]))
+    assert plain == {
         "event": "signature",
         "required": {"value": "dataclass"},
         "default": "default",
@@ -61,11 +64,11 @@ async def test_a_fq_01_arguments_and_task_identity(flexiq_contract: FlexiqContra
         "rest": {},
         "task_name": app.adapter.task_name(signature),
     }
-    assert events[1]["required"] == {"value": "pydantic"}
-    assert events[1]["default"] is None
-    assert events[1]["extra"] == ["Привет", large]
-    assert events[1]["option"] is None
-    assert events[1]["rest"] == {"named": "значение"}
+    assert rich["required"] == {"value": "pydantic"}
+    assert rich["default"] is None
+    assert rich["extra"] == ["Привет", large]
+    assert rich["option"] is None
+    assert rich["rest"] == {"named": "значение"}
     assert "_th" not in str(events)
     assert view.state is BatchState.SUCCEEDED
 
