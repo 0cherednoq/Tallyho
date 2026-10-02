@@ -179,13 +179,14 @@ class TaskRuntime:
         *,
         context: ItemContext,
     ) -> object:
+        attempt = context.attempt
         try:
             result = await task(*args, **kwargs)
         except asyncio.CancelledError:
             if not context.lease_lost:
                 # Установка уже закрыта — Item вернул в outbox aclose; отмену не подменяем.
                 with contextlib.suppress(ClosedError):
-                    _ = await self.completer.release(context.ref)
+                    _ = await self.completer.release(context.ref, attempt=attempt)
             raise
         except BaseException as exc:
             if context.lease_lost:
@@ -193,31 +194,45 @@ class TaskRuntime:
                 # finish и release задели бы чужую попытку, поэтому не пишем ничего.
                 if isinstance(exc, LeaseLostError):
                     # Не ошибка задачи: брокеру — успех, как при DUPLICATE и TERMINAL.
-                    _log.info("Item %s: попытка %d потеряла lease", context.id, context.attempt)
+                    _log.info("Item %s: попытка %d потеряла lease", context.id, attempt)
                     return None
                 raise
-            if isinstance(self.broker, CancellationClassifier) and self.broker.is_cancelled(exc):
-                value = FinishResult(
-                    result_class=ResultClass.CANCELLED,
-                    label="cancelled",
-                    error={"type": type(exc).__name__, "message": str(exc)},
-                    metrics=context.metrics,
-                )
-                _ = await self.completer.finish(context.ref, value)
-            elif self.broker.retry_verdict(exc) is Verdict.RETRY:
-                _ = await self.completer.release(context.ref)
-            else:
-                value = FinishResult(
-                    result_class=ResultClass.ERROR,
-                    label="exhausted",
-                    error={"type": type(exc).__name__, "message": str(exc)},
-                    metrics=context.metrics,
-                )
-                _ = await self.completer.finish(context.ref, value)
+            if not await self._settle_failure(exc, context):
+                # Путь A без lease (UC-03): итог не записан, ретрай и DLQ задели бы
+                # Item, который теперь у другого исполнителя, — как LeaseLostError.
+                _log.info("Item %s: попытка %d потеряла lease", context.id, attempt)
+                return None
             raise
         if not (context.completed_in_user_tx or context.lease_lost):
-            _ = await self.completer.finish(context.ref, context.finish_result())
+            # Потерянный lease здесь ничего не меняет: брокеру — успех, итог не записан.
+            _ = await self.completer.finish(
+                context.ref, context.finish_result(), attempt=context.attempt
+            )
         return result
+
+    async def _settle_failure(self, exc: BaseException, context: ItemContext) -> bool:
+        """Записать исход упавшей попытки: cancelled, release или error.
+
+        Returns:
+            ``False``, если попытка уже не владеет lease и ничего не записано.
+        """
+        if isinstance(self.broker, CancellationClassifier) and self.broker.is_cancelled(exc):
+            value = FinishResult(
+                result_class=ResultClass.CANCELLED,
+                label="cancelled",
+                error={"type": type(exc).__name__, "message": str(exc)},
+                metrics=context.metrics,
+            )
+            return await self.completer.finish(context.ref, value, attempt=context.attempt)
+        if self.broker.retry_verdict(exc) is Verdict.RETRY:
+            return await self.completer.release(context.ref, attempt=context.attempt)
+        value = FinishResult(
+            result_class=ResultClass.ERROR,
+            label="exhausted",
+            error={"type": type(exc).__name__, "message": str(exc)},
+            metrics=context.metrics,
+        )
+        return await self.completer.finish(context.ref, value, attempt=context.attempt)
 
     async def _heartbeat(self, context: ItemContext) -> None:
         while True:
