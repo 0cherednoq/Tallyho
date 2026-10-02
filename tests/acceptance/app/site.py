@@ -138,6 +138,7 @@ class FakeCatalogSite:
         app.router.add_get("/pages/{page}", self._page)
         app.router.add_get("/cards/{card}", self._card)
         app.router.add_get("/pdfs/{pdf}", self._pdf)
+        app.router.add_get("/journal", self._journal)
         runner = web.AppRunner(app)
         await runner.setup()
         selected_port = _free_port() if port is None else port
@@ -151,6 +152,9 @@ class FakeCatalogSite:
         if self._runner is not None:
             await self._runner.cleanup()
             self._runner = None
+
+    async def _journal(self, _request: web.Request) -> web.Response:
+        return web.json_response(dict(self.calls))
 
     async def _page(self, request: web.Request) -> web.Response:
         page = int(request.match_info["page"])

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import TYPE_CHECKING, cast
@@ -35,8 +36,11 @@ if TYPE_CHECKING:
     from tests.acceptance.app.domain import DomainTable, DomainTables
 
 __all__ = [
+    "AUDIENCE_ID_SPAN",
+    "PAGE",
     "AcceptanceApp",
     "AcceptanceTasks",
+    "StandTuning",
     "build_app",
     "flexiq_dsn",
 ]
@@ -45,6 +49,30 @@ S1_KIND = "acceptance.s1"
 S2_KIND = "acceptance.s2"
 S3_KIND = "acceptance.s3"
 PAGE = 10
+AUDIENCE_ID_SPAN = 1_000_000
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class StandTuning:
+    """Process-level knobs the chaos stand overrides; defaults keep the smoke harness as is.
+
+    Attributes:
+        application_name: PostgreSQL ``application_name`` of this process' SQLAlchemy
+            connections; the chaos controller finds processes by it in ``pg_stat_activity``.
+        lease_ttl: Tallyho ``lease_ttl``.
+        heartbeat_every: Tallyho ``heartbeat_every``.
+        sweep_interval: Tallyho ``sweep_interval``.
+        drain_timeout: FlexIQ graceful-shutdown budget for running jobs, seconds.
+        hook_delay: Seconds ``on_finalized`` keeps its transaction open after the domain
+            write, so A-CH-03 can observe the hook in ``pg_stat_activity``.
+    """
+
+    application_name: str | None = None
+    lease_ttl: timedelta = timedelta(seconds=60)
+    heartbeat_every: timedelta = timedelta(seconds=20)
+    sweep_interval: timedelta = timedelta(milliseconds=100)
+    drain_timeout: int = 1
+    hook_delay: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -129,7 +157,11 @@ class AcceptanceApp:
             _ = await session.execute(
                 insert(audience),
                 [
-                    {"id": index, "campaign_id": campaign_id, "email": address}
+                    {
+                        "id": campaign_id * AUDIENCE_ID_SPAN + index,
+                        "campaign_id": campaign_id,
+                        "email": address,
+                    }
                     for index, address in enumerate(addresses, start=1)
                 ],
             )
@@ -139,7 +171,11 @@ class AcceptanceApp:
                 expand = root.sub_batch("expand")
                 _ = root.sub_batch("send", fed_by=[expand])
                 await expand.add_calls(
-                    [self.th.call(self.tasks.expand_audience, campaign_id, 0).opts(key="page:0")]
+                    [
+                        self.th.call(self.tasks.expand_audience, campaign_id, 0).opts(
+                            key="page:0", max_retries=3
+                        )
+                    ]
                 )
             _ = await session.execute(
                 update(campaigns)
@@ -197,9 +233,17 @@ def build_app(  # ruff: ignore[complex-structure, too-many-statements, too-many-
     transient_rate: float = 0.05,
     permanent_rate: float = 0.01,
     worker_count: int = 4,
+    tuning: StandTuning | None = None,
 ) -> AcceptanceApp:
     """Build one producer/worker process with identical task registrations."""
-    engine = create_async_engine(dsn)
+    knobs = tuning or StandTuning()
+    engine = (
+        create_async_engine(dsn)
+        if knobs.application_name is None
+        else create_async_engine(
+            dsn, connect_args={"server_settings": {"application_name": knobs.application_name}}
+        )
+    )
     domain = build_domain(domain_schema)
     domain_engine = engine.execution_options(schema_translate_map={None: tallyho_schema})
     audience = domain.audience
@@ -218,7 +262,7 @@ def build_app(  # ruff: ignore[complex-structure, too-many-statements, too-many-
         schema=flexiq_schema,
         workers=worker_count,
         async_concurrency=worker_count,
-        drain_timeout=1,
+        drain_timeout=knobs.drain_timeout,
         scheduler_poll_interval_ms=20,
         scheduler_reap_interval=1,
     )
@@ -228,7 +272,9 @@ def build_app(  # ruff: ignore[complex-structure, too-many-statements, too-many-
         schema=tallyho_schema,
         relay_grace=timedelta(0),
         finalize_grace=timedelta(0),
-        sweep_interval=timedelta(milliseconds=100),
+        sweep_interval=knobs.sweep_interval,
+        lease_ttl=knobs.lease_ttl,
+        heartbeat_every=knobs.heartbeat_every,
         snapshot_tick=timedelta(milliseconds=50),
         watch_throttle=timedelta(milliseconds=10),
     )
@@ -520,6 +566,8 @@ def build_app(  # ruff: ignore[complex-structure, too-many-statements, too-many-
                     progress_found=summary.progress.found,
                 )
             )
+            if knobs.hook_delay > 0:
+                await asyncio.sleep(knobs.hook_delay)
 
         @th.on_progress(kind, every=timedelta(seconds=1))
         async def progress(session: AsyncSession, summary: BatchSummary) -> None:

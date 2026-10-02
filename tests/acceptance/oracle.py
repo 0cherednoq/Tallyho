@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from datetime import timedelta
 from typing import TYPE_CHECKING, cast
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import func, or_, select, text
 
 from tallyho.model.states import TERMINAL_THRESHOLD, BatchState, ItemState
 from tallyho.storage.counters import read_counters
@@ -283,21 +283,31 @@ def check_i07_generator_truth(
 async def check_i08_monotonic_snapshots(
     connection: AsyncConnection, domain: DomainTables
 ) -> InvariantReport:
-    """I-08: progress seq/totals grow and no progress commits after finalization."""
+    """I-08: progress seq/totals grow and no progress commits after finalization.
+
+    ``hook_log.at`` is the hook transaction's start time. A snapshot transaction that
+    starts after the finalization transaction started may still legitimately commit first
+    (the finalization CAS then wins), so start time misorders such pairs. When PostgreSQL
+    runs with ``track_commit_timestamp=on`` (the compose stand does), rows are ordered by
+    the real commit time of ``txid``; otherwise by start time, as before.
+    """
     hook = domain.hook_log
-    rows = (
-        await connection.execute(
-            select(
-                hook.c.batch_id,
-                hook.c.hook,
-                hook.c.seq,
-                hook.c.progress_done,
-                hook.c.progress_found,
-                hook.c.at,
-                hook.c.txid,
-            ).order_by(hook.c.batch_id, hook.c.at, hook.c.txid)
-        )
-    ).all()
+    tracked = await connection.scalar(text("SELECT current_setting('track_commit_timestamp')"))
+    statement = select(
+        hook.c.batch_id,
+        hook.c.hook,
+        hook.c.seq,
+        hook.c.progress_done,
+        hook.c.progress_found,
+        hook.c.at,
+        hook.c.txid,
+    )
+    if tracked == "on":
+        committed = text("pg_xact_commit_timestamp((txid % 4294967296)::text::xid)")
+        statement = statement.order_by(hook.c.batch_id, committed, hook.c.txid)
+    else:
+        statement = statement.order_by(hook.c.batch_id, hook.c.at, hook.c.txid)
+    rows = (await connection.execute(statement)).all()
     evidence: list[str] = []
     previous: dict[UUID, tuple[int, int, int]] = {}
     finalized: set[UUID] = set()
@@ -336,11 +346,14 @@ async def check_i09_tree_order(
             .join(fed, fed.c.id == tables.feed.c.fed_id)
         )
     ).all()
-    evidence = [
-        f"feed:{feeder_id}->{fed_id}"
-        for feeder_id, fed_id, feeder_at, fed_at in feed_rows
-        if fed_at < feeder_at
-    ]
+    evidence: list[str] = []
+    for feeder_id, fed_id, raw_feeder_at, raw_fed_at in feed_rows:
+        # An unfinished stage (I-01 reports it after chaos) does not break the order; a stage
+        # finished before its feeder, or while the feeder is still unfinished, does.
+        feeder_at = cast("datetime | None", raw_feeder_at)
+        fed_at = cast("datetime | None", raw_fed_at)
+        if fed_at is not None and (feeder_at is None or fed_at < feeder_at):
+            evidence.append(f"feed:{feeder_id}->{fed_id}")
     hooks = domain.hook_log.alias("hooks")
     parent_hooks = domain.hook_log.alias("parent_hooks")
     child_rows = (

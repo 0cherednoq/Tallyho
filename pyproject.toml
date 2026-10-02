@@ -122,6 +122,13 @@ test = { cmd = "pytest -m 'not integration' --cov-fail-under=0", help = "Unit + 
 test-all = { cmd = "pytest", help = "All tests incl. PostgreSQL integration (needs Docker or TALLYHO_TEST_DSN)" }
 test-flexiq = { cmd = "pytest tests/contract/flexiq/test_contract.py -m flexiq -n 0 --no-cov", help = "A-FQ contracts with PostgreSQL and subprocess workers" }
 acceptance-smoke = { cmd = "pytest tests/acceptance/test_reference_app.py -m flexiq -n 0 --no-cov", help = "Small S1/S2/S3 reference app against PostgreSQL and a real FlexIQ worker" }
+acceptance = { cmd = "pytest tests/acceptance/test_chaos.py -m chaos -n ${JOBS} --dist loadgroup --no-cov -p no:randomly", help = "Хаос-приёмка A-CH поверх S1/S2/S3 на compose-стенде (нужен Docker), затем оракул I-01…I-14", args = [
+  { name = "SEED", options = ["--seed"], default = "1", help = "Seed расписания хаоса, данных и инъекции ошибок" },
+  { name = "SCENARIO", options = ["--scenario"], default = "all", help = "S1, S2, S3, список через запятую или all" },
+  { name = "CHAOS", options = ["--chaos"], default = "all", help = "A-CH-01 … A-CH-12, список через запятую или all" },
+  { name = "DURATION", options = ["--duration"], default = "120", help = "Окно хаоса в секундах: 120 локально, 600 nightly, 3600 pre-release" },
+  { name = "JOBS", options = ["--jobs"], default = "0", help = "Сколько стендов гонять параллельно (pytest-xdist)" },
+] }
 mutation-cas = { shell = "mutmut run --max-children 4 '*Tx*claim*' '*Tx*finish*' '*Finalizer*_cas*' '*Snapshotter*_attempt*' '*Operations*_retry_items*' && ! mutmut results | grep -Eq ': (survived|suspicious|no tests)'", help = "Mutation gate for critical CAS functions (Linux/WSL only)" }
 check = { sequence = ["lint", "types", "imports", "deps", "test"], help = "Everything CI runs, except integration" }
 check-all = { sequence = ["lint", "types", "imports", "deps", "test-all"], help = "Всё, включая PostgreSQL и покрытие ≥ 95%" }
@@ -400,6 +407,7 @@ asyncio_default_test_loop_scope = "function"
 timeout = 60
 filterwarnings = ["error"]
 markers = [
+  "chaos: хаос-приёмка A-CH на compose-стенде; запускается только через `poe acceptance` (-m chaos)",
   "flexiq: contract tests with a live Flexiq worker in a separate process",
   "integration: требует PostgreSQL (Docker/testcontainers или TALLYHO_TEST_DSN)",
   "slow: долгие тесты (хаос, нагрузка)",
