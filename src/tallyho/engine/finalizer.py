@@ -8,6 +8,12 @@ ARCHITECTURE §6.1, §7.3, §7.5 и §8.1. Финализация выполня
 (сам батч и этапы, которые он наполняет, одним ``FOR UPDATE`` по id) →
 ``th_outbox`` → ``th_item`` (виртуальный Item родителя) → ``th_counter`` →
 ``th_metric``. Тот же порядок у Completer и операций над поддеревом.
+
+Итог выбирается дважды: без блокировок — чтобы показать его хуку, и под
+блокировкой строки батча — по ней и по счётчикам, прочитанным заново. Запись
+делается только если оба результата совпали: запрос отмены, дедлайн, политика
+или ``retry_failed`` потомка, закоммиченные между чтениями, повторяют попытку
+или откладывают финализацию.
 """
 
 from __future__ import annotations
@@ -171,6 +177,19 @@ class _Stage:
 
 
 @dataclass(frozen=True, slots=True)
+class _Verdict:
+    """Итог готового к финализации батча: ``summary.state`` и ``summary.reason`` хука.
+
+    Счётчики в сравнение не входят: при ``pending = 0`` у незавершённого батча
+    меняется только ``dispatched`` (relay пишет его после отправки), а на итог
+    он не влияет.
+    """
+
+    state: BatchState
+    reason: CancelReason | None
+
+
+@dataclass(frozen=True, slots=True)
 class _Committed:
     batch_id: UUID
     kind: str
@@ -230,19 +249,14 @@ class Finalizer:
 
     async def _attempt(self, conn: AsyncConnection, batch_id: UUID) -> _Committed:
         target = await self._read_batch(conn, batch_id)
-        if target is None or target.state.is_terminal:
+        verdict = None if target is None else await self._verdict(conn, target)
+        if target is None or verdict is None:
             raise _CasLostError
-        totals = (await read_counters(conn, self.tables, [batch_id]))[batch_id]
-        if totals.pending != 0 or not self._closable(target):
-            raise _CasLostError
-        values = (await self._metrics(conn, [batch_id])).get(batch_id, {})
-        child_errors = await self._child_errors(conn, batch_id)
-        final_state = self._final_state(target, totals, values, child_errors=child_errors)
         self.hooks.ensure(target.kind, target.hooks)
         now = await conn.scalar(select(sql_now(self.clock)))
         if now is None:
             raise _CasLostError
-        summary = await self._summary(conn, target=target, state=final_state, now=now)
+        summary = await self._summary(conn, target=target, state=verdict.state, now=now)
         hook = self.hooks.finalized(target.kind)
         if hook is not None:
             try:
@@ -251,23 +265,50 @@ class Finalizer:
                         await hook(session, summary)
             except Exception as exc:
                 raise _HookCallError(error=exc, batch_id=batch_id, kind=target.kind) from exc
-        return await self._apply(conn, target, state=final_state, now=now)
+        return await self._apply(conn, target, verdict=verdict, now=now)
+
+    async def _verdict(self, conn: AsyncConnection, batch: _Batch) -> _Verdict | None:
+        """Выбрать итог по прочитанной строке батча и текущим счётчикам.
+
+        Returns:
+            Итог или ``None``, если батч уже терминален либо ещё не готов.
+        """
+        if batch.state.is_terminal:
+            return None
+        totals = (await read_counters(conn, self.tables, [batch.id]))[batch.id]
+        if totals.pending != 0 or not self._closable(batch):
+            return None
+        values = (await self._metrics(conn, [batch.id])).get(batch.id, {})
+        child_errors = await self._child_errors(conn, batch.id)
+        state = self._final_state(batch, totals, values, child_errors=child_errors)
+        return _Verdict(state=state, reason=batch.cancel_reason)
 
     async def _apply(
-        self, conn: AsyncConnection, target: _Batch, *, state: BatchState, now: datetime
+        self, conn: AsyncConnection, target: _Batch, *, verdict: _Verdict, now: datetime
     ) -> _Committed:
         # Порядок блокировок общий с Completer (§9.2, §10): сначала все строки
         # th_batch в порядке id, потом th_outbox, th_item и th_counter. Хук уже
         # отработал: под блокировкой батча его вызывать нельзя (A-DB-08).
-        stages = await self._lock_stages(conn, target.id)
-        won = await self._cas(conn, batch=target, state=state, now=now)
-        if not won:
-            current = await conn.scalar(
-                select(self.tables.batch.c.state).where(self.tables.batch.c.id == target.id)
-            )
-            if current is not None and not BatchState(current).is_terminal:
-                raise _SnapshotChangedError
+        stages = await self._lock(conn, target.id)
+        # Итог, показанный хуку, выбран по раннему снимку. Решает строка под
+        # блокировкой: всё, что меняет итог (cancel, дедлайн, fail_fast, политика,
+        # retry_failed), блокирует её же и после этой точки ждёт нашего commit.
+        locked = await self._read_batch(conn, target.id)
+        if locked is None:
             raise _CasLostError
+        if not locked.state.is_terminal:
+            current = await self._verdict(conn, locked)
+            if current is None:
+                # Батч снова не готов: retry_failed потомка вернул Item в работу.
+                raise _CasLostError
+            if current != verdict:
+                raise _SnapshotChangedError
+        state = verdict.state
+        if not await self._cas(conn, batch=target, state=state, now=now):
+            # Терминальную строку отсекает сам CAS; иначе изменился только snap_seq.
+            if locked.state.is_terminal:
+                raise _CasLostError
+            raise _SnapshotChangedError
         if await self._fed_ids(conn, target.id) != {stage.id for stage in stages}:
             # add_feed успел добавить этап до блокировки батча: повторить с начала.
             raise _SnapshotChangedError
@@ -423,18 +464,17 @@ class Finalizer:
         feed = self.tables.feed
         return set(await conn.scalars(select(feed.c.fed_id).where(feed.c.feeder_id == feeder_id)))
 
-    async def _lock_stages(self, conn: AsyncConnection, batch_id: UUID) -> list[_Stage]:
+    async def _lock(self, conn: AsyncConnection, batch_id: UUID) -> list[_Stage]:
         """Заблокировать батч вместе с этапами, которые он наполняет.
 
         Один ``FOR UPDATE`` в порядке id — глобальный порядок блокировок
-        ``th_batch``. Если этапов нет, строку батча блокирует сам CAS.
+        ``th_batch``. Строка батча блокируется всегда: по ней под блокировкой
+        перепроверяется итог.
 
         Returns:
             Этапы, которые наполняет батч, по возрастанию id.
         """
         fed_ids = await self._fed_ids(conn, batch_id)
-        if not fed_ids:
-            return []
         batch = self.tables.batch
         rows = await conn.execute(
             select(batch.c.id, batch.c.state, batch.c.on_feeder_failed)
@@ -508,7 +548,10 @@ class Finalizer:
         state: BatchState,
         now: datetime,
     ) -> BatchSummary:
-        rows = await self._tree(conn, target.root_id)
+        # Строка самого батча — та же, по которой выбран итог: ``state`` и
+        # ``reason`` в сводке хука согласованы и сверяются под блокировкой.
+        tree = await self._tree(conn, target.root_id)
+        rows = [target if row.id == target.id else row for row in tree]
         ids = [row.id for row in rows]
         attributes = await read_batch_attributes(conn, self.tables, target.root_id)
         totals = await read_counters(conn, self.tables, ids)
