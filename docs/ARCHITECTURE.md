@@ -300,8 +300,8 @@ classDiagram
         +kick(batch_ids) None
         +scan_once() int
         +start(scan_now) None
-        +stop(timeout) None
-        +close(timeout) None
+        +stop(grace) None
+        +close(grace) None
     }
     class Sweeper {
         +expire_leases() int
@@ -1508,7 +1508,7 @@ await th.migrate()  # или ревизии Alembic: upgrade(..., version=1), з
 | другой, остановлен, но не закрыт (flexiq после выхода из `run_worker`) | сам докручивает этот loop в служебном потоке, пока закрытие не завершится |
 | закрыт | пропускает с предупреждением: задачи уже не выполнятся, lease вернёт sweeper |
 
-Поэтому воркер flexiq закрывается так: `queue.run_worker(...)`, затем `asyncio.run(th.aclose())` (§11.3).
+Поэтому воркер flexiq закрывается так: `queue.run_worker(...)`, затем `asyncio.run(th.aclose())`; вариант с остановкой, ограниченной по времени, — в §11.3.
 
 **После закрытия.** Повторный `aclose` — no-op; второй вызов, сделанный, пока первый ещё выполняется, его не ждёт. Установка не перезапускается: `th.batch`, операции `BatchHandle`, меняющие батч (`pause`, `resume`, `cancel`, `reschedule`, `retry_failed`, `retry_finalize`, `release`), `th.maintenance()`, `th.run_maintenance_once()` и операции Completer (claim, heartbeat, finish, release, `complete_in`) бросают `ClosedError` — подкласс `InvalidStateError`. Чтение (`view`, `watch`, `wait`, `in_flight`, `items`, `find`, `list_batches`) и `migrate` работают. After-commit действия транзакций, начатых до закрытия, не бросают: `kick` только копит id, финализация не запускается — запись отправит scan другого процесса, финализацию выполнит sweeper.
 
@@ -1575,7 +1575,7 @@ await th.migrate()  # или ревизии Alembic: upgrade(..., version=1), з
 | Нет per-job heartbeat; мёртвый воркер обнаруживается через ~43 с (порог 30 с + heartbeat воркеров + цикл reaper), его джобы уходят в retry и тратят попытку | Ретрай flexiq может прийти при ещё живом нашем lease | Claim при живом чужом lease отдаёт успех и помечает lease `redelivered`. Item остаётся за lease: если владелец lease умер, sweeper переотправит Item по истечении (задержка ≤ `lease_ttl`); если он жив и завершит попытку вердиктом `RETRY`, `release` сам вернёт Item в outbox (UC-04) |
 | `requeue_job` возвращает Running-джобу в Pending, не останавливая исходное выполнение; успех повторной доставки завершает джобу, а отчёт исходного выполнения об ошибке после этого отбрасывается | После no-op дубля ретрая от брокера не будет | То же: `th_lease.redelivered` + возврат в outbox при `release`. Новая джоба получает свой бюджет ретраев |
 | `retry_on` задачи — белый список: исключение не из списка сразу уводит джобу в DLQ | Отказ PostgreSQL на claim/release/finish (`CompleterError`) при `retry_on=[TransientError]` — мгновенный DLQ, хотя задача не выполнялась | `@fq.task` с непустым `retry_on` регистрирует задачу во flexiq с `retry_on + [CompleterError]`. Тем же дополненным списком пользуется `retry_verdict`, пустой список («повторять всё») не меняется. `dont_retry_on` пользователя сильнее: класс из него, покрывающий `CompleterError`, оставляет прежнее поведение |
-| По `SIGTERM` воркер ждёт выполняющиеся джобы не дольше `drain_timeout`, затем останавливает (не закрывая) event loop исполнителя и выходит из `run_worker`; недоработавшие корутины остаются в этом loop | Completer и relay остались в остановленном loop, lease недоработавших Items не отпущены | После `run_worker` приложение вызывает `asyncio.run(th.aclose())`: закрытие докручивает loop исполнителя, досылает буфер и возвращает удержанные Items в outbox (§11.1). Недоработавшая корутина на finish получит `ClosedError`; адаптер добавляет его к непустому `retry_on` наравне с `CompleterError` |
+| По `SIGTERM` воркер ждёт выполняющиеся джобы не дольше `drain_timeout`, затем останавливает (не закрывая) event loop исполнителя и выходит из `run_worker`; недоработавшие корутины остаются в этом loop. Но если заняты все слоты `async_concurrency`, `run_worker` по истечении `drain_timeout` не возвращается, пока не завершится хотя бы одна джоба (flexiq 2.0.0, эксперимент Fix-11: 8 задач при `async_concurrency=8`) | Completer и relay остались в loop исполнителя — остановленном или ещё работающем; lease недоработавших Items не отпущены | После `run_worker` приложение вызывает `asyncio.run(th.aclose())`: закрытие досылает буфер и возвращает удержанные Items в outbox в loop исполнителя (§11.1). Чтобы остановка была ограничена по времени, `run_worker` запускают в потоке: главный поток по сигналу вызывает `queue.shutdown()`, ждёт `drain_timeout`, закрывает установку и, если flexiq так и не вернул управление, завершает процесс сам. Недоработавшая корутина на finish получит `ClosedError`; адаптер добавляет его к непустому `retry_on` наравне с `CompleterError` |
 | `retry_dead`, `replay` и авто-ретраи DLQ создают **новый** job id; kwargs (и `_th`) переносятся, `metadata` пользователя — нет (`retry_dead` добавляет служебные ключи, `replay` заменяет) | Повтор из UI flexiq исполнит Item повторно | Claim видит, что Item терминальный, → no-op. Перезапуск упавших — только `handle.retry_failed()` |
 | Встроенные `group/chord` — оркестрация в потоке вызывающего без записи в хранилище; `Workflow` — статичный DAG без добавления детей в работающий граф; прогресса группы нет | — | Не конфликтуем: tallyho закрывает то, чего во flexiq нет |
 | Проект молодой: 7 месяцев, 2 мажорные версии за 3 недели, ~20 звёзд | Риск ломающих изменений | Адаптер изолирован, `flexiq>=2.0,<3`, контрактные тесты против каждого релиза flexiq в CI |
