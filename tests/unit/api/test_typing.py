@@ -16,6 +16,8 @@ CASES = ROOT / "tests" / "typing" / "cases.py"
 EXPECTED = "# EXPECTED_NEGATIVE"
 TYPE_IGNORE = "  # type:" + " ignore"
 ERROR_LINE = re.compile(r"negative_cases\.py:(?P<line>\d+)(?::\d+)?:.*error", re.IGNORECASE)
+# С FORCE_COLOR checker раскрашивает вывод, и цветовые коды разрывают «файл:строка».
+ANSI = re.compile(r"\x1b\[[0-9;]*m")
 
 
 def negative_source() -> tuple[str, set[int]]:
@@ -47,7 +49,7 @@ def test_negative_calls_fail_on_exact_lines(tmp_path: Path, module: str) -> None
         capture_output=True,
         text=True,
     )
-    output = result.stdout + result.stderr
+    output = ANSI.sub("", result.stdout + result.stderr)
     found = {int(match["line"]) for match in ERROR_LINE.finditer(output)}
     assert result.returncode == 1, output
     assert found == expected, output
