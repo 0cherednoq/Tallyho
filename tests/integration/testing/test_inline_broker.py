@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import itertools
 from collections import Counter
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
 import pytest
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from tallyho import Tallyho, callback, item
 from tallyho.model.errors import ClosedError
@@ -345,15 +347,27 @@ async def test_pytest_fixture_is_installed_and_ready(tallyho_env: TallyhoTestEnv
     assert (await batch.handle.view()).state is BatchState.SUCCEEDED
 
 
+async def seal_empty(th: Tallyho, engine: AsyncEngine, schema: str, *, key: str) -> BatchHandle:
+    """Пустой батч в транзакции сессии: финализация после seal стартует строго после COMMIT."""
+    scoped = engine.execution_options(schema_translate_map={None: schema})
+    async with AsyncSession(scoped) as session:
+        async with th.batch("empty-after-commit", key=key, session=session) as batch:
+            pass
+        await session.commit()
+    return batch.handle
+
+
 async def test_env_close_closes_the_whole_installation(tallyho_env: TallyhoTestEnv) -> None:
-    async with tallyho_env.th.batch("fixture-close", key="empty") as batch:
-        pass  # финализация пустого батча идёт в фоне
+    # Финализация пустого батча идёт в фоне: закрытие должно её дождаться.
+    handle = await seal_empty(
+        tallyho_env.th, tallyho_env.engine, tallyho_env.schema or "", key="env"
+    )
 
     await tallyho_env.close()
 
     # Фоновых задач не осталось: удалять схему теста после этого безопасно.
     assert library_tasks() == []
-    assert (await batch.handle.view()).state is BatchState.SUCCEEDED
+    assert (await handle.view()).state is BatchState.SUCCEEDED
     with pytest.raises(ClosedError):
         _ = await tallyho_env.run_maintenance_once()
 
@@ -372,11 +386,12 @@ async def test_broker_close_stops_only_the_worker(engine: AsyncEngine, schema: s
         await broker.close()
 
         # Воркер остановлен, но установка открыта: продюсер и финализация работают.
-        async with th.batch("inline-broker-close", key="two") as second:
-            pass
-        assert (await second.handle.wait(timeout=timedelta(seconds=10))).state is (
-            BatchState.SUCCEEDED
-        )
+        second = await seal_empty(th, engine, schema, key="broker")
+        async with asyncio.timeout(10):
+            for _ in itertools.count():
+                if (await second.view()).state is BatchState.SUCCEEDED:
+                    break
+                await asyncio.sleep(0.02)
         assert (await batch.handle.view()).state is BatchState.SUCCEEDED
 
 

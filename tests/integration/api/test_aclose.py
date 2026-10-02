@@ -29,6 +29,7 @@ if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Callable
     from uuid import UUID
 
+    from tallyho import BatchHandle
     from tallyho.model.views import BatchSummary
     from tests.integration.engine.conftest import Env
 
@@ -50,6 +51,20 @@ async def eventually(condition: Callable[[], bool], *, deadline: float = 10.0) -
             if condition():
                 return
             await asyncio.sleep(0.01)
+
+
+async def create_empty(th: Tallyho, env: Env, kind: str) -> BatchHandle:
+    """Пустой батч в транзакции сессии: after-commit действия идут строго после COMMIT.
+
+    В собственной транзакции ``th.batch`` они срабатывают перед отправкой COMMIT, и
+    финализация после seal может не увидеть батч — тогда её выполняет sweeper.
+    """
+    scoped = env.engine.execution_options(schema_translate_map={None: env.schema})
+    async with AsyncSession(scoped) as session:
+        async with th.batch(kind=kind, key="one", session=session) as batch:
+            pass
+        await session.commit()
+    return batch.handle
 
 
 async def outbox_items(env: Env) -> list[UUID]:
@@ -103,8 +118,7 @@ async def test_aclose_leaves_no_library_tasks_and_returns_held_items(
     _ = await asyncio.wait_for(started.wait(), timeout=10)
     maintenance = asyncio.create_task(th.maintenance().run())
     await eventually(lambda: "tallyho-relay" in library_tasks())
-    async with th.batch(kind="closing-empty", key="one") as empty:
-        pass
+    empty = await create_empty(th, env, "closing-empty")
     assert await env.count(env.tables.lease) == 2
     assert await outbox_items(env) == []
     before = set(library_tasks())
@@ -121,7 +135,7 @@ async def test_aclose_leaves_no_library_tasks_and_returns_held_items(
     assert set(attempts.values()) == {0}
     # Финализация, начатая до закрытия, доведена до конца вместе с хуком.
     assert hook_states == [BatchState.SUCCEEDED]
-    assert (await empty.handle.view()).state is BatchState.SUCCEEDED
+    assert (await empty.view()).state is BatchState.SUCCEEDED
     # Maintenance получил просьбу остановиться; дожидается его тот, кто запустил.
     await asyncio.wait_for(maintenance, timeout=10)
 
@@ -209,8 +223,7 @@ async def test_aclose_cancels_work_that_misses_close_timeout(
         entered.set()
         _ = await asyncio.Event().wait()
 
-    async with th.batch(kind="stuck", key="hook") as stuck:
-        pass
+    stuck = await create_empty(th, env, "stuck")
     _ = await asyncio.wait_for(entered.wait(), timeout=10)
     async with th.batch(kind="mail", key="dispatch") as mail:
         await mail.add(quick, 1)
@@ -227,7 +240,7 @@ async def test_aclose_cancels_work_that_misses_close_timeout(
     assert "tallyho-api-finalize" in caplog.text
     assert "relay: цикл не остановился" in caplog.text
     # Ничего не потеряно: батч остался sealed, запись — в outbox; их подберут sweeper и scan.
-    assert (await stuck.handle.view()).state is BatchState.SEALED
+    assert (await stuck.view()).state is BatchState.SEALED
     assert len(await outbox_items(env)) == 1
     assert dispatcher.messages == []
 
@@ -253,7 +266,8 @@ async def test_aclose_from_another_loop_closes_worker_parts_in_their_loop(
     try:
         await worker.run(work())
         assert await env.count(env.tables.lease) == 1
-        assert "tallyho-completer" in library_tasks(worker.loop)
+        # Финализация после seal дочитала БД: loop воркера останавливают не посреди запроса.
+        await eventually(lambda: library_tasks(worker.loop) == ["tallyho-completer"])
         if stopped:
             worker.stop()
 
