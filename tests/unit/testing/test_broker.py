@@ -10,7 +10,7 @@ import pytest
 
 from tallyho.model.errors import ConfigurationError
 from tallyho.model.states import OutboxKind
-from tallyho.protocols.broker import Dispatcher, Message, Runtime, Verdict
+from tallyho.protocols.broker import Dispatcher, Message, RetryLimits, Runtime, Verdict
 from tallyho.protocols.serialization import PayloadCodec
 from tallyho.testing import InlineBroker
 
@@ -54,6 +54,18 @@ def test_task_name_rejects_collision() -> None:
 def test_inline_broker_rejects_invalid_duplicate_rate(rate: object) -> None:
     with pytest.raises(ConfigurationError, match="duplicate_delivery_rate"):
         _ = InlineBroker(duplicate_delivery_rate=cast("float", rate))
+
+
+def test_inline_broker_exposes_default_retry_limit() -> None:
+    assert isinstance(InlineBroker(), RetryLimits)
+    assert InlineBroker().max_retries("any.task") == 0
+    assert InlineBroker(max_retries=2).max_retries("any.task") == 2
+
+
+@pytest.mark.parametrize("value", [-1, True, 1.5, "3"])
+def test_inline_broker_rejects_invalid_default_retries(value: object) -> None:
+    with pytest.raises(ConfigurationError, match="max_retries"):
+        _ = InlineBroker(max_retries=cast("int", value))
 
 
 def test_inline_broker_requires_install_for_runtime_operations() -> None:

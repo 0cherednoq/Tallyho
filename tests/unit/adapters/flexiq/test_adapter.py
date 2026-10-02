@@ -15,7 +15,7 @@ from tallyho.adapters.flexiq import FlexiqAdapter
 from tallyho.engine import RuntimeServices
 from tallyho.model.errors import ConfigurationError, TallyhoError, UnsupportedOption
 from tallyho.model.states import OutboxKind
-from tallyho.protocols.broker import Dispatcher, Message, Runtime, Verdict
+from tallyho.protocols.broker import Dispatcher, Message, RetryLimits, Runtime, Verdict
 from tallyho.protocols.serialization import PayloadCodec
 from tallyho.runtime.tracked import TaskRuntime, bind_runtime
 
@@ -260,6 +260,18 @@ def test_adapter_satisfies_protocols_and_registers_task_options() -> None:
     assert isinstance(adapter, PayloadCodec)
     assert adapter.task_name(task) == "custom.echo"
     assert queue.task_options == [options]
+
+
+def test_retry_limits_expose_decorator_default_to_sweeper() -> None:
+    adapter, _queue = _adapter()
+    explicit = adapter.task(name="custom.explicit", max_retries=7)(_echo)
+    implicit = adapter.task(name="custom.implicit")(_echo)
+
+    assert isinstance(adapter, RetryLimits)
+    assert adapter.max_retries(adapter.task_name(explicit)) == 7
+    # Без max_retries в декораторе flexiq берёт своё умолчание задачи — 3.
+    assert adapter.max_retries(adapter.task_name(implicit)) == 3
+    assert adapter.max_retries("custom.unknown") == 0
 
 
 async def test_dispatch_maps_options_markers_and_user_keys_exactly() -> None:

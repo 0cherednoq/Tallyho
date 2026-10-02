@@ -69,12 +69,6 @@ class _Defect:
         )
 
 
-# Sweeper читает max_retries только из опций вызова. Если задача объявлена как
-# `@fq.task(max_retries=3)`, а вызов идёт без `.opts(max_retries=...)`, первый же истёкший
-# lease даёт error("lease_expired") вместо повтора.
-_SWEEPER_RETRIES = _Defect(
-    "Fix-5", "sweeper не видит max_retries декоратора: lease_expired без повтора", strict=True
-)
 # Джоба упала на claim, пока PostgreSQL недоступен, и ушла в DLQ; обработчик JOB_DEAD тоже
 # не смог записать итог, а `reconcile_dead` движок не вызывает. Item остаётся active без
 # lease и outbox, батч не финализируется.
@@ -106,10 +100,8 @@ _INVARIANT_DEFECTS: Mapping[str, _Defect] = {
     "A-CH-10": _DUPLICATE_ORPHAN,
     "A-CH-12": _DEAD_JOB_ORPHAN,
 }
-# Невыполненные ожидания A-CH. В S1 max_retries задан только в декораторе задачи.
-_EXPECTATION_DEFECTS: Mapping[tuple[str, str], _Defect] = {
-    ("A-CH-01", "S1"): _SWEEPER_RETRIES,
-}
+# Невыполненные ожидания A-CH: известных дефектов нет.
+_EXPECTATION_DEFECTS: Mapping[tuple[str, str], _Defect] = {}
 
 
 def _cases(defect_of: Mapping[tuple[str, str], _Defect]) -> list[ParameterSet]:

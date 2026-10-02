@@ -27,6 +27,7 @@ from tallyho.protocols.broker import (
     CancellationClassifier,
     DeadLetters,
     Dispatcher,
+    RetryLimits,
     Runtime,
     Verdict,
     WorkerServices,
@@ -223,7 +224,7 @@ class _Prepared:
 
 @final
 class FlexiqAdapter(
-    Dispatcher, Runtime, PayloadCodec, CallOptionsValidator, CancellationClassifier
+    Dispatcher, Runtime, PayloadCodec, CallOptionsValidator, CancellationClassifier, RetryLimits
 ):
     """Двусторонний адаптер одной пользовательской ``flexiq.Queue``."""
 
@@ -327,6 +328,16 @@ class FlexiqAdapter(
             _ = validate_and_encode_notes(notes)
         except Exception as exc:
             raise ConfigurationError(_BAD_OPTIONS) from exc
+
+    @override
+    def max_retries(self, task_name: str) -> int:
+        """Отдать sweeper-у ``max_retries`` декоратора задачи (D-012).
+
+        Returns:
+            Лимит из ``@fq.task``; 0 для задачи, не зарегистрированной здесь.
+        """
+        config = self._tasks.get(task_name)
+        return 0 if config is None else config.max_retries
 
     @override
     def is_cancelled(self, exc: BaseException) -> bool:
