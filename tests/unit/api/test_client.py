@@ -142,6 +142,28 @@ def test_install_assembles_services_once_and_requires_it_for_maintenance() -> No
         client.install(adapter)
 
 
+async def test_install_without_broker_serves_maintenance_but_not_producer() -> None:
+    client = _client()
+    client.install(None)
+
+    assert client.maintenance() is client.maintenance()
+    with pytest.raises(ConfigurationError, match="install"):
+        _ = client.batch("kind")
+    with pytest.raises(ConfigurationError, match="install"):
+        _ = client.call(sample_task, 1, mode="strict")
+    with pytest.raises(ConfigurationError, match="уже установлен"):
+        client.install(Adapter())
+    await client.aclose()
+
+
+async def test_aclose_without_started_relay_is_idempotent() -> None:
+    client = _client()
+    await client.aclose()
+    client.install(Adapter())
+    await client.aclose()
+    await client.aclose()
+
+
 async def sample_task(value: int, *, mode: str) -> str:
     """Сигнатура задачи для runtime-проверки ``Tallyho.call``."""
     await asyncio.sleep(0)

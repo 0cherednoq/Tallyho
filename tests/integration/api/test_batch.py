@@ -16,7 +16,7 @@ from tallyho.model.states import BatchState
 from tallyho.protocols.broker import Dispatcher
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Sequence
+    from collections.abc import AsyncGenerator, Callable, Sequence
 
     from tallyho import BatchBuilder, BatchHandle
     from tallyho.model.views import BatchSummary
@@ -64,21 +64,29 @@ async def fail_after_add(builder: BatchBuilder) -> None:
 
 
 async def settle() -> None:
-    """Дождаться фоновых задач библиотеки, чтобы они не пересеклись с удалением схемы."""
-    own = [task for task in asyncio.all_tasks() if task.get_name().startswith("tallyho-")]
+    """Дождаться разовых фоновых задач библиотеки, чтобы они не пересеклись с удалением схемы.
+
+    Цикл relay живёт до ``aclose`` — его останавливает фикстура ``th``.
+    """
+    own = [
+        task
+        for task in asyncio.all_tasks()
+        if task.get_name().startswith("tallyho-") and task.get_name() != "tallyho-relay"
+    ]
     _ = await asyncio.gather(*own, return_exceptions=True)
 
 
-def client(env: Env) -> Tallyho:
-    """Установленный публичный клиент над схемой теста."""
+@pytest.fixture
+async def th(env: Env) -> AsyncGenerator[Tallyho]:
+    """Установленный публичный клиент над схемой теста; relay остановлен до DROP SCHEMA."""
     value = Tallyho(env.engine, schema=env.schema)
     value.install(FakeBroker())
-    return value
+    yield value
+    await value.aclose()
 
 
-async def test_schedule_example_builds_and_seals_pipeline(env: Env) -> None:
+async def test_schedule_example_builds_and_seals_pipeline(th: Tallyho) -> None:
     """§12.4: root и feeder закрыты, зависимый этап остаётся open."""
-    th = client(env)
     at = datetime(2030, 1, 2, tzinfo=UTC)
 
     async with th.batch(kind="campaign_deliveries", key="campaign:7", start_at=at) as root:
@@ -97,9 +105,8 @@ async def test_schedule_example_builds_and_seals_pipeline(env: Env) -> None:
     assert (await root.handle.child("send")).id == view.children["send"].id
 
 
-async def test_start_import_example_builds_three_stages(env: Env) -> None:
+async def test_start_import_example_builds_three_stages(th: Tallyho) -> None:
     """§13.2: цепочка pages → cards → pdfs создаётся одним context manager."""
-    th = client(env)
 
     async with th.batch(kind="catalog_parse", key="catalog:12", max_items=200_000) as root:
         pages = root.sub_batch("pages", max_depth=1)
@@ -114,9 +121,8 @@ async def test_start_import_example_builds_three_stages(env: Env) -> None:
     assert view.children["pdfs"].state is BatchState.OPEN
 
 
-async def test_own_transaction_rolls_back_on_exception(env: Env) -> None:
+async def test_own_transaction_rolls_back_on_exception(th: Tallyho) -> None:
     """Без session исключение откатывает всё дерево."""
-    th = client(env)
     builder = th.batch(kind="rollback", key="own")
 
     with pytest.raises(ScenarioFailedError):
@@ -126,9 +132,10 @@ async def test_own_transaction_rolls_back_on_exception(env: Env) -> None:
         _ = await builder.handle.view()
 
 
-async def test_external_transaction_keeps_writes_but_does_not_seal_on_exception(env: Env) -> None:
+async def test_external_transaction_keeps_writes_but_does_not_seal_on_exception(
+    env: Env, th: Tallyho
+) -> None:
     """С чужой session rollback/commit решает пользователь; API не дописывает seal."""
-    th = client(env)
     scoped = env.engine.execution_options(schema_translate_map={None: env.schema})
     async with AsyncSession(scoped) as session:
         builder = th.batch(kind="external", key="kept", session=session)
@@ -141,10 +148,12 @@ async def test_external_transaction_keeps_writes_but_does_not_seal_on_exception(
     assert view.progress.found == 1
 
 
-async def test_handle_mutations_use_own_or_external_transaction(env: Env) -> None:
+async def test_handle_mutations_use_own_or_external_transaction(th: Tallyho) -> None:
     """Handle делегирует pause/resume/reschedule публичному engine-фасаду."""
-    th = client(env)
-    async with th.batch(kind="operations", key="one") as root:
+    # Старт отложен: relay после commit ещё не может отправить Item, и число
+    # перенесённых записей не зависит от фоновой отправки.
+    later = datetime.now(UTC) + timedelta(minutes=30)
+    async with th.batch(kind="operations", key="one", start_at=later) as root:
         await root.add(parse_page, "url", page=1)
 
     handle: BatchHandle = th.handle(root.handle.id)
@@ -156,9 +165,8 @@ async def test_handle_mutations_use_own_or_external_transaction(env: Env) -> Non
     assert moved == 0
 
 
-async def test_empty_batch_is_finalized_immediately_after_commit(env: Env) -> None:
+async def test_empty_batch_is_finalized_immediately_after_commit(th: Tallyho) -> None:
     """Producer seal подталкивает Finalizer, даже если maintenance ещё не запущен."""
-    th = client(env)
     async with th.batch(kind="empty", key="one") as root:
         pass
 
@@ -167,11 +175,12 @@ async def test_empty_batch_is_finalized_immediately_after_commit(env: Env) -> No
     assert view.progress.final
 
 
-async def test_cancel_right_after_seal_never_finalizes_succeeded(env: Env) -> None:
+async def test_cancel_right_after_seal_never_finalizes_succeeded(th: Tallyho) -> None:
     """Fix-9: отмена сразу после выхода из builder гонится с финализацией после seal."""
-    th = client(env)
+    # Старт отложен: relay после commit не отправляет Items, и отмена закрывает их сразу.
+    later = datetime.now(UTC) + timedelta(minutes=30)
     for index in range(8):
-        async with th.batch(kind="cancelled-early", key=f"run:{index}") as root:
+        async with th.batch(kind="cancelled-early", key=f"run:{index}", start_at=later) as root:
             for page in range(4):
                 await root.add(parse_page, "url", page=page)
         await root.handle.cancel()
@@ -182,9 +191,8 @@ async def test_cancel_right_after_seal_never_finalizes_succeeded(env: Env) -> No
     await settle()
 
 
-async def test_cancel_during_finalization_hook_finalizes_cancelled(env: Env) -> None:
+async def test_cancel_during_finalization_hook_finalizes_cancelled(th: Tallyho) -> None:
     """Отмена, закоммиченная во время хука, определяет итог: хук вызывается заново."""
-    th = client(env)
     entered = asyncio.Event()
     release = asyncio.Event()
     seen: list[BatchState] = []

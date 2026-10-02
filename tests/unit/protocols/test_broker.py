@@ -15,6 +15,7 @@ from tallyho.protocols.broker import (
     DeadLetters,
     Dispatcher,
     Message,
+    RelayPolicy,
     RetryLimits,
     Runtime,
     Verdict,
@@ -124,3 +125,5 @@ async def test_runtime_fake_satisfies_protocol() -> None:
 def test_protocols_reject_incomplete_fakes() -> None:
     assert not isinstance(_RecordingDispatcher(), Runtime)
     assert not isinstance(_CountingRuntime(), Dispatcher)
+    # Обычный адаптер политику relay не объявляет: фоновый цикл стартует сам.
+    assert not isinstance(_RecordingDispatcher(), RelayPolicy)

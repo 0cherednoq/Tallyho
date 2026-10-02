@@ -197,6 +197,7 @@ async def _contract(postgres_dsn: str, root: Path) -> AsyncGenerator[FlexiqContr
                 await _stop_worker(extra)
             await _stop_worker(worker)
             log.close()
+            await app.th.aclose()  # relay не должен отправлять через закрытый адаптер
             app.queue.close()
             await app.adapter.close()
             await app.engine.dispose()

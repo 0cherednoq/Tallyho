@@ -131,25 +131,30 @@ flowchart LR
 flowchart TB
     subgraph apiproc["API-процесс"]
         A1["Tallyho client"]
-        A2["Relay fast-path<br/>after_commit kick"]
-        A3["Maintenance в lifespan<br/>Relay scan, Sweeper, Snapshotter"]
+        A2["Relay: fast-path после commit<br/>и страховочный scan"]
+        A3["Maintenance в lifespan<br/>Sweeper, Snapshotter"]
     end
     subgraph wproc["Процесс воркера flexiq (N штук)"]
         B1["flexiq worker, pool=thread"]
         B2["th.tracked обёртка"]
         B3["Completer<br/>в async-loop flexiq"]
-        B4["Relay fast-path"]
+        B4["Relay: fast-path и scan"]
         B5["Finalizer + tx-хуки"]
     end
     subgraph opt["Альтернатива"]
-        C1["tallyho maintenance<br/>отдельный процесс"]
+        C1["tallyho maintenance<br/>отдельный процесс без брокера"]
     end
     B1 --> B2 --> B3 --> B5
     A3 -.-|"leader election<br/>pg_try_advisory_lock"| C1
 ```
 
-* **Relay fast-path** работает в каждом процессе: сразу после commit отправляет то, что этот процесс только что записал.
-* **Maintenance** (relay scan, sweeper, снимки прогресса) работает в одном экземпляре-лидере. Лидер выбирается через advisory lock. Relay scan безопасен и в нескольких экземплярах (`SKIP LOCKED`).
+* **Relay** работает в каждом процессе, где установлен адаптер брокера (`th.install(adapter)`). Это один фоновый цикл на процесс с двумя входами:
+  * **fast-path** — сразу после commit отправляет то, что этот процесс только что записал (`kick`), не дожидаясь `relay_grace`;
+  * **страховочный scan** — раз в `sweep_interval` отправляет все записи старше `relay_grace`: потерянный `kick`, записи упавшего процесса, отложенный старт, возврат после `relay_claim_ttl`.
+
+  Цикл стартует лениво, в event loop первого `kick` (как Completer), и сразу — при запуске `th.maintenance().run()` в этом процессе (тогда первый scan выполняется немедленно). Scan **не привязан к лидерству** maintenance: захват записей идёт через `FOR UPDATE SKIP LOCKED`, поэтому несколько процессов не отправляют одну запись дважды. Цикл останавливает `await th.aclose()`; выход из `th.maintenance().run()` тоже останавливает его, следующий `kick` запустит цикл заново.
+* **Процесс без адаптера** (`th.install(None)`, CLI `tallyho maintenance`) relay не создаёт: outbox не захватывает и ничего не отправляет. Sweeper, Finalizer и Snapshotter в нём работают; записи, которые они кладут в outbox (повтор Item, колбэк финализации), отправит scan любого процесса с адаптером.
+* **Maintenance** (sweeper, снимки прогресса) работает в одном экземпляре-лидере. Лидер выбирается через advisory lock; лидером может быть и процесс без адаптера.
 * **Finalizer** работает там, где завершился последний Item (воркер), либо в sweeper'е. Поэтому **модули с tx-хуками должны импортироваться и в воркерах, и в maintenance**: `Tallyho(..., hook_modules=[...])` импортирует их при инициализации (§7.5).
 * **Completer** живёт в event loop исполнителя async-задач flexiq и создаётся лениво при первой задаче.
 
@@ -203,6 +208,7 @@ classDiagram
         +on_progress(kind, every) decorator
         +on_policy_breach(kind) decorator
         +maintenance() Maintenance
+        +aclose() None
     }
     class BatchBuilder {
         +add(fn, *args, **kwargs) None
@@ -290,6 +296,9 @@ classDiagram
     class Relay {
         +kick(batch_ids) None
         +scan_once() int
+        +start(scan_now) None
+        +stop() None
+        +close() None
     }
     class Sweeper {
         +expire_leases() int
@@ -349,6 +358,7 @@ UUIDv7 генерируем сами (≈30 строк). В Python 3.14+ исп�
 |---|---|---|
 | `Dispatcher`, `Runtime`, `PayloadCodec` | адаптер брокера | отправка; обёртка исполнения, вердикт ретрая, сверка с DLQ по курсору (§11.3); кодек payload Items (без своего кодека — `SerializerCodec` поверх `Serializer`) |
 | `RetryLimits` | адаптер брокера (необязательно) | умолчание `max_retries` задачи по её имени — для sweeper, когда у вызова нет своей опции (UC-15) |
+| `RelayPolicy` | тестовый брокер | `relay_autostart = False`: relay не запускает фоновый цикл по `kick`, его проходы вызывает сам адаптер (`InlineBroker.step/drain`); так тест остаётся детерминированным |
 | Tx-хуки `on_finalized / on_progress / on_policy_breach` | пользователь | перенос итога и прогресса в доменные таблицы (§7) |
 | `Serializer` | пользователь (есть json/msgspec) | аргументы задач, `result` Item |
 | `Observer` | пользователь | метрики, OpenTelemetry, логи — вне транзакций, fire-and-forget |
@@ -660,6 +670,7 @@ stateDiagram-v2
 At-least-once отправка. Дубль в брокере отсекает claim по `th_lease` и состоянию Item.
 
 Запись outbox появляется повторно, когда Item возвращается в очередь: lease истёк (sweeper), воркер останавливается (`close(requeue_held=True)`), батч на паузе при claim, а также при `release` по вердикту `RETRY`, если за время выполнения брокеру был подтверждён дубль доставки (`th_lease.redelivered`, UC-04).
+Захватывают записи только процессы с адаптером брокера (§3.2): fast-path — записи батчей из `kick`, scan — все записи старше `relay_grace`. Параллельные проходы разных процессов расходятся по `SKIP LOCKED`, а захваченная запись невидима остальным до `relay_claim_ttl`.
 
 ---
 
@@ -1423,7 +1434,7 @@ ratio_корня = Σ w_done_детей / Σ ожидаемый w_total_дете
 
 | Отказ | Защита | Время восстановления |
 |---|---|---|
-| Падение между commit и dispatch | Outbox + relay scan | `relay_grace` (5 с) |
+| Падение между commit и dispatch | Outbox + relay scan в любом процессе с адаптером | `relay_grace` + `sweep_interval` (до 10 с) |
 | Брокер доставил дважды | claim через `th_lease` + CAS state | мгновенно |
 | Дубль закрыл джобу брокера при живом lease, а исходное выполнение упало с вердиктом RETRY | claim помечает `th_lease.redelivered`, `release` возвращает Item в outbox (UC-04) | мгновенно (kick relay) / `relay_grace` |
 | PostgreSQL недоступен при claim, release или finish | операция бросает `CompleterError`; адаптер flexiq добавляет её в `retry_on` задачи, поэтому джоба уходит в ретрай брокера, а не сразу в DLQ (§11.3) | как у брокера; незавершённый lease — `lease_ttl` |
@@ -1442,7 +1453,7 @@ ratio_корня = Σ w_done_детей / Σ ожидаемый w_total_дете
 | Дубликат при spawn | `ON CONFLICT DO NOTHING RETURNING` до счётчиков, `duplicates += n` | — |
 | Бесконечное разрастание (циклические ссылки, ошибка парсера) | `max_items` на дерево, `max_depth` на самоподпитку → `skipped_by_limit` | — |
 | Часы воркеров расходятся | все сроки (`lease_until`, `start_at`, `deadline_at`, `available_at`, retention) считаются по `now()` БД, а не по локальным часам процесса | — |
-| Колбэк не отправлен | outbox, вставлен в той же tx, что и CAS | `relay_grace` |
+| Колбэк не отправлен | outbox, вставлен в той же tx, что и CAS | `relay_grace` + `sweep_interval` |
 | Дрейф счётчика | reconcile по `count(*)` | цикл sweeper'а |
 | Дедлок | глобальный порядок блокировок + retry `40P01` | мгновенно |
 | Чужая блокировка | `lock_timeout` + retry с backoff | ≤ 5 с |
@@ -1470,6 +1481,10 @@ async def my_task(x: int) -> None: ...
 
 await th.migrate()  # или ревизии Alembic: upgrade(..., version=1), затем version=2, 3 и 4
 ```
+
+`th.install(adapter)` запускает в процессе relay (§3.2): отправка после commit не требует отдельного процесса maintenance. `th.install(None)` — установка без брокера для процессов обслуживания и чтения (CLI): `th.batch` и `th.call` в ней бросают `ConfigurationError`, relay не создаётся, `th.maintenance()` выполняет sweeper, финализацию и снимки.
+
+`await th.aclose()` останавливает фоновый цикл relay и дожидается его; вызывается при остановке процесса в том же event loop. После `aclose` `kick` только копит id — их отправит scan другого процесса.
 
 ### 11.2 Сводка
 
@@ -2558,7 +2573,7 @@ xychart-beta
 | `completer_tick` / `completer_max_batch` | 20 мс / 500 | задержка возврата результата задачи брокеру |
 | `completer_backpressure` | 10 000 | как у River |
 | `lease_ttl` / `heartbeat_every` | 60 с / 20 с | |
-| `relay_grace` / `relay_claim_ttl` | 5 с / 30 с | |
+| `relay_grace` / `relay_claim_ttl` | 5 с / 30 с | возраст записи для страховочного scan / срок захвата записи |
 | `finalize_grace` | 30 с | |
 | `hook_timeout` | 10 с | `statement_timeout` + `asyncio.timeout` |
 | `hook_backoff` | 1 с → 5 мин, экспонента | повтор упавшего `on_finalized` |
@@ -2566,7 +2581,7 @@ xychart-beta
 | `estimate_min_basis` / `estimate_min_share` | 20 / 5% | минимальная выборка родителей для оценки итога |
 | `eta_window` | 60 с | окно скользящего среднего скорости |
 | `max_items` | `None` | лимит на дерево, задаётся на корне |
-| `sweep_interval` | 5 с | |
+| `sweep_interval` | 5 с | период sweeper у лидера и страховочного scan relay в каждом процессе с адаптером |
 | `lock_timeout` | 5 с | retry на `55P03/40P01/40001` |
 | `retention` | 14 дней | `None` — вечно; учитывает `release_required` |
 | `watch_throttle` | 500 мс | NOTIFY не чаще на батч |
@@ -2600,9 +2615,9 @@ xychart-beta
 | Очередь результатов `th.results.take(session=)` и хук `on_terminal_items` | нужно видеть инфраструктурные исходы Items в домене, пока батч ещё идёт | рецепт финального экспорта (§12.9) |
 
 CLI v1 предоставляет `migrate`, отдельный процесс `maintenance` и read-only
-`inspect` дерева. CLI maintenance не подтверждает outbox без явно установленного
-broker-процесса: recovery, финализация и tx-хуки продолжают работать, а сообщения
-остаются для relay процесса с настоящим адаптером.
+`inspect` дерева. CLI работает без брокера (`th.install(None)`): relay в нём нет,
+outbox он не захватывает; recovery, финализация и tx-хуки продолжают работать, а
+сообщения отправляет relay любого процесса с настоящим адаптером (§3.2).
 
 OpenTelemetry поставляется отдельным верхнеуровневым пакетом
 `tallyho.observability` (extra `otel`): он реализует `Observer`, не участвует в

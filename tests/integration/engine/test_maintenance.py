@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import itertools
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import timedelta
 from time import monotonic
 from typing import TYPE_CHECKING
@@ -42,6 +42,15 @@ __all__: list[str] = []
 class RecordingRelay:
     events: list[str]
     calls: int = 0
+    starts: list[bool] = field(default_factory=list[bool])
+    stops: int = 0
+
+    def start(self, *, scan_now: bool = False) -> None:
+        self.starts.append(scan_now)
+
+    async def stop(self) -> None:
+        await asyncio.sleep(0)
+        self.stops += 1
 
     async def scan_once(self) -> int:
         self.events.append("relay")
@@ -72,18 +81,18 @@ class RecordingSnapshotter:
 
 
 @dataclass
-class FlakyRelay:
+class FlakySweeper:
     subject: Maintenance | None = None
     calls: int = 0
 
-    async def scan_once(self) -> int:
+    async def sweep(self) -> SweepResult:
         self.calls += 1
         if self.calls == 1:
-            message = "synthetic relay failure"
+            message = "synthetic sweeper failure"
             raise RuntimeError(message)
         assert self.subject is not None
         self.subject.stop()
-        return 0
+        return SweepResult()
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,7 +103,8 @@ class Services:
 
     @property
     def calls(self) -> int:
-        return self.relay.calls + self.sweeper.calls + self.snapshotter.calls
+        """Сколько раз работали сервисы лидера; relay к лидерству не привязан."""
+        return self.sweeper.calls + self.snapshotter.calls
 
 
 def services() -> Services:
@@ -168,6 +178,10 @@ async def test_exactly_one_leader_and_second_takes_over_after_backend_loss(env: 
         )
         await eventually(lambda: leader_services.calls > 0)
         assert loser_services.calls == 0
+        # Relay запущен в обоих процессах: страховочный scan не ждёт лидерства.
+        assert first_services.relay.starts == [True]
+        assert second_services.relay.starts == [True]
+        assert first_services.relay.calls == second_services.relay.calls == 0
         backend_pid = leader.leader_backend_pid
         assert backend_pid is not None
 
@@ -192,9 +206,12 @@ async def test_graceful_stop_unlocks_pooled_leader_connection(env: Env) -> None:
     first_task = asyncio.create_task(first.run())
     await eventually(lambda: first.is_leader)
     await eventually(lambda: first_services.snapshotter.calls >= 3)
-    assert first_services.relay.calls == 1
+    assert first_services.sweeper.calls == 1
+    assert first_services.relay.starts == [True]
+    assert first_services.relay.stops == 0
     first.stop()
     await first_task
+    assert first_services.relay.stops == 1
 
     second = maintenance(env, second_services, identity=None)
     second_task = asyncio.create_task(second.run())
@@ -207,11 +224,12 @@ async def test_graceful_stop_unlocks_pooled_leader_connection(env: Env) -> None:
 
 async def test_service_failure_relinquishes_and_retries_leadership(env: Env) -> None:
     events: list[str] = []
-    relay = FlakyRelay()
+    sweeper = FlakySweeper()
+    relay = RecordingRelay(events)
     subject = Maintenance(
         engine=schema_engine(env),
         relay=relay,
-        sweeper=RecordingSweeper(events),
+        sweeper=sweeper,
         snapshotter=RecordingSnapshotter(events),
         settings=MaintenanceSettings(
             sweep_interval=timedelta(milliseconds=100),
@@ -219,11 +237,53 @@ async def test_service_failure_relinquishes_and_retries_leadership(env: Env) -> 
         ),
         lock_identity=f"{env.schema}:flaky",
     )
-    relay.subject = subject
+    sweeper.subject = subject
 
     await subject.run()
 
-    assert relay.calls == 2
+    assert sweeper.calls == 2
+    assert relay.starts == [True]
+    assert relay.stops == 1
+
+
+async def test_cancelled_run_still_stops_relay(env: Env) -> None:
+    owned = services()
+    subject = maintenance(env, owned, identity=f"{env.schema}:cancelled")
+    task = asyncio.create_task(subject.run())
+    await eventually(lambda: subject.is_leader)
+
+    _ = task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert owned.relay.stops == 1
+    assert not subject.is_leader
+
+
+async def test_process_without_broker_runs_leader_services_only(env: Env) -> None:
+    events: list[str] = []
+    sweeper = RecordingSweeper(events)
+    snapshotter = RecordingSnapshotter(events)
+    subject = Maintenance(
+        engine=schema_engine(env),
+        sweeper=sweeper,
+        snapshotter=snapshotter,
+        settings=MaintenanceSettings(
+            sweep_interval=timedelta(milliseconds=100),
+            snapshot_tick=timedelta(milliseconds=20),
+        ),
+        lock_identity=f"{env.schema}:no-broker",
+    )
+
+    result = await run_maintenance_once(subject)
+    assert result.relayed == 0
+    assert events == ["sweeper", "snapshotter"]
+
+    task = asyncio.create_task(subject.run())
+    try:
+        await eventually(lambda: sweeper.calls >= 2 and snapshotter.calls >= 3)
+    finally:
+        await stop_all((subject, task))
 
 
 async def test_watch_is_throttled_and_never_loses_final_state(env: Env) -> None:

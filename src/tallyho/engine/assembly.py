@@ -31,6 +31,7 @@ from tallyho.model.errors import ConfigurationError
 from tallyho.model.progress import ProgressSettings
 from tallyho.protocols.broker import (
     CallOptionsValidator,
+    RelayPolicy,
     RetryLimits,
     Runtime,
     RuntimeInstaller,
@@ -179,9 +180,7 @@ class _Facade:
     _finalizer: Finalizer | None = None
     _background: set[asyncio.Task[None]] = field(default_factory=set, init=False)
 
-    def install(  # ruff: ignore[too-many-locals]  # composition root names each service explicitly
-        self, adapter: Dispatcher, worker_factory: WorkerFactory
-    ) -> None:
+    def install(self, adapter: Dispatcher | None, worker_factory: WorkerFactory) -> None:
         value = self.installation
         settings = self.settings
         progress_settings = ProgressSettings(
@@ -197,19 +196,7 @@ class _Facade:
             throttle=settings.watch_throttle,
             clock=self.clock,
         )
-        relay = Relay(
-            engine=value.engine,
-            tables=value.tables,
-            clock=self.clock,
-            dispatcher=adapter,
-            observer=self.observer,
-            settings=RelaySettings(
-                claim_ttl=settings.relay_claim_ttl,
-                grace=settings.relay_grace,
-                slot=slot,
-            ),
-            retry=retry,
-        )
+        relay = self._build_relay(adapter, slot=slot, retry=retry)
         self._relay = relay
         finalizer = Finalizer(
             tables=value.tables,
@@ -239,16 +226,7 @@ class _Facade:
             ),
             observer=self.observer,
         )
-        codec = adapter if isinstance(adapter, PayloadCodec) else SerializerCodec(self.serializer)
-        producer = Producer(
-            tables=value.tables,
-            clock=self.clock,
-            ids=self.ids,
-            codec=codec,
-            hooks=self.hooks,
-            slot=slot,
-            option_validator=adapter if isinstance(adapter, CallOptionsValidator) else None,
-        )
+        producer = self._build_producer(adapter, slot=slot)
         self._producer = producer
         tree_cache = TreeCache()
         completer = Completer(
@@ -311,7 +289,7 @@ class _Facade:
             clock=self.clock,
             finalizer=finalizer,
             relay=relay,
-            limits=adapter if isinstance(adapter, RetryLimits) else None,
+            limits=self._retry_limits(adapter),
             settings=SweeperSettings(
                 slot=slot,
                 finalize_grace=settings.finalize_grace,
@@ -339,15 +317,56 @@ class _Facade:
             tree_cache=tree_cache,
         )
 
+    @staticmethod
+    def _retry_limits(adapter: object) -> RetryLimits | None:
+        # Протокол необязателен: без него sweeper считает умолчание задачи равным 0 (UC-15).
+        return adapter if isinstance(adapter, RetryLimits) else None
+
+    def _build_producer(self, adapter: object, *, slot: int) -> Producer:
+        return Producer(
+            tables=self.installation.tables,
+            clock=self.clock,
+            ids=self.ids,
+            codec=adapter
+            if isinstance(adapter, PayloadCodec)
+            else SerializerCodec(self.serializer),
+            hooks=self.hooks,
+            slot=slot,
+            option_validator=adapter if isinstance(adapter, CallOptionsValidator) else None,
+        )
+
+    def _build_relay(
+        self, adapter: Dispatcher | None, *, slot: int, retry: RetryPolicy
+    ) -> Relay | None:
+        # Без адаптера relay нет: процесс не захватывает outbox (ARCHITECTURE §3.2).
+        if adapter is None:
+            return None
+        settings = self.settings
+        return Relay(
+            engine=self.installation.engine,
+            tables=self.installation.tables,
+            clock=self.clock,
+            dispatcher=adapter,
+            observer=self.observer,
+            settings=RelaySettings(
+                claim_ttl=settings.relay_claim_ttl,
+                grace=settings.relay_grace,
+                slot=slot,
+                scan_interval=settings.sweep_interval,
+            ),
+            retry=retry,
+            autostart=adapter.relay_autostart if isinstance(adapter, RelayPolicy) else True,
+        )
+
     def _install_worker(
         self,
-        adapter: Dispatcher,
+        adapter: Dispatcher | None,
         *,
         worker_factory: WorkerFactory,
         completer: Completer,
         tree_cache: TreeCache,
     ) -> None:
-        if not isinstance(adapter, RuntimeInstaller):
+        if adapter is None or not isinstance(adapter, RuntimeInstaller):
             return
         if not isinstance(adapter, Runtime):
             message = "runtime installer должен реализовывать Runtime"
@@ -377,6 +396,12 @@ class _Facade:
             return None
         return await run_maintenance_once(maintenance)
 
+    async def close(self) -> None:
+        # Fix-11 добавит сюда ожидание _background и задач Operations.
+        relay = self._relay
+        if relay is not None:
+            await relay.close()
+
     @asynccontextmanager
     async def writer(
         self, target: AsyncSession | AsyncConnection | None
@@ -403,8 +428,9 @@ class _Facade:
             )
 
     def _notify_commit(self, batch_id: UUID) -> None:
-        relay = self._require(self._relay)
-        relay.kick([batch_id])
+        relay = self._relay
+        if relay is not None:
+            relay.kick([batch_id])
 
     def _notify_retry(self, sqlstate: str) -> None:
         try:

@@ -113,6 +113,7 @@ class AcceptanceApp:
 
     async def close(self) -> None:
         """Close process-local clients."""
+        await self.th.aclose()  # relay не должен отправлять через закрытый адаптер
         self.queue.close()
         await self.adapter.close()
         await self.engine.dispose()
