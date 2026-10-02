@@ -10,15 +10,16 @@ from typing import TYPE_CHECKING, ParamSpec, Protocol, Self, TypeVar, cast, over
 from tallyho.engine.completer import ExpectRequest, FinishResult, SpawnRequest, SubBatchRequest
 from tallyho.engine.producer import SubBatchSpec
 from tallyho.model.calls import TaskCall
-from tallyho.model.errors import ConfigurationError
+from tallyho.model.errors import ConfigurationError, LeaseLostError
 from tallyho.model.states import OnFeederFailed, ResultClass
-from tallyho.storage.tx import after_commit
+from tallyho.storage.tx import after_commit, after_commit_pending, resolve_connection
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Generator, Iterable, Mapping
     from datetime import datetime, timedelta
     from uuid import UUID
 
+    from sqlalchemy.engine import Connection
     from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession
 
     from tallyho.engine.completer import Completer, ItemRef
@@ -46,6 +47,10 @@ U = TypeVar("U")
 V = TypeVar("V")
 
 _NO_CONTEXT = "операция th.item доступна только внутри отслеживаемой задачи"
+_OTHER_TRANSACTION = (
+    "complete_in уже вызван в другой, ещё не завершённой транзакции: "
+    "Item завершается в одной транзакции"
+)
 
 
 class CallFactory(Protocol):
@@ -135,6 +140,15 @@ class RuntimeSubBatch:
             self.context.sub_batches.append(SubBatchRequest(spec=self.spec, calls=self.calls))
 
 
+@dataclass(frozen=True, slots=True, kw_only=True)
+class _Completion:
+    """Запись ``complete_in`` в транзакции пользователя, ещё не закоммиченная."""
+
+    target: AsyncSession | AsyncConnection
+    connection: Connection | None
+    committed: Callable[[], None]
+
+
 @dataclass(slots=True, kw_only=True)
 class ItemContext:
     """Буферы одной попытки пользовательской задачи."""
@@ -148,6 +162,10 @@ class ItemContext:
     progress_done: int | None = None
     progress_total: int | None = None
     completed_in_user_tx: bool = False
+    lease_lost: bool = False
+    """``complete_in`` обнаружил, что попытка больше не владеет Item (UC-08)."""
+    completion: _Completion | None = None
+    """Последняя запись ``complete_in``; в силе, пока её колбэк ждёт commit."""
     cancel_requested: bool = False
     metrics: dict[str, int] = field(default_factory=dict[str, int])
     spawns: list[SpawnRequest] = field(default_factory=list[SpawnRequest])
@@ -313,6 +331,45 @@ class ItemContext:
     ) -> None:
         """Установить ошибочный итог без выбрасывания исключения."""
         self._set_result(ResultClass.ERROR, label, error=detail, mark=mark)
+
+    async def complete_in(self, session: AsyncSession | AsyncConnection) -> None:
+        """Атомарно завершить Item в транзакции пользователя (ARCHITECTURE UC-08).
+
+        Записывает итог и буферы, накопленные к этому моменту, если попытка
+        ещё владеет Item. Повторный вызов после commit и в той же транзакции,
+        пока первая запись в силе, ничего не делает; после отката транзакции
+        или savepoint записывает заново.
+
+        Args:
+            session: Открытая сессия или соединение пользователя.
+
+        Raises:
+            LeaseLostError: Item уже завершён без этой попытки или его lease
+                перехвачен. Ничего не записано; исключение должно выйти из
+                транзакции пользователя, чтобы та откатилась.
+            ConfigurationError: Item уже завершается в другой, ещё открытой
+                транзакции этой же попытки.
+        """
+        if self.completed_in_user_tx:
+            return
+        connection = (await resolve_connection(session)).sync_connection
+        pending = self.completion
+        if pending is not None and await after_commit_pending(pending.target, pending.committed):
+            if pending.connection is not connection:
+                raise ConfigurationError(_OTHER_TRANSACTION)
+            return
+        changed = await self.completer.complete_in(
+            session, self.ref, self.finish_result(), attempt=self.attempt
+        )
+        if not changed:
+            self.lease_lost = True
+            raise LeaseLostError(self.id)
+
+        def committed() -> None:
+            self.completed_in_user_tx = True
+
+        self.completion = _Completion(target=session, connection=connection, committed=committed)
+        await after_commit(session, committed)
 
     def cancelled(self) -> bool:
         """Вернуть запрос кооперативной отмены, замеченный heartbeat.
@@ -541,10 +598,13 @@ class ItemFacade:
             context.error(label, detail=detail, mark=mark)
 
     async def complete_in(self, session: AsyncSession | AsyncConnection) -> None:
-        """Атомарно завершить Item в пользовательской транзакции."""
+        """Делегировать ``complete_in``; вне задачи — no-op.
+
+        Исключения — как у :meth:`ItemContext.complete_in`: ``LeaseLostError``,
+        если попытка больше не владеет Item.
+        """
         if (context := self.current()) is not None:
-            _ = await context.completer.complete_in(session, context.ref, context.finish_result())
-            await after_commit(session, lambda: setattr(context, "completed_in_user_tx", True))
+            await context.complete_in(session)
 
     def cancelled(self) -> bool:
         """Вернуть ``False`` вне задачи или флаг кооперативной отмены.

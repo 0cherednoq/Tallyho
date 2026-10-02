@@ -386,6 +386,86 @@ async def send_email(campaign_id: int, email: str) -> None:
 этому моменту. Если ваша транзакция откатилась, задача остаётся незавершённой и будет повторена
 брокером.
 
+### Если задача потеряла аренду
+
+Задача может пережить свою аренду: зависла дольше `lease_ttl` без продления, батч отменили, после
+сбоя её уже повторяет другой воркер. К моменту `complete_in` итог такой задачи записан без неё
+(`lease_expired`, `cancelled`) или принадлежит другой попытке. Записать вашу строку в этот момент
+значило бы получить доменный эффект у задачи, которая не считается успешной.
+
+Поэтому `complete_in` проверяет, что задача ещё принадлежит этой попытке. Если нет, он ничего не
+записывает и бросает `LeaseLostError`:
+
+* **не ловите её.** Исключение должно выйти из блока транзакции: `async with engine.begin()` и
+  `async with session.begin()` откатят ваши записи сами;
+* это **не ошибка задачи**. Обёртка tallyho не записывает итог, не тратит попытку и возвращает
+  брокеру успех: ни ретрая, ни DLQ не будет. Задачу доведёт тот, кому она теперь принадлежит, или
+  она уже завершена;
+* побочные эффекты вне базы (отправленное письмо) к этому моменту уже случились — как и при любом
+  повторе at-least-once, их идемпотентность остаётся на вас.
+
+<!-- tallyho-example: guide-hooks-lease-lost -->
+```python
+from datetime import UTC, datetime, timedelta
+
+from sqlalchemy import Column, MetaData, String, Table, insert, select
+
+from tallyho import Tallyho, item
+from tallyho.model.states import BatchState
+from tallyho.testing import FakeClock, InlineBroker
+
+app_engine = engine.execution_options(schema_translate_map={None: schema})
+metadata = MetaData()
+deliveries = Table("deliveries", metadata, Column("email", String, primary_key=True))
+async with app_engine.begin() as connection:
+    await connection.run_sync(metadata.create_all)
+
+clock = FakeClock(datetime(2026, 10, 1, 9, tzinfo=UTC))
+broker = InlineBroker()
+th = Tallyho(app_engine, schema=schema, clock=clock, lease_ttl=timedelta(seconds=60))
+th.install(broker.adapter)
+await th.migrate()
+
+reached_the_end: list[str] = []
+
+
+async def send(email: str) -> None:
+    # Задача «зависла» дольше аренды: фоновые проверки завершили её как lease_expired.
+    clock.advance(seconds=61)
+    await th.run_maintenance_once()
+    async with app_engine.begin() as connection:
+        await connection.execute(insert(deliveries).values(email=email))
+        item.ok("sent")
+        await item.complete_in(connection)  # LeaseLostError: транзакция откатывается
+    reached_the_end.append(email)
+
+
+try:
+    async with th.batch("issue", key="2026-10-01") as batch:
+        await batch.add(send, "ada@example.com")
+    await broker.drain()
+
+    view = await batch.handle.wait(timeout=30)
+    assert view.state is BatchState.COMPLETED_WITH_ERRORS
+    assert (view.progress.ok, view.progress.error) == (0, 1)
+    assert view.labels["lease_expired"] == 1  # итог фоновой проверки не изменился
+    assert reached_the_end == []
+    assert broker.dead_letters == ()  # для брокера попытка закончилась успехом
+    async with app_engine.connect() as connection:
+        assert (await connection.execute(select(deliveries))).all() == []  # строки «sent» нет
+finally:
+    await broker.close()
+```
+
+Повторный вызов `complete_in` в той же задаче:
+
+| Когда | Что происходит |
+|---|---|
+| после коммита вашей транзакции | ничего: задача уже завершена |
+| в той же транзакции, пока первая запись в силе | ничего; итог и `spawn`, заданные после первого вызова, не записываются |
+| после отката транзакции или savepoint | итог записывается заново — вместе с вашими новыми записями |
+| в другой транзакции, пока первая открыта | `ConfigurationError`: задача завершается в одной транзакции |
+
 ## Retention и `release()`
 
 Завершённые деревья удаляются фоновыми проверками.

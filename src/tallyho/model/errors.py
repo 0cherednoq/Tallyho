@@ -24,6 +24,7 @@ __all__ = [
     "HookTransactionError",
     "InvalidAttributesError",
     "InvalidStateError",
+    "LeaseLostError",
     "NotFoundError",
     "SealError",
     "SpawnTargetError",
@@ -58,6 +59,26 @@ class CompleterError(TallyhoError):
     Операции этой транзакции не выполнены: задача не подтверждается брокеру,
     и он повторит её по своим правилам. Исходная ошибка — в ``__cause__``.
     """
+
+
+class LeaseLostError(TallyhoError):
+    """Попытка больше не владеет Item: ``complete_in`` ничего не записал (UC-08).
+
+    Пока задача работала, Item завершили без неё (истёк lease, отмена) или его
+    lease перешёл другому исполнителю. Исключение должно выйти из транзакции
+    пользователя, чтобы её доменные записи откатились. Это не ошибка задачи:
+    обёртка ``th.tracked`` завершает попытку без записи итога и без ретрая
+    брокера. Повторять ``complete_in`` бессмысленно — Item к попытке не вернётся.
+    """
+
+    item_id: UUID
+
+    def __init__(self, item_id: UUID) -> None:
+        """Ошибка для Item ``item_id``."""
+        super().__init__(
+            f"попытка больше не владеет Item {item_id}: он уже завершён или lease перехвачен"
+        )
+        self.item_id = item_id
 
 
 class HookTransactionError(TallyhoError):

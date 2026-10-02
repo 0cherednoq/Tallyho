@@ -432,6 +432,8 @@ class _ItemRow:
 class _LeaseRow:
     worker_id: str
     live: bool
+    attempt: int
+    """Попытка Item, для которой взят lease (``th_item.attempt`` на момент claim)."""
     redelivered: bool = False
 
 
@@ -559,15 +561,16 @@ class _Tx:
                 lease.c.item_id,
                 lease.c.worker_id,
                 lease.c.lease_until > self.now,
+                lease.c.attempt,
                 lease.c.redelivered,
             )
             .where(lease.c.item_id == any_(_uuids(ids)))
             .order_by(lease.c.item_id)
             .with_for_update()
         )
-        for item_id, worker_id, live, redelivered in result:
+        for item_id, worker_id, live, attempt, redelivered in result:
             self.leases[item_id] = _LeaseRow(
-                worker_id=worker_id, live=live, redelivered=redelivered
+                worker_id=worker_id, live=live, attempt=attempt, redelivered=redelivered
             )
 
     async def expired(self, item_ids: Iterable[UUID]) -> set[UUID]:
@@ -713,9 +716,11 @@ class _Tx:
         )
         _ = await self.conn.execute(stmt)
         for item_id in item_ids:
-            self.leases[item_id] = _LeaseRow(worker_id=self.c.settings.worker_id, live=True)
-            self._result(item_id, ClaimOutcome.CLAIMED)
             row = self.items[item_id]
+            self.leases[item_id] = _LeaseRow(
+                worker_id=self.c.settings.worker_id, live=True, attempt=row.attempt
+            )
+            self._result(item_id, ClaimOutcome.CLAIMED)
             self.applied.claimed.append((row.batch_id, item_id, row.attempt))
 
     async def mark_redelivered(self, repeated: Iterable[UUID]) -> None:
@@ -838,6 +843,28 @@ class _Tx:
             item_id
             for item_id in item_ids
             if (lease := self.leases.get(item_id)) is not None and lease.worker_id == worker
+        )
+
+    def holds(self, item: ItemRef, attempt: int) -> bool:
+        """Владеет ли попытка ``attempt`` этого процесса активным Item (UC-08).
+
+        Читает строки, заблокированные :meth:`lock_items` и :meth:`lock_leases`:
+        Item ``active``, а lease взят этим процессом для этой попытки. Срок
+        lease не проверяется: истёкший, но никем не перехваченный lease всё
+        ещё принадлежит попытке, а строка Item заблокирована.
+
+        Returns:
+            ``True``, если завершить Item вправе эта попытка.
+        """
+        row = self.items.get(item.id)
+        lease = self.leases.get(item.id)
+        return (
+            row is not None
+            and lease is not None
+            and row.batch_id == item.batch_id
+            and not row.state.is_terminal
+            and lease.worker_id == self.c.settings.worker_id
+            and lease.attempt == attempt
         )
 
     async def release(self, item_ids: Iterable[UUID]) -> None:
@@ -1385,6 +1412,8 @@ class Completer:
         target: AsyncSession | AsyncConnection,
         item: ItemRef,
         value: FinishResult,
+        *,
+        attempt: int | None = None,
     ) -> bool:
         """Завершить Item внутри внешней транзакции пользователя (путь B).
 
@@ -1394,15 +1423,25 @@ class Completer:
         финализацию. Откат транзакции или savepoint отменяет и записи, и
         зарегистрированное действие после commit.
 
+        С ``attempt`` завершить Item может только попытка, владеющая им: под
+        блокировкой строки ``th_item``, затем ``th_lease`` (порядок §9.2)
+        проверяется, что lease взят этим процессом для этой попытки. Попытка,
+        чей Item завершён без неё (sweeper, отмена) или чей lease перехвачен,
+        ничего не пишет — ни в Item, ни в чужой lease.
+
         Args:
             target: Открытая пользовательская сессия или соединение.
             item: Завершаемый Item.
             value: Итог и накопленные динамические операции.
+            attempt: Номер попытки из claim (``ClaimResult.attempt``). ``None``
+                — без проверки lease, только CAS по ``state``: для вызова вне
+                обёртки задачи, когда lease никто не брал.
 
         Returns:
             ``True``, если CAS завершил Item; ``False``, если он уже был
-            терминальным. Это флаг для middleware, чтобы не писать finish
-            повторно после возврата задачи.
+            терминальным или попытка им не владеет: записей нет. Вызывающий
+            обязан откатить доменные записи транзакции (``th.item.complete_in``
+            для этого бросает ``LeaseLostError``).
 
         Raises:
             ConfigurationError: Нужен spawn, но Completer создан без Producer.
@@ -1433,6 +1472,11 @@ class Completer:
             batch_ids.extend(sub_batch.spec.fed_by)
         if batch_ids:
             await tx.lock_batches(batch_ids, write=writes_structure)
+        if attempt is not None:
+            await tx.lock_items([item.id])
+            await tx.lock_leases([item.id])
+            if not tx.holds(item, attempt):
+                return False
         values = {item.id: (item, value)}
         await tx.finish(values, scalar=True)
         await tx.expand(values)

@@ -12,7 +12,7 @@ import pytest
 from sqlalchemy import Table
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession
 
-from tallyho.storage.tx import after_commit, resolve_connection
+from tallyho.storage.tx import after_commit, after_commit_pending, resolve_connection
 from tests.helpers.probe import (
     ProbeColumns,
     ProbeRow,
@@ -229,3 +229,56 @@ async def test_orm_flush_keeps_callbacks(engine: AsyncEngine, probe: Probe) -> N
 
     assert calls.names == ["a"]
     assert await committed_ids(engine, probe) == [1]
+
+
+async def test_pending_until_commit(target: Target, probe: Probe) -> None:
+    calls = Calls()
+    callback = calls.callback("a")
+    assert not await after_commit_pending(target, callback)
+
+    await _write(target, probe, 1)
+    await after_commit(target, callback)
+    assert await after_commit_pending(target, callback)
+    assert not await after_commit_pending(target, calls.callback("other"))
+
+    await target.commit()
+    assert calls.names == ["a"]
+    assert not await after_commit_pending(target, callback)
+
+
+async def test_not_pending_after_rollback(target: Target, probe: Probe) -> None:
+    callback = Calls().callback("a")
+    await _write(target, probe, 1)
+    await after_commit(target, callback)
+
+    await target.rollback()
+
+    assert not await after_commit_pending(target, callback)
+
+
+async def test_pending_follows_savepoint_outcome(target: Target, probe: Probe) -> None:
+    calls = Calls()
+    kept, dropped = calls.callback("kept"), calls.callback("dropped")
+    await _write(target, probe, 1)
+    released = await target.begin_nested()
+    await after_commit(target, kept)
+    await released.commit()
+    discarded = await target.begin_nested()
+    await after_commit(target, dropped)
+    await discarded.rollback()
+
+    # Release оставляет запись уровня в силе, откат savepoint'а — отменяет.
+    assert await after_commit_pending(target, kept)
+    assert not await after_commit_pending(target, dropped)
+    await target.commit()
+    assert calls.names == ["kept"]
+
+
+async def test_not_pending_on_closed_connection(engine: AsyncEngine, probe: Probe) -> None:
+    callback = Calls().callback("a")
+    async with engine.connect() as conn:
+        await _write(conn, probe, 1)
+        await after_commit(conn, callback)
+        assert await after_commit_pending(conn, callback)
+
+    assert not await after_commit_pending(conn, callback)

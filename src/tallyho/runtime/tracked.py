@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import functools
 import inspect
+import logging
 from collections.abc import Mapping
 from contextvars import ContextVar
 from typing import TYPE_CHECKING, ParamSpec, Protocol, TypeVar, cast, final
@@ -15,7 +16,7 @@ from sqlalchemy import select
 
 from tallyho.engine.completer import FinishResult, ItemRef
 from tallyho.model.calls import TaskCall
-from tallyho.model.errors import ConfigurationError
+from tallyho.model.errors import ConfigurationError, LeaseLostError
 from tallyho.model.states import ResultClass
 from tallyho.protocols.broker import CancellationClassifier, Verdict
 from tallyho.runtime.context import (
@@ -37,6 +38,8 @@ P = ParamSpec("P")
 R = TypeVar("R")
 
 __all__ = ["TaskRuntime", "bind_runtime", "build_runtime", "current_runtime", "tracked"]
+
+_log = logging.getLogger(__name__)
 
 _runtime: ContextVar[TaskRuntime | None] = ContextVar("tallyho_runtime", default=None)
 _installed: list[TaskRuntime] = []
@@ -177,9 +180,18 @@ class TaskRuntime:
         try:
             result = await task(*args, **kwargs)
         except asyncio.CancelledError:
-            _ = await self.completer.release(context.ref)
+            if not context.lease_lost:
+                _ = await self.completer.release(context.ref)
             raise
         except BaseException as exc:
+            if context.lease_lost:
+                # Item уже завершён или принадлежит другому исполнителю (UC-08):
+                # finish и release задели бы чужую попытку, поэтому не пишем ничего.
+                if isinstance(exc, LeaseLostError):
+                    # Не ошибка задачи: брокеру — успех, как при DUPLICATE и TERMINAL.
+                    _log.info("Item %s: попытка %d потеряла lease", context.id, context.attempt)
+                    return None
+                raise
             if isinstance(self.broker, CancellationClassifier) and self.broker.is_cancelled(exc):
                 value = FinishResult(
                     result_class=ResultClass.CANCELLED,
@@ -199,7 +211,7 @@ class TaskRuntime:
                 )
                 _ = await self.completer.finish(context.ref, value)
             raise
-        if not context.completed_in_user_tx:
+        if not (context.completed_in_user_tx or context.lease_lost):
             _ = await self.completer.finish(context.ref, context.finish_result())
         return result
 

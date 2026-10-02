@@ -54,6 +54,7 @@ EXPECTED = {
     "guide-batches-listing",
     "guide-hooks-domain",
     "guide-hooks-retry",
+    "guide-hooks-lease-lost",
     "guide-hooks-release",
     "guide-testing-broker",
     "guide-testing-clock",

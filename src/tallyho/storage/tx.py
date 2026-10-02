@@ -49,6 +49,7 @@ __all__ = [
     "RetryPolicy",
     "TxSettings",
     "after_commit",
+    "after_commit_pending",
     "hook_session",
     "is_retryable",
     "own_transaction",
@@ -423,6 +424,34 @@ async def after_commit(target: AsyncSession | AsyncConnection, callback: AfterCo
     if sync is None:
         raise TypeError(_NOT_STARTED)
     _connection_pending(sync).callbacks.append(callback)
+
+
+async def after_commit_pending(
+    target: AsyncSession | AsyncConnection, callback: AfterCommit
+) -> bool:
+    """Ждёт ли ``callback`` commit транзакции ``target``.
+
+    ``True`` — колбэк зарегистрирован :func:`after_commit`, а записи его уровня
+    транзакции ещё в силе: commit не было, savepoint и транзакция не откатаны.
+    После commit (колбэк вызван) и после отката — ``False``. По ответу
+    вызывающий отличает «моя запись в этой транзакции ещё действует» от «её
+    откатили, пишем заново».
+
+    Args:
+        target: Сессия или соединение, переданные в :func:`after_commit`.
+        callback: Тот же объект колбэка.
+
+    Returns:
+        ``True``, пока колбэк ждёт commit.
+    """
+    if isinstance(target, HookSession):
+        target = await target.connection()
+    if isinstance(target, AsyncSession):
+        pending = _sessions.get(target.sync_session)
+    else:
+        sync = target.sync_connection
+        pending = None if sync is None else _connections.get(sync)
+    return pending is not None and callback in pending.callbacks
 
 
 # --- HookSession ----------------------------------------------------------------------

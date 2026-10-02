@@ -18,21 +18,24 @@ async def complete_in(
     value: FinishResult,
     *,
     completer: Completer,
+    attempt: int | None = None,
 ) -> bool:
     """Завершить ``item`` атомарно с доменными записями ``target``.
 
     Счётчики пишутся append-only дельтами и сворачиваются Completer после
-    commit внешней транзакции. Возвращаемое значение позволяет middleware не
-    отправлять обычный finish второй раз.
+    commit внешней транзакции. При ``False`` ничего не записано: вызывающий
+    должен откатить доменные записи своей транзакции (I-04).
 
     Args:
         target: Пользовательская ``AsyncSession`` или ``AsyncConnection``.
         item: Завершаемый Item.
         value: Итог и накопленные spawn/expect/sub-batch операции.
         completer: Completer текущего runtime.
+        attempt: Номер попытки из claim: завершить Item может только её
+            владелец lease (UC-08). ``None`` — только CAS по ``state``.
 
     Returns:
         ``True`` после успешного CAS ``active -> terminal``; ``False`` для
-        уже завершённого Item.
+        уже завершённого Item и для попытки, которая им не владеет.
     """
-    return await completer.complete_in(target, item, value)
+    return await completer.complete_in(target, item, value, attempt=attempt)
