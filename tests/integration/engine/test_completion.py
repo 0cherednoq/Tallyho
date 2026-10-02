@@ -12,9 +12,10 @@ from sqlalchemy import column, func, select, table, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from typing_extensions import override
 
-from tallyho.engine.completer import FinishResult, ItemRef, SpawnRequest
+from tallyho.engine.completer import CompleterSettings, FinishResult, ItemRef, SpawnRequest
 from tallyho.engine.completion import complete_in
 from tallyho.engine.spawn import SpawnRoute
+from tallyho.engine.sweeper import Sweeper, SweeperSettings
 from tallyho.model.calls import TaskCall
 from tallyho.model.states import ItemState, ResultClass
 from tallyho.protocols.observer import NullObserver
@@ -23,8 +24,11 @@ from tests.helpers.probe import committed_ids, create_probe, insert_id
 from tests.integration.engine.completer_env import (
     COMPLETER_SLOT,
     NOW,
+    SETTINGS,
     Finalized,
+    MovableClock,
     RecordingProgress,
+    lease_row,
     open_completer,
     schema_engine,
     seed,
@@ -354,3 +358,149 @@ async def test_twenty_percent_long_transactions_do_not_block_counter(env: Env) -
         assert waiting == 0
         release.set()
         assert all(await asyncio.gather(*slow))
+
+
+# --- владение lease (UC-08): завершает только попытка, владеющая Item ------------------
+
+LATER = NOW + SETTINGS.lease_ttl + timedelta(seconds=1)
+"""Момент, когда lease, взятый в ``NOW``, уже истёк."""
+OTHER = CompleterSettings(worker_id="worker-2", slot=COMPLETER_SLOT + 1)
+OK = FinishResult(result_class=ResultClass.OK)
+
+
+class _Limits:
+    """Умолчание ``max_retries`` адаптера: истёкший lease возвращает Item в outbox."""
+
+    def max_retries(self, task_name: str) -> int:
+        del task_name
+        return 1
+
+
+def _sweeper(env: Env, *, retries: bool = False) -> Sweeper:
+    return Sweeper(
+        tables=env.tables,
+        engine=schema_engine(env),
+        clock=MovableClock(LATER),
+        finalizer=Finalized(),
+        limits=_Limits() if retries else None,
+        settings=SweeperSettings(finalize_grace=timedelta(0)),
+    )
+
+
+async def _untouched(env: Env, item_id: UUID) -> bool:
+    """Отказ ``complete_in`` ничего не записал: ни дельт, ни пометок."""
+    deltas = await env.count(env.tables.counter_delta)
+    marks = await env.count(env.tables.item_mark)
+    return (deltas, marks) == (0, 0) and await _state(env, item_id) is ItemState.ACTIVE
+
+
+async def test_complete_in_owner_attempt_finishes_item(env: Env) -> None:
+    seeded = await seed(env, 1)
+    ref = seeded.refs[0]
+    async with open_completer(env) as completer:
+        claim = await completer.claim(ref)
+        assert (claim.run, claim.attempt) == (True, 0)
+        async with env.transaction() as conn:
+            assert await complete_in(conn, ref, OK, completer=completer, attempt=0)
+
+    assert await _state(env, ref.id) is ItemState.OK
+    assert await lease_row(env, ref.id) is None
+    assert (await env.counters(seeded.batch_id)).ok == 1
+
+
+async def test_complete_in_expired_but_unclaimed_lease_still_owns_item(env: Env) -> None:
+    seeded = await seed(env, 1)
+    ref = seeded.refs[0]
+    clock = MovableClock()
+    async with open_completer(env, clock=clock) as completer:
+        assert (await completer.claim(ref)).run
+        clock.value = LATER
+        async with env.transaction() as conn:
+            assert await complete_in(conn, ref, OK, completer=completer, attempt=0)
+
+    assert await _state(env, ref.id) is ItemState.OK
+
+
+async def test_complete_in_without_lease_is_rejected(env: Env) -> None:
+    seeded = await seed(env, 1)
+    ref = seeded.refs[0]
+    async with open_completer(env) as completer, env.transaction() as conn:
+        assert not await complete_in(conn, ref, OK, completer=completer, attempt=0)
+
+    assert await _untouched(env, ref.id)
+    assert (await env.counters(seeded.batch_id)).pending == 1
+
+
+async def test_complete_in_stolen_lease_is_rejected_and_left_intact(env: Env) -> None:
+    seeded = await seed(env, 1)
+    ref = seeded.refs[0]
+    async with (
+        open_completer(env) as first,
+        open_completer(env, clock=MovableClock(LATER), settings=OTHER) as second,
+    ):
+        assert (await first.claim(ref)).run
+        stolen = await second.claim(ref)
+        assert (stolen.run, stolen.attempt) == (True, 1)
+
+        async with env.transaction() as conn:
+            assert not await complete_in(conn, ref, OK, completer=first, attempt=0)
+        assert await _untouched(env, ref.id)
+        lease = await lease_row(env, ref.id)
+        assert lease is not None
+        assert (lease["worker_id"], lease["attempt"]) == (OTHER.worker_id, 1)
+
+        # Номер попытки без своего lease тоже не даёт права на Item.
+        async with env.transaction() as conn:
+            assert not await complete_in(conn, ref, OK, completer=first, attempt=1)
+        async with env.transaction() as conn:
+            assert await complete_in(conn, ref, OK, completer=second, attempt=1)
+
+    assert await _state(env, ref.id) is ItemState.OK
+    assert (await env.counters(seeded.batch_id)).ok == 1
+
+
+async def test_complete_in_same_worker_is_fenced_by_attempt(env: Env) -> None:
+    seeded = await seed(env, 1)
+    ref = seeded.refs[0]
+    async with open_completer(env) as completer:
+        assert (await completer.claim(ref)).run
+        # Lease истёк, sweeper вернул Item в outbox, и его снова получил тот же процесс.
+        assert await _sweeper(env, retries=True).expire_leases() == 1
+        again = await completer.claim(ref)
+        assert (again.run, again.attempt) == (True, 1)
+
+        async with env.transaction() as conn:
+            assert not await complete_in(conn, ref, OK, completer=completer, attempt=0)
+        lease = await lease_row(env, ref.id)
+        assert lease is not None
+        assert (lease["worker_id"], lease["attempt"]) == (SETTINGS.worker_id, 1)
+        assert await _state(env, ref.id) is ItemState.ACTIVE
+
+        async with env.transaction() as conn:
+            assert await complete_in(conn, ref, OK, completer=completer, attempt=1)
+
+    assert await _state(env, ref.id) is ItemState.OK
+
+
+async def test_complete_in_terminal_item_with_stale_lease_is_rejected(env: Env) -> None:
+    seeded = await seed(env, 2)
+    cancelled, foreign = seeded.refs
+    async with open_completer(env) as completer:
+        assert (await completer.claim(cancelled)).run
+        assert (await completer.claim(foreign)).run
+        async with env.transaction() as conn:
+            _ = await conn.execute(
+                update(env.tables.item)
+                .where(env.tables.item.c.id == cancelled.id)
+                .values(state=int(ItemState.CANCELLED))
+            )
+        async with env.transaction() as conn:
+            assert not await complete_in(conn, cancelled, OK, completer=completer, attempt=0)
+            # Lease свой, но Item из другого батча: ссылка не та.
+            wrong = ItemRef(foreign.id, uuid4())
+            assert not await complete_in(conn, wrong, OK, completer=completer, attempt=0)
+
+    assert await lease_row(env, cancelled.id) is not None
+    assert await _state(env, cancelled.id) is ItemState.CANCELLED
+    assert await _state(env, foreign.id) is ItemState.ACTIVE
+    assert (await env.counters(seeded.batch_id)).pending == 2
