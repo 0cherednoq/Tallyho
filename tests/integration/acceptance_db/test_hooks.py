@@ -17,7 +17,7 @@ from tallyho.model.errors import TallyhoError
 from tallyho.model.states import BatchState
 from tallyho.protocols.clock import SystemClock
 from tallyho.testing import FakeClock
-from tests.helpers.db import deadlock_count
+from tests.helpers.db import deadlocks, record_db_errors
 from tests.helpers.probe import committed_ids, create_probe, insert_id
 from tests.integration.engine.completer_env import schema_engine
 
@@ -150,9 +150,6 @@ async def test_a_db_08_domain_lock_then_pause_does_not_deadlock_finalizer(
         entered.set()
         _ = await session.execute(select(probe).where(probe.c.id == 1).with_for_update())
 
-    async with env.connection() as conn:
-        before = await deadlock_count(conn)
-
     async with env.transaction() as conn:
         root = await env.producer.create_root(conn, RootSpec(kind="a-db-08"))
         _ = await env.producer.seal(conn, root.id)
@@ -164,13 +161,14 @@ async def test_a_db_08_domain_lock_then_pause_does_not_deadlock_finalizer(
         hooks=registry,
     )
     operations = Operations(tables=env.tables, clock=SystemClock())
-    async with env.transaction() as conn:
-        _ = await conn.execute(select(probe).where(probe.c.id == 1).with_for_update())
-        finishing = asyncio.create_task(finalizer.try_finalize(root.id))
-        _ = await asyncio.wait_for(entered.wait(), timeout=5)
-        await operations.pause(conn, root.id)
-    assert await asyncio.wait_for(finishing, timeout=5)
+    # Движок финализатора получен из env.engine и наследует слушателя: в записи
+    # попадают и транзакция пользователя, и повторённые внутри библиотеки 40P01.
+    with record_db_errors(env.engine) as errors:
+        async with env.transaction() as conn:
+            _ = await conn.execute(select(probe).where(probe.c.id == 1).with_for_update())
+            finishing = asyncio.create_task(finalizer.try_finalize(root.id))
+            _ = await asyncio.wait_for(entered.wait(), timeout=5)
+            await operations.pause(conn, root.id)
+        assert await asyncio.wait_for(finishing, timeout=5)
 
-    async with env.connection() as conn:
-        after = await deadlock_count(conn)
-    assert after == before
+    assert deadlocks(errors) == []

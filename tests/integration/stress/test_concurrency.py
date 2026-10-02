@@ -18,7 +18,7 @@ from tallyho import Tallyho, item
 from tallyho.model.states import BatchState, OnFeederFailed
 from tallyho.protocols.observer import NullObserver
 from tallyho.testing import FakeClock, InlineBroker
-from tests.helpers.db import deadlock_count, schema_connection
+from tests.helpers.db import DEADLOCK_SQLSTATE, deadlocks, record_db_errors, schema_connection
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Sequence
@@ -28,6 +28,7 @@ if TYPE_CHECKING:
 
     from tallyho import BatchHandle
     from tallyho.model.views import BatchSummary
+    from tests.helpers.db import DbError
 
 __all__: list[str] = []
 
@@ -52,11 +53,16 @@ class _HookProbeColumns(TypedColumns):
 class _Finalizations(NullObserver):
     def __init__(self) -> None:
         self.counts: Counter[UUID] = Counter()
+        self.retries: Counter[str] = Counter()
 
     @override
     def batch_finalized(self, *, batch_id: UUID, kind: str, state: BatchState) -> None:
         del kind, state
         self.counts[batch_id] += 1
+
+    @override
+    def transaction_retry(self, *, sqlstate: str) -> None:
+        self.retries[sqlstate] += 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -276,6 +282,32 @@ async def _create_deadlock_roots(
     return handles
 
 
+def _assert_no_deadlocks(errors: list[DbError], observer: _Finalizations) -> None:
+    # Любой 40P01 на соединениях сценария — нарушение порядка блокировок (§9.2, §14),
+    # даже если библиотека повторила транзакцию: повтор виден в retries.
+    assert deadlocks(errors) == []
+    assert observer.retries[DEADLOCK_SQLSTATE] == 0
+
+
+async def _run_pipelines(runtime: _PipelineRuntime, rng: random.Random) -> None:
+    for offset in range(0, PIPELINES_PER_SEED, PIPELINE_CHUNK):
+        handles = [
+            await _create_pipeline(runtime, run, _scenario(rng))
+            for run in range(offset, offset + PIPELINE_CHUNK)
+        ]
+        inject_kill = rng.random() < 0.75
+        if inject_kill:
+            runtime.broker.kill_worker_after(rng.randint(1, PIPELINE_CHUNK))
+        _ = await runtime.broker.drain(concurrency=PIPELINE_CHUNK)
+        if inject_kill:
+            _ = runtime.clock.advance(seconds=2)
+            _ = await runtime.th.run_maintenance_once()
+            _ = await runtime.broker.drain(concurrency=PIPELINE_CHUNK)
+        _ = await runtime.th.run_maintenance_once()
+        _ = await runtime.broker.drain(concurrency=PIPELINE_CHUNK)
+        await _assert_terminal_once(handles, runtime.observer)
+
+
 @pytest.mark.slow
 @pytest.mark.parametrize("seed", STRESS_SEEDS)
 async def test_randomized_pipelines_close_every_stage_once(
@@ -284,25 +316,11 @@ async def test_randomized_pipelines_close_every_stage_once(
     seed: int,
 ) -> None:
     runtime = _pipeline_runtime(engine, schema, seed=seed)
-    rng = _random(seed)
     await runtime.th.migrate()
     try:
-        for offset in range(0, PIPELINES_PER_SEED, PIPELINE_CHUNK):
-            handles = [
-                await _create_pipeline(runtime, run, _scenario(rng))
-                for run in range(offset, offset + PIPELINE_CHUNK)
-            ]
-            inject_kill = rng.random() < 0.75
-            if inject_kill:
-                runtime.broker.kill_worker_after(rng.randint(1, PIPELINE_CHUNK))
-            _ = await runtime.broker.drain(concurrency=PIPELINE_CHUNK)
-            if inject_kill:
-                _ = runtime.clock.advance(seconds=2)
-                _ = await runtime.th.run_maintenance_once()
-                _ = await runtime.broker.drain(concurrency=PIPELINE_CHUNK)
-            _ = await runtime.th.run_maintenance_once()
-            _ = await runtime.broker.drain(concurrency=PIPELINE_CHUNK)
-            await _assert_terminal_once(handles, runtime.observer)
+        with record_db_errors(engine) as errors:
+            await _run_pipelines(runtime, _random(seed))
+        _assert_no_deadlocks(errors, runtime.observer)
     finally:
         await runtime.broker.close()
 
@@ -321,9 +339,10 @@ async def test_ten_percent_duplicate_delivery_finalizes_once(
 
     await runtime.th.migrate()
     try:
-        async with runtime.th.batch("stress-duplicates", key="ten-percent") as batch:
-            await batch.add_calls([runtime.th.call(record, index) for index in range(200)])
-        _ = await runtime.broker.drain(concurrency=100)
+        with record_db_errors(engine) as errors:
+            async with runtime.th.batch("stress-duplicates", key="ten-percent") as batch:
+                await batch.add_calls([runtime.th.call(record, index) for index in range(200)])
+            _ = await runtime.broker.drain(concurrency=100)
 
         view = await batch.handle.view()
         assert view.state is BatchState.SUCCEEDED
@@ -331,6 +350,7 @@ async def test_ten_percent_duplicate_delivery_finalizes_once(
         assert runtime.broker.deliveries > 200
         assert calls == Counter(dict.fromkeys(range(200), 1))
         assert runtime.observer.counts[view.id] == 1
+        _assert_no_deadlocks(errors, runtime.observer)
     finally:
         await runtime.broker.close()
 
@@ -347,26 +367,27 @@ async def test_parallel_pause_cancel_sources_and_hooks_have_no_deadlocks(
     try:
         async with harness.engine.connect() as connection:
             assert await connection.scalar(text("SHOW deadlock_timeout")) == "100ms"
-            before = await deadlock_count(connection)
 
-        handles = await _create_deadlock_roots(harness.th, work.run, roots=roots)
-        draining = asyncio.create_task(harness.broker.drain(concurrency=roots * 2))
-        await asyncio.wait_for(work.all_started.wait(), timeout=10)
-        operations = [
-            handle.pause() if index % 2 == 0 else handle.cancel()
-            for index, handle in enumerate(handles)
-        ]
-        _ = await asyncio.gather(*operations)
-        work.release.set()
-        _ = await asyncio.wait_for(draining, timeout=30)
-        await _assert_terminal_once(handles, harness.observer)
+        # Дедлоки считаются по своим соединениям: pg_stat_database общий на БД и
+        # публикуется с задержкой, в него попадают намеренные дедлоки других тестов.
+        with record_db_errors(harness.engine) as errors:
+            handles = await _create_deadlock_roots(harness.th, work.run, roots=roots)
+            draining = asyncio.create_task(harness.broker.drain(concurrency=roots * 2))
+            await asyncio.wait_for(work.all_started.wait(), timeout=10)
+            operations = [
+                handle.pause() if index % 2 == 0 else handle.cancel()
+                for index, handle in enumerate(handles)
+            ]
+            _ = await asyncio.gather(*operations)
+            work.release.set()
+            _ = await asyncio.wait_for(draining, timeout=30)
+            await _assert_terminal_once(handles, harness.observer)
 
         async with schema_connection(harness.engine, schema) as connection:
-            after = await deadlock_count(connection)
             hook_calls = await connection.scalar(
                 select(harness.hook_probe.c.calls).where(harness.hook_probe.c.id == 1)
             )
-        assert after == before
+        _assert_no_deadlocks(errors, harness.observer)
         assert hook_calls == roots
     finally:
         work.release.set()
