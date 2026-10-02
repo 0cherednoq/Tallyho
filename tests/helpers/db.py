@@ -7,32 +7,41 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import os
 import uuid
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
-from sqlalchemy import text
+from sqlalchemy import event, text
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator
+    from collections.abc import AsyncGenerator, Generator
 
+    from sqlalchemy.engine import ExceptionContext
     from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 __all__ = [
+    "DEADLOCK_SQLSTATE",
     "SCHEMA_PREFIX",
+    "DbError",
     "LockRow",
+    "backend_pid",
     "deadlock_count",
+    "deadlocks",
     "held_locks",
+    "record_db_errors",
     "schema_connection",
     "schema_exists",
     "schema_transaction",
     "temporary_schema",
     "unique_schema_name",
+    "wait_blocked_by",
 ]
 
 SCHEMA_PREFIX = "t_"
+DEADLOCK_SQLSTATE = "40P01"
 
 
 def unique_schema_name() -> str:
@@ -85,17 +94,80 @@ async def schema_exists(conn: AsyncConnection, schema: str) -> bool:
 async def deadlock_count(conn: AsyncConnection) -> int:
     """Счётчик дедлоков текущей БД из ``pg_stat_database.deadlocks``.
 
-    Счётчик общий на БД, поэтому сравнивайте разницу «до/после», а не абсолютное
-    значение. Backend, поймавший дедлок, публикует статистику с задержкой (до ~1 с;
-    сразу — после ``pg_stat_force_next_flush()`` или при отключении), поэтому
-    после провокации дедлока значение стоит опрашивать. Снимок статистики текущей
-    транзакции сбрасывается здесь же.
+    Счётчик общий на БД, а backend, поймавший дедлок, публикует статистику с
+    задержкой (до ~1 с; сразу — после ``pg_stat_force_next_flush()`` или при
+    отключении). Поэтому им нельзя доказывать «в моём сценарии дедлоков не было»:
+    в окно «до/после» попадает дедлок соседнего теста, в том числе намеренный и
+    уже завершившийся. Для такой проверки есть :func:`record_db_errors`. Снимок
+    статистики текущей транзакции сбрасывается здесь же.
     """
     await conn.execute(text("SELECT pg_stat_clear_snapshot()"))
     value = await conn.scalar(
         text("SELECT deadlocks FROM pg_stat_database WHERE datname = current_database()")
     )
     return int(value or 0)
+
+
+@dataclass(frozen=True, slots=True)
+class DbError:
+    """Ошибка БД на соединении движка: SQLSTATE и запрос, на котором она возникла."""
+
+    sqlstate: str | None
+    statement: str | None
+
+
+@contextlib.contextmanager
+def record_db_errors(engine: AsyncEngine) -> Generator[list[DbError]]:
+    """Записывает ошибки БД на всех соединениях ``engine``, пока открыт контекст.
+
+    Событие ``handle_error`` срабатывает на каждой ошибке драйвера — и на той,
+    которую библиотека потом повторила (``40P01`` в ``run_transaction``), и на
+    той, что ушла пользователю. Чужие соединения той же БД сюда не попадают,
+    поэтому проверка не зависит от соседних тестов. Движки, полученные через
+    ``engine.execution_options(...)``, наследуют слушателя.
+    """
+    errors: list[DbError] = []
+
+    def on_error(context: ExceptionContext) -> None:
+        state = cast("object", getattr(context.original_exception, "sqlstate", None))
+        errors.append(DbError(state if isinstance(state, str) else None, context.statement))
+
+    event.listen(engine.sync_engine, "handle_error", on_error)
+    try:
+        yield errors
+    finally:
+        event.remove(engine.sync_engine, "handle_error", on_error)
+
+
+def deadlocks(errors: list[DbError]) -> list[DbError]:
+    """Только дедлоки (``40P01``) из записанных ошибок."""
+    return [error for error in errors if error.sqlstate == DEADLOCK_SQLSTATE]
+
+
+async def backend_pid(conn: AsyncConnection) -> int:
+    """PID backend'а PostgreSQL, который обслуживает соединение."""
+    return int(await conn.scalar(text("SELECT pg_backend_pid()")) or 0)
+
+
+_BLOCKED_SQL = text("""
+    SELECT count(*) FROM pg_locks l
+    WHERE NOT l.granted AND :pid = ANY(pg_blocking_pids(l.pid))
+""")
+
+
+async def wait_blocked_by(conn: AsyncConnection, pid: int, *, attempts: int = 1000) -> None:
+    """Дождаться, пока какой-нибудь backend встанет в очередь за блокировкой ``pid``.
+
+    ``conn`` — отдельное соединение наблюдателя: ни держатель блокировки, ни
+    ожидающий. ``pg_locks`` читается заново при каждом запросе; опрос идёт раз
+    в 10 мс, не дольше ``attempts`` раз.
+    """
+    for _ in range(attempts):
+        if await conn.scalar(_BLOCKED_SQL, {"pid": pid}):
+            return
+        await asyncio.sleep(0.01)
+    message = f"никто не ждёт блокировку backend'а {pid}"
+    raise AssertionError(message)
 
 
 @dataclass(frozen=True, slots=True)
