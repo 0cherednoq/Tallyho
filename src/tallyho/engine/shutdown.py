@@ -88,6 +88,11 @@ async def run_in(
     докручивается в служебном потоке, пока корутина не завершится. Закрытый
     loop пропускается: его задачи уже не выполнятся.
 
+    Докрутить можно не всё: запрос SQLAlchemy, прерванный остановкой loop,
+    привязан (greenlet) к потоку, который этот loop крутил, и в другом потоке
+    завершится ошибкой. Библиотека такие ошибки фоновой работы логирует, а
+    недоделанное подбирает sweeper; новые запросы закрытия выполняются штатно.
+
     Args:
         owner: Loop владельца; ``None`` — компонент ни к чему не привязан.
         make: Фабрика корутины: вызывается ровно один раз, если корутину есть
@@ -188,30 +193,37 @@ async def close_services(
         relay: Relay установки; ``None`` — процесс без адаптера.
     """
     patience = budget.left + _HANDOVER_GRACE
+    current = asyncio.get_running_loop()
     by_loop: dict[asyncio.AbstractEventLoop, list[asyncio.Task[object]]] = {}
     for task in tasks:
         by_loop.setdefault(task.get_loop(), []).append(task)
+    home = None if completer is None else (completer.loop or current)
+    if home is not None:
+        _ = by_loop.setdefault(home, [])
+    # На каждый loop — одна корутина: остановленный чужой loop докручивает один поток.
     steps = [
-        run_in(owner, _draining(group, budget), patience=patience)
+        run_in(
+            owner,
+            _working(group, completer if owner is home else None, budget),
+            patience=patience,
+        )
         for owner, group in by_loop.items()
     ]
-    if completer is not None:
-        steps.append(run_in(completer.loop, _closing(completer, budget), patience=patience))
     _ = await asyncio.gather(*steps)
     if relay is not None:
         await run_in(relay.loop, _stopping(relay, budget), patience=patience)
 
 
-def _draining(
-    group: list[asyncio.Task[object]], budget: Budget
+def _working(
+    group: list[asyncio.Task[object]], completer: _Completer | None, budget: Budget
 ) -> Callable[[], Coroutine[object, object, None]]:
-    return lambda: drain_tasks(group, budget)
+    async def work() -> None:
+        steps = [drain_tasks(group, budget)]
+        if completer is not None:
+            steps.append(_close_completer(completer, budget))
+        _ = await asyncio.gather(*steps)
 
-
-def _closing(
-    completer: _Completer, budget: Budget
-) -> Callable[[], Coroutine[object, object, None]]:
-    return lambda: _close_completer(completer, budget)
+    return work
 
 
 def _stopping(relay: _Relay, budget: Budget) -> Callable[[], Coroutine[object, object, None]]:

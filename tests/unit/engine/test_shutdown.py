@@ -289,6 +289,28 @@ async def test_close_services_closes_each_part_in_its_own_loop(foreign: LoopThre
     assert completer.calls == ["close(requeue_held=True)", "closed"]
 
 
+async def test_close_services_drives_a_stopped_loop_once_for_all_its_parts(
+    foreign: LoopThread, caplog: pytest.LogCaptureFixture
+) -> None:
+    done: list[str] = []
+
+    async def finish() -> None:
+        await asyncio.sleep(0.01)
+        done.append("task")
+
+    foreign_task = _spawn_in(foreign.loop, finish)
+    completer = FakeCompleter(loop=foreign.loop, delay=0.01)
+    foreign.stop()
+
+    with caplog.at_level(logging.WARNING, logger="tallyho.engine.shutdown"):
+        await close_services(budget=budget(), tasks=[foreign_task], completer=completer, relay=None)
+
+    # Задачи и Completer одного остановленного loop закрыты одним проходом, без гонки потоков.
+    assert not caplog.records
+    assert done == ["task"]
+    assert completer.calls == ["close(requeue_held=True)", "closed"]
+
+
 def _spawn_in(
     loop: asyncio.AbstractEventLoop, work: Callable[[], Coroutine[object, object, None]]
 ) -> asyncio.Task[None]:
