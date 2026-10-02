@@ -90,7 +90,7 @@ class MailingApp:
             seed=42,
         )
         self.th = Tallyho(
-            engine,
+            self.engine,
             schema=schema,
             clock=self.clock,
             lease_ttl=timedelta(seconds=60),

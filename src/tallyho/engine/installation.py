@@ -26,13 +26,25 @@ __all__ = ["Installation", "RuntimeServices", "create_installation", "migrate_in
 
 @dataclass(frozen=True, slots=True)
 class Installation:
-    """Движок со schema translation и таблицы выбранного prefix."""
+    """Движок пользователя и таблицы выбранных schema и prefix.
 
-    source_engine: AsyncEngine
+    Схема записана в таблицах, а не в опциях движка: запросы библиотеки
+    находят свои таблицы и на соединении пользователя, а сессия tx-хука
+    адресует доменные таблицы так же, как остальной код пользователя.
+    """
+
     engine: AsyncEngine
     schema: str | None
     prefix: str
     tables: Tables
+
+    @property
+    def maintenance_identity(self) -> str | None:
+        """Имя advisory-блокировки лидера maintenance: одна схема — один лидер.
+
+        ``None`` для установки без схемы: имя выводится из опций движка.
+        """
+        return None if self.schema is None else f"{self.schema}:maintenance"
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,8 +78,7 @@ def create_installation(engine: AsyncEngine, schema: str | None, prefix: str) ->
     """
     validate_schema(schema)
     validate_prefix(prefix)
-    scoped = engine.execution_options(schema_translate_map={None: schema})
-    return Installation(engine, scoped, schema, prefix, build_metadata(prefix))
+    return Installation(engine, schema, prefix, build_metadata(prefix, schema=schema))
 
 
 async def migrate_installation(value: Installation, *, lock_timeout: timedelta) -> int:
@@ -77,7 +88,7 @@ async def migrate_installation(value: Installation, *, lock_timeout: timedelta) 
         Текущая версия схемы.
     """
     return await migrate(
-        value.source_engine,
+        value.engine,
         value.schema,
         value.prefix,
         lock_timeout=lock_timeout,

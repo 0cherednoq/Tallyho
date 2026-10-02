@@ -1,8 +1,11 @@
 """Описание таблиц и индексов tallyho (ARCHITECTURE §5.1, §5.2).
 
-Таблицы описаны без схемы (``schema=None``): схему пользователя подставляет
-``schema_translate_map={None: schema}`` в опциях выполнения соединения. Имена
-таблиц и индексов начинаются с ``prefix`` (по умолчанию ``th_``).
+Схема установки записана в самих таблицах (``build_metadata(schema=...)``),
+поэтому запросы находят их на любом соединении — и на нашем, и на соединении
+пользователя с его собственными ``search_path`` и ``schema_translate_map``
+(Fix-12). При ``schema=None`` таблицы описаны без схемы и ищутся так же, как
+таблицы пользователя без схемы. Имена таблиц и индексов начинаются с
+``prefix`` (по умолчанию ``th_``).
 
 Колонки описаны классами :class:`~sqlalchemy.TypedColumns`, поэтому
 ``tables.item.c.state`` типизирован для mypy и basedpyright.
@@ -357,6 +360,7 @@ class Tables:
 def build_metadata(
     prefix: str = DEFAULT_PREFIX,
     *,
+    schema: str | None = None,
     _delta_timestamps: bool = True,
     _lease_redelivery: bool = True,
 ) -> Tables:
@@ -365,11 +369,15 @@ def build_metadata(
     Args:
         prefix: префикс имён таблиц и индексов. Проверка допустимости —
             задача установки (``migrate``).
+        schema: схема установки. Имя попадает в каждый запрос, поэтому
+            таблицы находятся на любом соединении. ``None`` — таблицы без
+            схемы: их адрес определяет соединение (``search_path`` или его
+            ``schema_translate_map``).
 
     Returns:
-        Таблицы установки; схема подставляется через ``schema_translate_map``.
+        Таблицы установки.
     """
-    metadata = MetaData()
+    metadata = MetaData(schema=schema)
     return Tables(
         metadata=metadata,
         batch=_batch(metadata, prefix),

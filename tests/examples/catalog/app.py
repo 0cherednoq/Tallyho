@@ -67,7 +67,7 @@ class CatalogApp:
         self.clock = FakeClock(datetime(2026, 10, 1, 9, tzinfo=UTC))
         self.broker = InlineBroker(duplicate_delivery_rate=0.05, seed=13)
         self.th = Tallyho(
-            engine,
+            self.engine,
             schema=schema,
             clock=self.clock,
             lease_ttl=timedelta(seconds=60),

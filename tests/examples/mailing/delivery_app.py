@@ -71,7 +71,7 @@ class DeliveryApp:
         self.engine = engine.execution_options(schema_translate_map={None: schema})
         self.clock = FakeClock(datetime(2026, 10, 1, 9, tzinfo=UTC))
         self.broker = InlineBroker(seed=7)
-        self.th = Tallyho(engine, schema=schema, clock=self.clock, retention=timedelta(days=1))
+        self.th = Tallyho(self.engine, schema=schema, clock=self.clock, retention=timedelta(days=1))
         self.th.install(self.broker.adapter)
         self.mail = FakeMailProvider()
         self.page = page
