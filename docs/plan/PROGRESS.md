@@ -75,13 +75,13 @@
 | Fix-3 | InlineBroker.drain дожидается после-коммитной работы Completer | — | done | 7d80183 |
 | Fix-4 | Редкий дедлок в стресс-файле test_concurrency и утечка статистики дедлоков между тестами | — | done | 96c0d33..908e889 (4), merge 4da9890 |
 | Fix-5 | Sweeper учитывает `max_retries` из декоратора задачи | — | done | 700f1dc..9ccde03 (5), merge 56b7a1f |
-| Fix-6 | Движок периодически вызывает `reconcile_dead` | — | todo | |
+| Fix-6 | Движок периодически вызывает `reconcile_dead` | — | in_progress | |
 | Fix-7 | Повторная доставка не оставляет Item без исполнителя | — | done | 51fc8b8..ae2e22b (7), merge 15ed914 |
-| Fix-8 | `complete_in` учитывает результат CAS | — | todo | |
+| Fix-8 | `complete_in` учитывает результат CAS | — | in_progress | |
 | Fix-9 | Отменённый до старта батч не финализируется как `succeeded` | — | done | 200a272..046b1a1 (3), merge 5b22aff |
 | Fix-10 | Быстрая отправка relay после commit в каждом процессе | — | done | 5de7d24..69d0d91 (5), merge d36a62f |
-| Fix-11 | Закрытие дожидается фоновых задач; SIGTERM возвращает удержанные Items | — | todo | |
-| Fix-12 | Запросы на соединении пользователя видят схему установки | — | todo | |
+| Fix-11 | Закрытие дожидается фоновых задач; SIGTERM возвращает удержанные Items | — | in_progress | |
+| Fix-12 | Запросы на соединении пользователя видят схему установки | — | in_progress | |
 | Fix-13 | Публичный API ↔ ARCHITECTURE §11 | — | todo | |
 | Fix-14 | Мелкие расхождения движка: backoff хуков, labels/metrics, lock с prefix, `found` корня | — | todo | |
 | Fix-15 | Дедлайн после явного `cancel()` не меняет итог на `failed` | — | todo | |
@@ -94,6 +94,9 @@
 - Отклонения от плана/доков: … (или «нет»)
 - Узнали / на что обратить внимание дальше: …
 -->
+### 2026-10-02 · волна 10 запущена · Fix-6, Fix-8, Fix-11, Fix-12
+- Четыре задачи в изолированных worktree от `45695a8`: сверка с DLQ в maintenance, результат CAS в `complete_in`, закрытие с ожиданием фоновых задач, схема установки на соединении пользователя. Fix-13 (пересекается с Fix-8 в runtime), Fix-14 (с Fix-6 в maintenance) и Fix-15 (с Fix-11 в operations) — следующей волной. G2 и мутационный gate выполняет оркестратор после вливания.
+
 ### 2026-10-02 · волна 9 влита · Fix-5, Fix-7, Fix-9, Fix-10 · merge 56b7a1f, 15ed914, 5b22aff, d36a62f
 - **Fix-5 · done.** Sweeper спрашивает умолчание `max_retries` у адаптера по `task_name` через необязательный протокол `RetryLimits`; опция вызова сильнее (D-047). Возврат Item в outbox по истёкшему lease теперь делает `attempt += 1` — иначе лимит был недостижим. `InlineBroker(max_retries=)`. A-CH-01 × S1 зелёный (640 Items, 0 `lease_expired` при оставшихся попытках), xfail снят.
 - **Fix-7 · done.** Дубль доставки при живом lease помечает `th_lease.redelivered`; `release` для такого lease в той же транзакции возвращает Item в outbox (D-048). Схема v4 (`SCHEMA_VERSION = 4`, Alembic `version=4`). Адаптер flexiq добавляет `CompleterError` к непустому `retry_on`. Воспроизведение — `tests/integration/runtime/test_redelivery.py` и контрактный тест `requeue_job` на настоящем flexiq. A-CH-10 зелёный: S2 три прогона подряд, S1 и S3 по одному; xfail снят. Sweeper не тронут.
