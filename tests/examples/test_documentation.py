@@ -1,4 +1,19 @@
-"""Extract and execute the documentation blocks marked for CI."""
+"""Extract and execute the documentation blocks marked for CI.
+
+Two markers are recognised, each on the line(s) right above a Python fence:
+
+* ``<!-- tallyho-example: name -->`` — the block is compiled with top-level
+  ``await`` and executed on PostgreSQL with ``engine`` and ``schema`` in scope;
+* ``<!-- tallyho-noexec: reason -->`` — the block is illustrative (it needs a
+  broker worker, pgbouncer, a user project layout …) and is only accounted for.
+
+README and every page of ``docs/guide`` are *strict*: a Python fence without
+one of the markers fails the manifest tests. ARCHITECTURE keeps its many
+illustrative fragments unmarked; only its marked blocks are executed.
+
+Relative links of the strict documents are checked too: the target file must
+exist and a ``#fragment`` must match a heading of that file.
+"""
 
 from __future__ import annotations
 
@@ -20,14 +35,52 @@ if TYPE_CHECKING:
 __all__: list[str] = []
 
 ROOT = Path(__file__).parents[2]
-DOCUMENTS = (ROOT / "README.md", ROOT / "docs" / "ARCHITECTURE.md")
+README = ROOT / "README.md"
+ARCHITECTURE = ROOT / "docs" / "ARCHITECTURE.md"
+GUIDE = ROOT / "docs" / "guide"
+GUIDE_PAGES = tuple(sorted(GUIDE.rglob("*.md")))
+DOCUMENTS = (README, ARCHITECTURE, *GUIDE_PAGES)
+STRICT_DOCUMENTS = (README, *GUIDE_PAGES)
 EXPECTED = {
     "readme-quickstart",
     "architecture-mailing",
     "architecture-delivery",
     "architecture-catalog",
+    "guide-install-migrate",
+    "guide-batches-basics",
+    "guide-batches-pipeline",
+    "guide-batches-policy",
+    "guide-batches-operations",
+    "guide-batches-listing",
+    "guide-hooks-domain",
+    "guide-hooks-retry",
+    "guide-hooks-release",
+    "guide-testing-broker",
+    "guide-testing-clock",
+    "guide-flexiq-call-options",
+    "guide-operations-maintenance",
+    "guide-operations-observer",
+}
+# Guide pages that must exist; a renamed or deleted page fails the manifest.
+EXPECTED_GUIDE_PAGES = {
+    "README.md",
+    "installation.md",
+    "batches.md",
+    "hooks.md",
+    "testing.md",
+    "flexiq.md",
+    "operations.md",
+    "limitations.md",
 }
 MARKER = re.compile(r"^\s*<!--\s*tallyho-example:\s*([a-z0-9-]+)\s*-->\s*$")
+NOEXEC = re.compile(r"^\s*<!--\s*tallyho-noexec:\s*(\S.*?)\s*-->\s*$")
+PYTHON_INFO = {"python", "py", "python3"}
+EXECUTABLE_FENCE = "```python"
+FENCE = "```"
+LINK = re.compile(r"\[[^\]]*\]\(([^)\s]+)\)")
+HEADING = re.compile(r"^#{1,6}\s+(.+?)\s*$")
+NOT_SLUG = re.compile(r"[^\w\- ]")
+EXTERNAL = ("http://", "https://", "mailto:")
 
 
 @dataclass(frozen=True, slots=True)
@@ -40,42 +93,132 @@ class Example:
     source: str
 
 
+@dataclass(frozen=True, slots=True)
+class PythonFence:
+    """One Python fence of a document together with the marker above it."""
+
+    path: Path
+    line: int
+    opening: str
+    source: str
+    example: str | None
+    noexec: str | None
+
+
 class ExampleRunner(Protocol):
     """Callable shape of a code object compiled with top-level await."""
 
     def __call__(self) -> Awaitable[object]: ...
 
 
+def _is_python(opening: str) -> bool:
+    info = opening.strip()[len(FENCE) :].split()
+    return bool(info) and info[0].lower() in PYTHON_INFO
+
+
+def _marker_above(lines: list[str], fence: int) -> tuple[int | None, str | None, str | None]:
+    """Return ``(marker line index, example name, noexec reason)`` for a fence."""
+    index = fence - 1
+    while index >= 0 and not lines[index].strip():
+        index -= 1
+    if index < 0:
+        return None, None, None
+    if (match := MARKER.fullmatch(lines[index])) is not None:
+        return index, match.group(1), None
+    if (match := NOEXEC.fullmatch(lines[index])) is not None:
+        return index, None, match.group(1)
+    return None, None, None
+
+
+def python_fences(path: Path) -> list[PythonFence]:
+    """Return every Python fence of ``path``; a dangling marker is an error."""
+    lines = path.read_text(encoding="utf-8").splitlines()
+    found: list[PythonFence] = []
+    attached: set[int] = set()
+    index = 0
+    while index < len(lines):
+        opening = lines[index]
+        if not opening.strip().startswith(FENCE):
+            index += 1
+            continue
+        end = index + 1
+        while end < len(lines) and lines[end].strip() != FENCE:
+            end += 1
+        assert end < len(lines), f"{path}:{index + 1}: unclosed fence"
+        if _is_python(opening):
+            marker, example, noexec = _marker_above(lines, index)
+            if marker is not None:
+                attached.add(marker)
+            found.append(
+                PythonFence(
+                    path=path,
+                    line=index + 2,
+                    opening=opening.strip(),
+                    source="\n".join(lines[index + 1 : end]) + "\n",
+                    example=example,
+                    noexec=noexec,
+                )
+            )
+        index = end + 1
+    for number, line in enumerate(lines):
+        if MARKER.fullmatch(line) is not None or NOEXEC.fullmatch(line) is not None:
+            message = f"{path}:{number + 1}: marker must be followed by a Python fence"
+            assert number in attached, message
+    return found
+
+
+def prose_lines(path: Path) -> list[str]:
+    """Return the lines of ``path`` that lie outside fenced code blocks."""
+    prose: list[str] = []
+    fenced = False
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if line.strip().startswith(FENCE):
+            fenced = not fenced
+        elif not fenced:
+            prose.append(line)
+    return prose
+
+
+def heading_slugs(path: Path) -> set[str]:
+    """Return GitHub-style anchors of every heading in ``path``."""
+    slugs: set[str] = set()
+    for line in prose_lines(path):
+        match = HEADING.fullmatch(line)
+        if match is not None:
+            slugs.add(NOT_SLUG.sub("", match.group(1).lower()).replace(" ", "-"))
+    return slugs
+
+
+def broken_links(path: Path) -> list[str]:
+    """Return relative links of ``path`` whose file or heading does not exist."""
+    broken: list[str] = []
+    for line in prose_lines(path):
+        for target in cast("list[str]", LINK.findall(line)):
+            if target.startswith(EXTERNAL):
+                continue
+            location, _, fragment = target.partition("#")
+            destination = (path.parent / location).resolve() if location else path
+            missing = not destination.exists()
+            checks_heading = bool(fragment) and destination.suffix == ".md"
+            if missing or (checks_heading and fragment not in heading_slugs(destination)):
+                broken.append(target)
+    return broken
+
+
 def extract_examples(paths: Iterable[Path]) -> list[Example]:
-    """Return every Python fence immediately following a tallyho marker."""
+    """Return every Python fence immediately following a tallyho-example marker."""
     examples: list[Example] = []
     names: set[str] = set()
     for path in paths:
-        lines = path.read_text(encoding="utf-8").splitlines()
-        for index, line in enumerate(lines):
-            match = MARKER.fullmatch(line)
-            if match is None:
+        for fence in python_fences(path):
+            if fence.example is None:
                 continue
-            name = match.group(1)
-            fence = index + 1
-            while fence < len(lines) and not lines[fence].strip():
-                fence += 1
-            message = f"{path}:{index + 1}: marker must be followed by a Python fence"
-            assert fence < len(lines), message
-            assert lines[fence].strip() == "```python", message
-            end = fence + 1
-            while end < len(lines) and lines[end].strip() != "```":
-                end += 1
-            assert end < len(lines), f"{path}:{fence + 1}: unclosed Python fence"
-            assert name not in names, f"duplicate documentation example: {name}"
-            names.add(name)
+            message = f"{path}:{fence.line - 1}: executable block must open with ```python"
+            assert fence.opening == EXECUTABLE_FENCE, message
+            assert fence.example not in names, f"duplicate documentation example: {fence.example}"
+            names.add(fence.example)
             examples.append(
-                Example(
-                    name=name,
-                    path=path,
-                    line=fence + 2,
-                    source="\n".join(lines[fence + 1 : end]) + "\n",
-                )
+                Example(name=fence.example, path=path, line=fence.line, source=fence.source)
             )
     return examples
 
@@ -85,15 +228,50 @@ EXAMPLES = extract_examples(DOCUMENTS)
 
 def test_documentation_example_manifest_is_complete() -> None:
     assert {example.name for example in EXAMPLES} == EXPECTED
-    assert {example.path for example in EXAMPLES} == set(DOCUMENTS)
-    readme = DOCUMENTS[0]
-    readme_python_fences = sum(
-        line.strip() == "```python" for line in readme.read_text(encoding="utf-8").splitlines()
-    )
-    assert sum(example.path == readme for example in EXAMPLES) == readme_python_fences
+    with_examples = {example.path for example in EXAMPLES}
+    assert {README, ARCHITECTURE} <= with_examples
+    readme_python_fences = python_fences(README)
+    assert readme_python_fences
+    # README остаётся полностью исполняемым: noexec-блоков в нём нет.
+    assert all(fence.example is not None for fence in readme_python_fences)
 
 
-@pytest.mark.parametrize("example", EXAMPLES, ids=lambda value: value.name)
+def test_guide_pages_are_present() -> None:
+    assert {page.relative_to(GUIDE).as_posix() for page in GUIDE_PAGES} == EXPECTED_GUIDE_PAGES
+
+
+@pytest.mark.parametrize(
+    "path", STRICT_DOCUMENTS, ids=lambda value: cast("Path", value).relative_to(ROOT).as_posix()
+)
+def test_every_python_block_is_marked(path: Path) -> None:
+    unmarked = [
+        f"{path.relative_to(ROOT).as_posix()}:{fence.line - 1}"
+        for fence in python_fences(path)
+        if fence.example is None and fence.noexec is None
+    ]
+    assert not unmarked, f"Python blocks without tallyho-example/tallyho-noexec: {unmarked}"
+
+
+@pytest.mark.parametrize(
+    "path", GUIDE_PAGES, ids=lambda value: cast("Path", value).relative_to(ROOT).as_posix()
+)
+def test_guide_page_with_code_has_executable_example(path: Path) -> None:
+    fences = python_fences(path)
+    if fences:
+        assert any(fence.example is not None for fence in fences), (
+            f"{path.relative_to(ROOT).as_posix()}: no executable example among "
+            f"{len(fences)} Python blocks"
+        )
+
+
+@pytest.mark.parametrize(
+    "path", STRICT_DOCUMENTS, ids=lambda value: cast("Path", value).relative_to(ROOT).as_posix()
+)
+def test_relative_links_resolve(path: Path) -> None:
+    assert broken_links(path) == []
+
+
+@pytest.mark.parametrize("example", EXAMPLES, ids=lambda value: cast("Example", value).name)
 async def test_documentation_example_executes(
     example: Example,
     engine: AsyncEngine,
