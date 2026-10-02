@@ -17,6 +17,7 @@ PARENTS: dict[type[errors.TallyhoError], type[errors.TallyhoError]] = {
     errors.InvalidStateError: errors.TallyhoError,
     errors.ConcurrentModification: errors.TallyhoError,
     errors.CompleterError: errors.TallyhoError,
+    errors.LeaseLostError: errors.TallyhoError,
     errors.HookTransactionError: errors.TallyhoError,
     errors.SealError: errors.InvalidStateError,
     errors.SpawnTargetError: errors.InvalidStateError,
@@ -44,6 +45,13 @@ def test_batch_purged_carries_batch_id() -> None:
     exc = errors.BatchPurged(batch_id)
     assert exc.batch_id == batch_id
     assert str(batch_id) in str(exc)
+
+
+def test_lease_lost_carries_item_id() -> None:
+    item_id = UUID(int=7)
+    exc = errors.LeaseLostError(item_id)
+    assert exc.item_id == item_id
+    assert str(item_id) in str(exc)
 
 
 def test_hook_missing_names_kind_and_hook() -> None:

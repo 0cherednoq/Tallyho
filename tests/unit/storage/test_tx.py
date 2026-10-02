@@ -14,6 +14,7 @@ from tallyho.storage.tx import (
     HookSession,
     RetryPolicy,
     after_commit,
+    after_commit_pending,
     is_retryable,
     sqlstate_of,
 )
@@ -109,6 +110,13 @@ async def test_after_commit_needs_open_connection() -> None:
 
     with pytest.raises(TypeError, match="AsyncConnection"):
         await after_commit(conn, lambda: None)
+
+
+async def test_nothing_is_pending_on_unopened_connection() -> None:
+    engine = create_async_engine("postgresql+asyncpg://")
+    conn = AsyncConnection(engine)
+
+    assert not await after_commit_pending(conn, lambda: None)
 
 
 async def test_hook_session_forbids_transaction_control() -> None:

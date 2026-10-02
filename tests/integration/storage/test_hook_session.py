@@ -9,7 +9,7 @@ from sqlalchemy import Table, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from tallyho.model.errors import HookTransactionError
-from tallyho.storage.tx import after_commit, hook_session, own_transaction
+from tallyho.storage.tx import after_commit, after_commit_pending, hook_session, own_transaction
 from tests.helpers.probe import (
     ProbeColumns,
     ProbeRow,
@@ -108,10 +108,16 @@ async def test_after_commit_from_hook_waits_for_our_commit(
     engine: AsyncEngine, probe: Probe
 ) -> None:
     calls: list[str] = []
+
+    def callback() -> None:
+        calls.append("hook")
+
     async with own_transaction(engine) as conn:
         async with hook_session(conn) as session:
             await insert_id(await session.connection(), probe, 1)
-            await after_commit(session, lambda: calls.append("hook"))
+            await after_commit(session, callback)
+            assert await after_commit_pending(session, callback)
         assert calls == []
+        assert await after_commit_pending(conn, callback)
 
     assert calls == ["hook"]
