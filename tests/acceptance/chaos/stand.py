@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import os
 import time
+import zlib
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import timedelta
@@ -41,7 +42,9 @@ __all__ = [
 HERE = Path(__file__).parent
 COMPOSE_FILE = HERE.parent / "docker-compose.yml"
 ROOT = HERE.parents[2]
-DEFAULT_IMAGE = "tallyho-acceptance-app:chaos"
+# Тег зависит от рабочего дерева: параллельные прогоны из разных worktree собирают разный код
+# и не должны подменять образ друг другу между build и up.
+DEFAULT_IMAGE = f"tallyho-acceptance-app:chaos-{zlib.crc32(str(ROOT).encode()):08x}"
 
 # Ошибки, которыми отвечает PostgreSQL за toxiproxy, пока он выключен или поднимается.
 CONNECTION_ERRORS = (DBAPIError, OSError, TimeoutError)
