@@ -13,7 +13,7 @@ tallyho — async-библиотека для Python и PostgreSQL. Она до�
 | Страница | О чём |
 |---|---|
 | [Установка и миграции](installation.md) | пакет и extras, клиент `Tallyho`, схема и префикс, `migrate()`, Alembic, CLI, настройки |
-| [Батчи и конвейеры](batches.md) | `th.batch`, задачи и метки итога, `sub_batch`, `fed_by`, `spawn`/`into=`, политики ошибок, операции над деревом, прогресс, атрибуты и листинг |
+| [Батчи и конвейеры](batches.md) | `th.batch`, потоковое добавление, задачи и метки итога, `sub_batch`, `fed_by`, `spawn`/`into=`, политики ошибок, операции над деревом, прогресс, атрибуты и листинг |
 | [Хуки](hooks.md) | `on_finalized`, `on_progress`, `on_policy_breach`, правила транзакции, повтор, колбэк-задачи, retention и `release()`, рецепт «строка на каждого получателя» |
 | [Тестирование](testing.md) | `tallyho.testing`: `InlineBroker`, `FakeClock`, pytest-фикстура |
 | [Адаптер flexiq](flexiq.md) | подключение, объявление задач, опции постановки, ретраи и DLQ |

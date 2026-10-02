@@ -49,6 +49,7 @@ EXPECTED = {
     "guide-install-migrate",
     "guide-install-session",
     "guide-batches-basics",
+    "guide-batches-streaming",
     "guide-batches-pipeline",
     "guide-batches-policy",
     "guide-batches-operations",
