@@ -74,6 +74,29 @@ async def test_duplicates_are_delivered_but_task_side_effect_runs_once(
         assert view.progress.ok == 1
 
 
+async def test_commit_does_not_dispatch_behind_the_test(engine: AsyncEngine, schema: str) -> None:
+    """Фоновый цикл relay не стартует: сообщения уходят только из ``step``/``drain``."""
+    calls: list[int] = []
+    async with make_client(engine, schema) as (th, broker, _clock):
+
+        async def record(value: int) -> None:
+            calls.append(value)
+            await asyncio.sleep(0)
+
+        async with th.batch("inline-manual", key="one") as batch:
+            await batch.add(record, 1)
+            await batch.add(record, 2)
+        await asyncio.sleep(0.2)
+
+        assert broker.pending == 0
+        assert [task for task in asyncio.all_tasks() if task.get_name() == "tallyho-relay"] == []
+        assert await broker.step() == 1
+        assert broker.pending == 1
+        assert calls == [1]
+        assert await broker.drain() == 1
+        assert (await batch.handle.view()).state is BatchState.SUCCEEDED
+
+
 async def test_retry_and_dlq_follow_max_retries(engine: AsyncEngine, schema: str) -> None:
     attempts: Counter[int] = Counter()
     async with make_client(engine, schema) as (th, broker, _clock):

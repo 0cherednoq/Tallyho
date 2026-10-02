@@ -139,8 +139,11 @@ class MaintenanceRunner(Protocol):
 class EngineFacade(Protocol):
     """Операции T6.1, реализованные внутри engine-слоя."""
 
-    def install(self, adapter: Dispatcher, worker_factory: WorkerFactory) -> None:
-        """Собрать producer, worker и maintenance вокруг адаптера."""
+    def install(self, adapter: Dispatcher | None, worker_factory: WorkerFactory) -> None:
+        """Собрать producer, worker и maintenance вокруг адаптера.
+
+        ``None`` — процесс без брокера: relay не создаётся, outbox не захватывается.
+        """
         ...
 
     async def migrate(self) -> int:
@@ -153,6 +156,10 @@ class EngineFacade(Protocol):
 
     async def run_maintenance_once(self) -> object:
         """Выполнить один проход maintenance."""
+        ...
+
+    async def close(self) -> None:
+        """Остановить фоновый цикл relay и дождаться его."""
         ...
 
     def writer(

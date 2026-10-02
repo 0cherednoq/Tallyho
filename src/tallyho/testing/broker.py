@@ -104,6 +104,15 @@ class InlineBroker(Dispatcher, Runtime, PayloadCodec):
         return self
 
     @property
+    def relay_autostart(self) -> bool:
+        """Relay не отправляет сообщения сам: его проходы вызывают ``step``/``drain``.
+
+        Фоновый цикл relay работает, только пока тест сам запустил
+        ``th.maintenance().run()``.
+        """
+        return False
+
+    @property
     def pending(self) -> int:
         """Число готовых доставок в памяти."""
         return len(self._queue)

@@ -27,6 +27,7 @@ __all__ = [
     "DeadLetters",
     "Dispatcher",
     "Message",
+    "RelayPolicy",
     "Runtime",
     "RuntimeInstaller",
     "Verdict",
@@ -123,6 +124,22 @@ class CallOptionsValidator(Protocol):
 
     def validate_options(self, options: Mapping[str, object]) -> None:
         """Reject invalid options before an Item and its outbox row are written."""
+        ...
+
+
+@runtime_checkable
+class RelayPolicy(Protocol):
+    """Необязательная часть адаптера: кто вызывает проходы relay (ARCHITECTURE §3.2).
+
+    Обычный адаптер этот протокол не реализует: relay сам запускает фоновый
+    цикл при первом ``kick``. Детерминированный тестовый брокер отключает
+    автозапуск и вызывает проходы relay сам, чтобы сообщения не уходили в
+    обход теста.
+    """
+
+    @property
+    def relay_autostart(self) -> bool:
+        """Запускать ли фоновый цикл relay по ``kick`` после commit."""
         ...
 
 

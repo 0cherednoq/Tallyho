@@ -11,7 +11,14 @@ from uuid import UUID
 import pytest
 
 from tallyho.model.states import OutboxKind
-from tallyho.protocols.broker import DeadLetters, Dispatcher, Message, Runtime, Verdict
+from tallyho.protocols.broker import (
+    DeadLetters,
+    Dispatcher,
+    Message,
+    RelayPolicy,
+    Runtime,
+    Verdict,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Sequence
@@ -105,3 +112,5 @@ async def test_runtime_fake_satisfies_protocol() -> None:
 def test_protocols_reject_incomplete_fakes() -> None:
     assert not isinstance(_RecordingDispatcher(), Runtime)
     assert not isinstance(_CountingRuntime(), Dispatcher)
+    # Обычный адаптер политику relay не объявляет: фоновый цикл стартует сам.
+    assert not isinstance(_RecordingDispatcher(), RelayPolicy)

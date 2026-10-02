@@ -10,7 +10,7 @@ import pytest
 
 from tallyho.model.errors import ConfigurationError
 from tallyho.model.states import OutboxKind
-from tallyho.protocols.broker import Dispatcher, Message, Runtime, Verdict
+from tallyho.protocols.broker import Dispatcher, Message, RelayPolicy, Runtime, Verdict
 from tallyho.protocols.serialization import PayloadCodec
 from tallyho.testing import InlineBroker
 
@@ -27,6 +27,8 @@ def test_inline_broker_satisfies_adapter_protocols_and_codec_round_trips() -> No
     assert isinstance(broker, Dispatcher)
     assert isinstance(broker, Runtime)
     assert isinstance(broker, PayloadCodec)
+    assert isinstance(broker, RelayPolicy)
+    assert not broker.relay_autostart
     assert broker.adapter is broker
 
     name = broker.task_name(task)

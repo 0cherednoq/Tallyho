@@ -142,7 +142,7 @@ async def no_items() -> AsyncIterator[ItemView]:
         yield value
 
 
-@dataclass
+@dataclass  # ruff: ignore[too-many-public-methods]  # fake повторяет весь протокол EngineFacade
 class Facade(EngineFacade):
     """Полный записывающий fake чистой engine-границы."""
 
@@ -155,7 +155,7 @@ class Facade(EngineFacade):
         self.context = WriterContext(self.writer_value)
 
     @override
-    def install(self, adapter: Dispatcher, worker_factory: WorkerFactory) -> None:
+    def install(self, adapter: Dispatcher | None, worker_factory: WorkerFactory) -> None:
         _ = adapter
         _ = worker_factory
 
@@ -170,6 +170,10 @@ class Facade(EngineFacade):
     @override
     async def run_maintenance_once(self) -> object:
         return None
+
+    @override
+    async def close(self) -> None:
+        self.calls.append(("close", None))
 
     @override
     def writer(

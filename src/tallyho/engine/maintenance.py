@@ -46,6 +46,10 @@ _LISTENER_UNSUPPORTED: Final = "PostgreSQL driver does not expose LISTEN notific
 
 
 class _Relay(Protocol):
+    def start(self, *, scan_now: bool = False) -> None: ...
+
+    async def stop(self) -> None: ...
+
     async def scan_once(self) -> int: ...
 
 
@@ -132,12 +136,18 @@ def _installation_identity(engine: AsyncEngine) -> str:
 
 @dataclass(eq=False, kw_only=True)
 class Maintenance:
-    """Run recovery services only while this process owns the installation lock."""
+    """Run recovery services only while this process owns the installation lock.
+
+    The relay is not leader-bound (ARCHITECTURE §3.2): while :meth:`run` works,
+    the relay loop of this process is kept running, leader or not. ``relay`` is
+    ``None`` in a process without a broker adapter; such a process never claims
+    the outbox.
+    """
 
     engine: AsyncEngine
-    relay: _Relay
     sweeper: _Sweeper
     snapshotter: _Snapshotter
+    relay: _Relay | None = None
     settings: MaintenanceSettings = field(default_factory=MaintenanceSettings)
     lock_identity: str | None = None
     _stop: asyncio.Event = field(init=False, default_factory=asyncio.Event)
@@ -170,20 +180,30 @@ class Maintenance:
         leadership; the outer loop then obtains a fresh connection and competes
         again.
 
+        The relay loop of this process is started with an immediate safety scan
+        and stopped on exit; it does not depend on leadership.
+
         Raises:
             asyncio.CancelledError: The owner cancels the maintenance task.
         """
         self._stop.clear()
         retry = self.settings.snapshot_tick.total_seconds()
-        while not self._stop.is_set():
-            try:
-                await self._compete(retry)
-            except asyncio.CancelledError:
-                raise
-            except Exception:  # ruff: ignore[blind-except]  # connection loss relinquishes leadership and retries
-                self._leader = False
-                _log.exception("maintenance leader connection failed")
-                await self._wait(retry)
+        relay = self.relay
+        if relay is not None:
+            relay.start(scan_now=True)
+        try:
+            while not self._stop.is_set():
+                try:
+                    await self._compete(retry)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:  # ruff: ignore[blind-except]  # connection loss relinquishes leadership and retries
+                    self._leader = False
+                    _log.exception("maintenance leader connection failed")
+                    await self._wait(retry)
+        finally:
+            if relay is not None:
+                await relay.stop()
 
     async def _compete(self, retry: float) -> None:
         async with self.engine.connect() as leader_conn:
@@ -192,10 +212,10 @@ class Maintenance:
                 await self._wait(retry)
                 return
             self._leader = True
-            self._leader_backend_pid = int(
-                await leader_conn.scalar(select(func.pg_backend_pid())) or 0
-            )
             try:
+                self._leader_backend_pid = int(
+                    await leader_conn.scalar(select(func.pg_backend_pid())) or 0
+                )
                 await self._leader_loop(leader_conn)
             except asyncio.CancelledError:
                 raise
@@ -234,7 +254,6 @@ class Maintenance:
             _ = await conn.scalar(select(literal(1)))
             now = loop.time()
             if now >= next_sweep:
-                _ = await self.relay.scan_once()
                 _ = await self.sweeper.sweep()
                 next_sweep = now + sweep_every
             _ = await self.snapshotter.tick()
@@ -251,10 +270,13 @@ class Maintenance:
 async def run_maintenance_once(maintenance: Maintenance) -> MaintenanceResult:
     """Run one complete pass without leader election, primarily for deterministic tests.
 
+    A process without a broker adapter has no relay: the outbox is left untouched.
+
     Returns:
         Counts and sweep details from the pass.
     """
-    relayed = await maintenance.relay.scan_once()
+    relay = maintenance.relay
+    relayed = 0 if relay is None else await relay.scan_once()
     swept = await maintenance.sweeper.sweep()
     snapshots = await maintenance.snapshotter.tick()
     return MaintenanceResult(relayed=relayed, swept=swept, snapshots=snapshots)

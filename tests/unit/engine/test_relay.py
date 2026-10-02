@@ -21,6 +21,7 @@ def test_settings_defaults_match_section_15() -> None:
     assert settings.grace == timedelta(seconds=5)
     assert settings.chunk == 1000
     assert settings.slot == 0
+    assert settings.scan_interval == timedelta(seconds=5)
 
 
 @pytest.mark.parametrize(
@@ -30,6 +31,7 @@ def test_settings_defaults_match_section_15() -> None:
         (lambda: RelaySettings(grace=timedelta(seconds=-1)), "relay_grace"),
         (lambda: RelaySettings(chunk=0), "chunk"),
         (lambda: RelaySettings(slot=-1), "slot"),
+        (lambda: RelaySettings(scan_interval=timedelta(0)), "scan"),
     ],
 )
 def test_settings_validation(build: Callable[[], RelaySettings], match: str) -> None:

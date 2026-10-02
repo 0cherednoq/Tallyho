@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import logging
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
@@ -323,37 +322,3 @@ async def test_observer_error_does_not_break_dispatch(
     assert observer.calls == [2]
     assert "Observer.relay_dispatched" in caplog.text
     assert await outbox_rows(rel) == []
-
-
-async def test_run_loop_sends_on_kick(rel: RelayEnv) -> None:
-    batch_id = await add_batch(rel, [call(1)])
-    task = asyncio.create_task(rel.relay.run())
-    try:
-        rel.relay.kick([batch_id])
-        _ = await asyncio.wait_for(rel.dispatcher.dispatched.wait(), timeout=10)
-    finally:
-        _ = task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await task
-    assert [message.batch_id for message in rel.dispatcher.messages] == [batch_id]
-
-
-async def test_run_loop_survives_failed_pass(env: Env, caplog: pytest.LogCaptureFixture) -> None:
-    rel = relay_env(env, NOW)
-    broken = rel.another_relay()
-    # Схема, которой нет: проход падает с ошибкой БД, цикл продолжает ждать.
-    broken.engine = env.engine.execution_options(schema_translate_map={None: "no_such_schema"})
-    task = asyncio.create_task(broken.run())
-    try:
-        with caplog.at_level(logging.ERROR, logger="tallyho.engine.relay"):
-            broken.kick([rel.producer.ids.new_id()])
-            for _ in range(200):
-                if "fast-path" in caplog.text:
-                    break
-                await asyncio.sleep(0.05)
-        assert "fast-path" in caplog.text
-        assert not task.done()
-    finally:
-        _ = task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await task

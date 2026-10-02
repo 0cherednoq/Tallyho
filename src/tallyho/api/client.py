@@ -246,6 +246,7 @@ class Tallyho:
         self.serializer = serializer
         self.hooks = HookRegistry()
         self._adapter: Dispatcher | None = None
+        self._installed = False
         self._engine: EngineFacade = create_engine_facade(
             engine,
             schema=schema,
@@ -259,16 +260,28 @@ class Tallyho:
         )
         import_hook_modules(self.hook_modules)
 
-    def install(self, adapter: Dispatcher) -> None:
+    def install(self, adapter: Dispatcher | None) -> None:
         """Связать producer/worker/maintenance с broker adapter.
 
+        С адаптером процесс отправляет сообщения сам: relay стартует при первом
+        commit (ARCHITECTURE §3.2). ``None`` — процесс без брокера (обслуживание,
+        чтение): outbox он не захватывает, ``batch`` и ``call`` недоступны.
+
         Raises:
-            ConfigurationError: adapter уже установлен.
+            ConfigurationError: ``install`` уже вызывался.
         """
-        if self._adapter is not None:
+        if self._installed:
             raise ConfigurationError(_ALREADY_INSTALLED)
         self._engine.install(adapter, load_worker_factory())
         self._adapter = adapter
+        self._installed = True
+
+    async def aclose(self) -> None:
+        """Остановить фоновый цикл relay и дождаться его.
+
+        Вызывается при остановке процесса в том же event loop, где шла работа.
+        """
+        await self._engine.close()
 
     async def migrate(self) -> int:
         """Установить или обновить таблицы.

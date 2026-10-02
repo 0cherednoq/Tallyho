@@ -20,6 +20,12 @@ Relay не зависит от адаптера: он говорит тольк�
 названные батчи, без ``grace``) и :meth:`Relay.scan_once` — страховочный
 проход по всем записям старше ``relay_grace``.
 
+Оба входа обслуживает один фоновый цикл на процесс (ARCHITECTURE §3.2). Он
+стартует лениво в event loop первого ``kick`` либо явно — :meth:`Relay.start`
+(его зовёт ``Maintenance.run``); останавливают его :meth:`Relay.stop` и
+:meth:`Relay.close`. Scan не привязан к лидерству maintenance: параллельные
+проходы разных процессов расходятся по ``FOR UPDATE SKIP LOCKED``.
+
 Окно ``max_in_flight`` считается по ``th_window``: строка на отправленный и
 не завершённый Item. Захват записей батча с окном сериализован
 ``pg_try_advisory_xact_lock``; занятый батч relay пропускает до следующего
@@ -31,9 +37,11 @@ Relay не зависит от адаптера: он говорит тольк�
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import functools
 import hashlib
 import logging
+import threading
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import timedelta
@@ -67,7 +75,7 @@ from tallyho.storage.now import sql_now
 from tallyho.storage.tx import RetryPolicy, run_transaction
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Mapping, Sequence
+    from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
     from datetime import datetime
 
     from sqlalchemy import ColumnElement
@@ -112,20 +120,26 @@ class RelaySettings:
             (``relay_grace``). Свежие записи отправляет fast-path.
         chunk: Сколько записей захватывает один раунд.
         slot: Слот ``th_counter`` для ``dispatched``.
+        scan_interval: Период страховочного scan в фоновом цикле
+            (``sweep_interval``).
     """
 
     claim_ttl: timedelta = timedelta(seconds=30)
     grace: timedelta = timedelta(seconds=5)
     chunk: int = 1000
     slot: int = 0
+    scan_interval: timedelta = timedelta(seconds=5)
 
     def __post_init__(self) -> None:
         """Проверить значения.
 
         Raises:
-            ConfigurationError: неположительный ``claim_ttl`` или ``chunk``,
-                отрицательные ``grace`` или ``slot``.
+            ConfigurationError: неположительный ``claim_ttl``, ``chunk`` или
+                ``scan_interval``, отрицательные ``grace`` или ``slot``.
         """
+        if self.scan_interval <= timedelta(0):
+            message = f"период scan relay должен быть > 0, получено {self.scan_interval}"
+            raise ConfigurationError(message)
         if self.claim_ttl <= timedelta(0):
             message = f"relay_claim_ttl должен быть > 0, получено {self.claim_ttl}"
             raise ConfigurationError(message)
@@ -188,6 +202,42 @@ class _Claim:
     lag: float
 
 
+@dataclass(eq=False, slots=True)
+class _Pump:
+    """Состояние одного запуска фонового цикла."""
+
+    wakeup: asyncio.Event
+    scan_due: bool
+    """Scan нужен в ближайшем проходе, не дожидаясь ``scan_interval``."""
+    stopping: bool = False
+    task: asyncio.Task[None] | None = None
+
+    @property
+    def alive(self) -> bool:
+        # Задача работает, а её event loop ещё не закрыт.
+        task = self.task
+        return task is not None and not task.done() and not task.get_loop().is_closed()
+
+    def wake(self) -> None:
+        # Разбудить цикл из любого потока; закрытый loop будить уже некому.
+        task = self.task
+        if task is None:
+            return
+        owner = task.get_loop()
+        if owner is _running_loop():
+            self.wakeup.set()
+            return
+        with contextlib.suppress(RuntimeError):
+            _ = owner.call_soon_threadsafe(self.wakeup.set)
+
+
+def _running_loop() -> asyncio.AbstractEventLoop | None:
+    try:
+        return asyncio.get_running_loop()
+    except RuntimeError:
+        return None
+
+
 def _uuids(ids: Iterable[UUID]) -> ColumnElement[Sequence[UUID]]:
     return literal(list(ids), ARRAY(Uuid()))
 
@@ -235,6 +285,9 @@ class Relay:
         observer: Получатель события ``relay_dispatched``.
         settings: Параметры relay.
         tx_settings: Таймауты своих транзакций; ``None`` — по умолчанию.
+        autostart: Запускать ли фоновый цикл лениво при :meth:`kick`.
+            ``False`` — проходы вызывает владелец (``InlineBroker``): цикл
+            работает, только пока запущен явно через :meth:`start`.
     """
 
     engine: AsyncEngine
@@ -245,8 +298,11 @@ class Relay:
     settings: RelaySettings = field(default_factory=RelaySettings)
     tx_settings: TxSettings | None = None
     retry: RetryPolicy = field(default_factory=RetryPolicy)
+    autostart: bool = True
     _kicked: set[UUID] = field(init=False, default_factory=set[UUID])
-    _wakeup: asyncio.Event = field(init=False, default_factory=asyncio.Event)
+    _pump: _Pump | None = field(init=False, default=None)
+    _closed: bool = field(init=False, default=False)
+    _guard: threading.Lock = field(init=False, default_factory=threading.Lock)
 
     # --- входы -------------------------------------------------------------
 
@@ -254,14 +310,24 @@ class Relay:
         """Попросить отправить записи батчей (fast-path, UC-01).
 
         Синхронный и быстрый: годится для ``after_commit``. Отправку делает
-        :meth:`run` (или :meth:`flush_kicked`). Потерянный kick страхует scan.
+        фоновый цикл: работающий — будится (в том числе из другого потока),
+        а при ``autostart`` и без цикла — стартует в текущем event loop. Без
+        цикла id копятся до :meth:`flush_kicked`. Потерянный kick страхует scan.
 
         Args:
             batch_ids: Батчи, в outbox которых появились записи.
         """
         self._kicked.update(batch_ids)
-        if self._kicked:
-            self._wakeup.set()
+        if not self._kicked or self._closed:
+            return
+        with self._guard:
+            pump = self._pump
+            if pump is not None and pump.alive:
+                pump.wake()
+                return
+            loop = _running_loop()
+            if self.autostart and loop is not None:
+                self._spawn(loop, scan_now=False)
 
     async def flush_kicked(self) -> int:
         """Отправить готовые записи батчей из :meth:`kick`, не дожидаясь ``grace``.
@@ -271,24 +337,96 @@ class Relay:
         """
         sent = 0
         while self._kicked:
-            batch_ids = frozenset(self._kicked)
-            self._kicked.clear()
-            sent += await self._drain(batch_ids)
+            # Множество подменяется целиком: kick, пришедший во время прохода,
+            # попадает в следующий раунд.
+            kicked, self._kicked = self._kicked, set()
+            sent += await self._drain(frozenset(kicked))
         return sent
 
-    async def run(self) -> None:
-        """Цикл fast-path: ждать :meth:`kick` и отправлять; до отмены задачи.
+    # --- фоновый цикл ------------------------------------------------------
 
-        Ошибка прохода (БД недоступна) не останавливает цикл: записи
-        останутся в outbox, их отправит следующий kick или scan.
+    @property
+    def running(self) -> bool:
+        """Работает ли фоновый цикл."""
+        pump = self._pump
+        return pump is not None and pump.alive
+
+    def start(self, *, scan_now: bool = False) -> None:
+        """Запустить фоновый цикл в текущем event loop; повторный вызов безвреден.
+
+        Вызывается из корутины. После :meth:`close` ничего не делает.
+
+        Args:
+            scan_now: Выполнить страховочный scan сразу, а не через
+                ``scan_interval`` (запуск maintenance подбирает потерянное).
         """
+        if self._closed:
+            return
+        with self._guard:
+            pump = self._pump
+            if pump is not None and pump.alive:
+                if scan_now:
+                    pump.scan_due = True
+                    pump.wake()
+                return
+            self._spawn(asyncio.get_running_loop(), scan_now=scan_now)
+
+    async def stop(self) -> None:
+        """Остановить фоновый цикл и дождаться его; цикл можно запустить снова.
+
+        Остановка мягкая: текущий проход завершается, уже полученные kick
+        отправляются. Задача цикла из другого event loop только получает
+        просьбу остановиться — дождаться её можно лишь в её loop.
+        """
+        with self._guard:
+            pump = self._pump
+            self._pump = None
+        if pump is None or pump.task is None or not pump.alive:
+            return
+        pump.stopping = True
+        pump.wake()
+        if pump.task.get_loop() is asyncio.get_running_loop():
+            # wait, а не await task: отмена самой задачи цикла не должна
+            # выглядеть отменой вызывающего.
+            _ = await asyncio.wait({pump.task})
+
+    async def close(self) -> None:
+        """Остановить цикл насовсем: после закрытия kick только копит id."""
+        self._closed = True
+        await self.stop()
+
+    def _spawn(self, loop: asyncio.AbstractEventLoop, *, scan_now: bool) -> None:
+        pump = _Pump(wakeup=asyncio.Event(), scan_due=scan_now)
+        if self._kicked or scan_now:
+            pump.wakeup.set()
+        pump.task = loop.create_task(self._run(pump), name="tallyho-relay")
+        self._pump = pump
+
+    async def _run(self, pump: _Pump) -> None:
+        # Ошибка прохода (БД недоступна) не останавливает цикл: записи
+        # останутся в outbox, их отправит следующий kick или scan.
+        loop = asyncio.get_running_loop()
+        every = self.settings.scan_interval.total_seconds()
+        next_scan = loop.time() + every
         while True:
-            _ = await self._wakeup.wait()
-            self._wakeup.clear()
-            try:
-                _ = await self.flush_kicked()
-            except Exception:  # ruff: ignore[blind-except]  # fast-path — подсказка, пропуск страхует scan
-                _log.exception("relay: проход fast-path упал")
+            with contextlib.suppress(TimeoutError):
+                async with asyncio.timeout(max(0.0, next_scan - loop.time())):
+                    _ = await pump.wakeup.wait()
+            pump.wakeup.clear()
+            await self._pass(self.flush_kicked, "fast-path")
+            if pump.stopping:
+                return
+            if pump.scan_due or loop.time() >= next_scan:
+                pump.scan_due = False
+                await self._pass(self.scan_once, "scan")
+                next_scan = loop.time() + every
+
+    @staticmethod
+    async def _pass(step: Callable[[], Awaitable[int]], name: str) -> None:
+        try:
+            _ = await step()
+        except Exception:  # ruff: ignore[blind-except]  # проход — страховка: записи остаются в outbox до следующего
+            _log.exception("relay: проход %s упал", name)
 
     async def scan_once(self) -> int:
         """Страховочный проход: вернуть места окна и отправить все записи старше ``grace``.
