@@ -469,9 +469,9 @@
 * **DoD:** каждый A-CH на S1/S2/S3 по 2 минуты запускается локально и даёт вердикт оракула; дефекты библиотеки помечены `xfail` с задачей-владельцем. Длинные прогоны (10/60 мин, 2 ч) — `human`.
 
 #### T11.3b — Все A-CH зелёные без xfail
-* **Зависит:** T11.3, Fix-5, Fix-6, Fix-7, Fix-8, Fix-11
+* **Зависит:** T11.3, Fix-6, Fix-8, Fix-11
 * **Док:** ACCEPTANCE §6; журнал PROGRESS от 2026-10-02 (матрица волны 8)
-* **Сделать:** снять все `xfail` в `tests/acceptance/test_chaos.py`, прогнать матрицу 12 × 3 на двух seed; оставшиеся красные ячейки — новые `Fix-N` с воспроизведением. Проверить Fix-8 на `LEASE_TTL=15 SWEEP_INTERVAL=1`.
+* **Сделать:** снять все `xfail` в `tests/acceptance/test_chaos.py`, прогнать матрицу 12 × 3 на двух seed; оставшиеся красные ячейки — новые `Fix-N` с воспроизведением. Проверить Fix-8 на `LEASE_TTL=15 SWEEP_INTERVAL=1`. A-CH-05 и A-CH-09 помечены дефектом Fix-7 — перепроверить после исправления.
 * **DoD:** `uv run poe acceptance --seed 1 --duration 120 --jobs 4` и то же с `--seed 2` — без xfailed и failed.
 
 #### T11.4 — Сценарии A-UC-01…22 на стенде
@@ -499,7 +499,7 @@
 #### Fix-6 — Движок периодически вызывает `reconcile_dead`
 * **Зависит:** —
 * **Док:** ARCHITECTURE §11.3, D-014; ACCEPTANCE A-CH-04, I-01, I-03, I-10
-* **Сделать:** `Runtime.reconcile_dead` реализован в адаптерах, но engine его не вызывает. Если claim упал с `CompleterError` (PostgreSQL недоступен), flexiq отправляет джобу в DLQ, обработчик `JOB_DEAD` тоже не может записать итог — Item навсегда `active` без lease, outbox и джобы. Добавить проход maintenance: курсор сверки хранится в `th_meta`, мёртвые джобы завершают Items как `error("exhausted")`.
+* **Сделать:** `Runtime.reconcile_dead` реализован в адаптерах, но engine его не вызывает. Если claim упал с `CompleterError` (PostgreSQL недоступен), flexiq отправляет джобу в DLQ, обработчик `JOB_DEAD` тоже не может записать итог — Item навсегда `active` без lease, outbox и джобы. Добавить проход maintenance: курсор сверки хранится в `th_meta`, мёртвые джобы завершают Items как `error("exhausted")`. После Fix-10 у `Maintenance` поле `relay` может быть `None`, а в процессе `th.install(None)` (CLI) адаптера нет: сверку выполняют только процессы с адаптером. Остаток Fix-7: при отказе PostgreSQL дольше суммы backoff ретраев flexiq джоба уходит в DLQ, не выполнившись.
 * **DoD:** интеграционный тест с `InlineBroker`: потерянное событие DLQ → один проход maintenance завершает Item; A-CH-04 на S1 без зависших Items.
 
 #### Fix-7 — Повторная доставка не оставляет Item без исполнителя
@@ -529,7 +529,7 @@
 #### Fix-11 — Закрытие дожидается фоновых задач; SIGTERM возвращает удержанные Items
 * **Зависит:** —
 * **Док:** ARCHITECTURE §3.2, UC-04; ACCEPTANCE A-CH-08; AGENTS.md (RUF006)
-* **Сделать:** фоновые задачи `_Facade._spawn_finalize` и `Operations._background` никто не дожидается: `DROP SCHEMA` в teardown тестов сталкивается с ними дедлоком (виновник — `tests/integration/api/test_batch.py::test_schedule_example_builds_and_seals_pipeline`), в логе воркера на SIGTERM — «Task was destroyed but it is pending», `Completer.close(requeue_held=True)` не вызывается. Дать публичное закрытие (`aclose`), которое дожидается фоновых задач и возвращает удержанные Items; вызвать его из воркера стенда и фикстур.
+* **Сделать:** фоновые задачи `_Facade._spawn_finalize` и `Operations._background` никто не дожидается: `DROP SCHEMA` в teardown тестов сталкивается с ними дедлоком (виновник — `tests/integration/api/test_batch.py::test_schedule_example_builds_and_seals_pipeline`), в логе воркера на SIGTERM — «Task was destroyed but it is pending», `Completer.close(requeue_held=True)` не вызывается. `Tallyho.aclose()` уже есть (Fix-10), но только останавливает relay: расширить `_Facade.close()` в `engine/assembly.py` — дождаться `_background`, задач `Operations` и вызвать `Completer.close(requeue_held=True)`; вызвать `aclose` из воркера стенда и фикстур. Хелпер `settle()` в `tests/integration/api/test_batch.py` заменить на `aclose`. `Relay.stop()` ждёт без таймаута — зависший `dispatch` задержит остановку.
 * **DoD:** тест: после закрытия нет незавершённых задач библиотеки; прогон `tests/integration` на PostgreSQL с логом — 0 дедлоков с участием `DROP SCHEMA`; A-CH-08 оставляет 0 lease при `drain_timeout` по умолчанию.
 
 #### Fix-12 — Запросы на соединении пользователя видят схему установки
@@ -547,8 +547,14 @@
 #### Fix-14 — Мелкие расхождения движка
 * **Зависит:** —
 * **Док:** ARCHITECTURE §7.3 (backoff хуков), §12.4 (`labels`), §3.2 (лидерство), D-024
-* **Сделать:** (1) `Settings.hook_backoff_initial` проверяется, но в engine не передаётся; (2) `view.labels` и `view.metrics` (и поля `BatchSummary`) — один словарь: метки итога вперемешку с метриками `item.incr`; (3) advisory lock лидера maintenance и миграции не учитывает `prefix` — две установки в одной схеме делят лидера; (4) у корня конвейера `progress.found` равен числу под-батчей, хотя D-024 говорит о вычитании виртуальных Items.
+* **Сделать:** (1) `Settings.hook_backoff_initial` проверяется, но в engine не передаётся; (2) `view.labels` и `view.metrics` (и поля `BatchSummary`) — один словарь: метки итога вперемешку с метриками `item.incr`; (3) advisory lock лидера maintenance и миграции не учитывает `prefix` — две установки в одной схеме делят лидера; (4) у корня конвейера `progress.found` равен числу под-батчей, хотя D-024 говорит о вычитании виртуальных Items; (5) `tree_cache.load` в `TaskRuntime._item` после успешного claim бросает сырые ошибки SQLAlchemy, а не подкласс `TallyhoError` (и они не попадают под расширенный `retry_on`).
 * **DoD:** по тесту на каждый пункт.
+
+#### Fix-15 — Дедлайн после явного `cancel()` не меняет итог на `failed`
+* **Зависит:** —
+* **Док:** ARCHITECTURE §6.1 (флаг и причина отмены), UC-12; D-011
+* **Сделать:** `Operations.cancel` и проходы, выставляющие отмену (дедлайн, политика), перезаписывают `cancel_reason` без условия: дедлайн после явного `cancel()` сменит итог с `cancelled` на `failed(deadline)`. Первая причина должна выигрывать (условие `cancel_requested_at IS NULL`); записать правило в ARCHITECTURE §6.1.
+* **DoD:** интеграционные тесты: `cancel()` → дедлайн → итог `cancelled`; дедлайн → `cancel()` → итог `failed`, причина `deadline`.
 
 ### Ф12. Документация и релиз
 
