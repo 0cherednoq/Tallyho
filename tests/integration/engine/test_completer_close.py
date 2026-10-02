@@ -67,7 +67,24 @@ async def test_close_requeues_held_leases(env: Env) -> None:
     # Попытка не тратится: задача не упала.
     async with env.connection() as conn:
         attempt = await conn.scalar(select(item.c.attempt).where(item.c.id == running.id))
+        generations = dict(
+            (
+                await conn.execute(
+                    select(item.c.id, item.c.generation).where(
+                        item.c.id.in_([ref.id for ref in (*seeded.refs, *paused.refs)])
+                    )
+                )
+            ).all()
+        )
     assert attempt == 0
+    # Зато это новая отправка: поколение растёт только у вернувшихся в outbox.
+    assert generations == {
+        running.id: 1,
+        finished.id: 0,
+        stolen.id: 0,
+        released.id: 0,
+        paused.refs[0].id: 1,
+    }
     after = await env.counters(seeded.batch_id)
     assert after.dispatched == before.dispatched - 1
     assert (await env.counters(paused.batch_id)).dispatched == 0

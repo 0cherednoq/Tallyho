@@ -12,6 +12,7 @@ import pytest
 
 from tallyho.model.states import OutboxKind
 from tallyho.protocols.broker import (
+    DeadLetter,
     DeadLetters,
     Dispatcher,
     Message,
@@ -57,7 +58,7 @@ class _CountingRuntime:
         return Verdict.FINAL if isinstance(exc, ValueError) else Verdict.RETRY
 
     async def reconcile_dead(self, since: str | None) -> DeadLetters:
-        return DeadLetters((ITEM,), cursor=since or "c1")
+        return DeadLetters((DeadLetter(ITEM, generation=2),), cursor=since or "c1")
 
 
 class _FixedLimits:
@@ -89,6 +90,7 @@ def test_message_is_immutable_with_empty_options() -> None:
         id=ITEM, batch_id=BATCH, kind=OutboxKind.ITEM, task_name="app.send", payload=b"{}"
     )
     assert message.options == {}
+    assert message.generation == 0
     attribute = "task_name"
     with pytest.raises(dataclasses.FrozenInstanceError):
         setattr(message, attribute, "other")
@@ -119,7 +121,16 @@ async def test_runtime_fake_satisfies_protocol() -> None:
     assert wrapped.__name__ == "_double"
     assert runtime.retry_verdict(ValueError()) is Verdict.FINAL
     assert runtime.retry_verdict(OSError()) is Verdict.RETRY
-    assert await runtime.reconcile_dead(None) == DeadLetters((ITEM,), "c1")
+    dead = await runtime.reconcile_dead(None)
+    assert dead == DeadLetters((DeadLetter(ITEM, 2),), "c1")
+    assert dead.item_ids == (ITEM,)
+    assert not dead.more
+
+
+def test_dead_letter_defaults_to_first_dispatch_without_detail() -> None:
+    letter = DeadLetter(ITEM)
+    assert (letter.generation, letter.detail) == (0, None)
+    assert DeadLetters((), None).item_ids == ()
 
 
 def test_protocols_reject_incomplete_fakes() -> None:

@@ -271,6 +271,13 @@ def build_app(  # ruff: ignore[complex-structure, too-many-statements]  # one fa
         _ = failed.write_text("failed", encoding="utf-8")
         raise RetryableError(key)
 
+    @adapter.task(max_retries=1, retry_delays=[0.01])
+    async def doomed(key: str) -> None:
+        # Fix-6: пока claim падает, функция не вызывается вовсе; после
+        # retry_failed новая джоба выполняет её как обычную задачу.
+        _record(root, "doomed", key=key, job_id=current_job.id)
+        await asyncio.sleep(0)
+
     @adapter.task(max_retries=0)
     async def cancellable(key: str) -> None:
         _record(root, "cancel-start", key=key, job_id=current_job.id)
@@ -332,6 +339,7 @@ def build_app(  # ruff: ignore[complex-structure, too-many-statements]  # one fa
         "soft_timeout": cast("Probe", soft_timeout),
         "hard_timeout": cast("Probe", hard_timeout),
         "requeued": cast("Probe", requeued),
+        "doomed": cast("Probe", doomed),
         "cancellable": cast("Probe", cancellable),
         "limited": cast("Probe", limited),
         "rate_limited": cast("Probe", rate_limited),

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+import json
+import logging
+from dataclasses import dataclass, replace
 from datetime import timedelta
 from typing import TYPE_CHECKING, Protocol, cast, final
 from uuid import uuid4
@@ -20,18 +22,26 @@ from tallyho.model.errors import (
     UnsupportedOption,
 )
 from tallyho.model.states import OutboxKind
-from tallyho.protocols.broker import Dispatcher, Message, RetryLimits, Runtime, Verdict
+from tallyho.protocols.broker import (
+    DeadLetter,
+    Dispatcher,
+    Message,
+    RetryLimits,
+    Runtime,
+    Verdict,
+)
 from tallyho.protocols.serialization import PayloadCodec
 from tallyho.runtime.tracked import TaskRuntime, bind_runtime
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Mapping, Sequence
+    from uuid import UUID
 
     from flexiq import Queue
 
     from tallyho.engine.completer import Completer, FinishResult, ItemRef
     from tallyho.engine.spawn import TreeCache
-    from tallyho.protocols.broker import WorkerRuntime
+    from tallyho.protocols.broker import DeadLetters, WorkerRuntime
 
 __all__: list[str] = []
 
@@ -85,6 +95,10 @@ class _FakeQueue:
         self.payloads: dict[bytes, tuple[tuple[object, ...], dict[str, object]]] = {}
         self.jobs: dict[str, _Job] = {}
         self.page = _Page([], None)
+        self.pages: dict[str | None, _Page] = {}
+        self.page_calls: list[tuple[int, str | None]] = []
+        self.job_calls: list[str] = []
+        self.job_error: Exception | None = None
         self.reject_many_once = False
         self.task_error: Exception | None = None
         self.many_error: Exception | None = None
@@ -128,15 +142,17 @@ class _FakeQueue:
 
     async def aget_job(self, job_id: str) -> object | None:
         await asyncio.sleep(0)
+        self.job_calls.append(job_id)
+        if self.job_error is not None:
+            raise self.job_error
         return self.jobs.get(job_id)
 
     async def adead_letters_after(self, *, limit: int, after: str | None) -> object:
-        assert limit == 1_000
-        assert after in {None, "cursor-1"}
         await asyncio.sleep(0)
+        self.page_calls.append((limit, after))
         if self.page_error is not None:
             raise self.page_error
-        return self.page
+        return self.pages.get(after, self.page)
 
     def _encode_payload(  # pyright: ignore[reportUnusedFunction]  # flexiq SPI вызывается адаптером динамически
         self, task_name: str, args: tuple[object, ...], kwargs: dict[str, object]
@@ -503,23 +519,280 @@ async def test_retry_verdict_matches_registered_filter_for_completer_error(
     await adapter.close()
 
 
-async def test_reconcile_dead_decodes_items_and_preserves_cursor() -> None:
+def _dead_job(
+    adapter: FlexiqAdapter, queue: _FakeQueue, job_id: str, *, generation: int | None = None
+) -> UUID:
+    """Положить в фейковую очередь мёртвую джобу Item и вернуть id Item."""
+    item_id = uuid4()
+    marker: dict[str, object] = {"i": str(item_id), "b": str(uuid4()), "r": 3}
+    if generation is not None:
+        marker["g"] = generation
+    payload = adapter.encode("echo", (), {"_th": marker})
+    queue.jobs[job_id] = _Job(_StoredJob("echo", payload))
+    return item_id
+
+
+def _letter(job_id: str, failed_at: int, **extra: object) -> dict[str, object]:
+    return {"id": f"dl-{job_id}", "original_job_id": job_id, "failed_at": failed_at, **extra}
+
+
+def _cursor(result: DeadLetters) -> dict[str, object]:
+    assert result.cursor is not None
+    return cast("dict[str, object]", json.loads(result.cursor))
+
+
+async def test_reconcile_dead_decodes_items_generation_and_detail() -> None:
     adapter, queue = _adapter()
     name = adapter.task_name(adapter.task(name="echo")(_echo))
-    item_id = uuid4()
-    batch_id = uuid4()
-    payload = adapter.encode(name, (), {"_th": {"i": str(item_id), "b": str(batch_id), "r": 3}})
-    queue.jobs["job-1"] = _Job(_StoredJob(name, payload))
+    assert name == "echo"
+    first = _dead_job(adapter, queue, "job-1")
+    second = _dead_job(adapter, queue, "job-2", generation=2)
     queue.page = _Page(
-        [{"original_job_id": "job-1"}, {"original_job_id": "missing"}, {"other": 1}],
-        "cursor-2",
+        [
+            _letter("job-2", 300, error="x" * 5_000),
+            _letter("job-1", 200, error=""),
+            _letter("missing", 100),
+            {"other": 1},
+        ],
+        None,
     )
 
-    result = await adapter.reconcile_dead("cursor-1")
+    result = await adapter.reconcile_dead(None)
 
-    assert result.item_ids == (item_id,)
-    assert result.cursor == "cursor-2"
+    assert result.entries == (
+        DeadLetter(second, 2, "x" * 1_000),
+        DeadLetter(first, 0, None),
+    )
+    assert result.item_ids == (second, first)
+    assert not result.more
+    assert _cursor(result) == {"w": 300, "h": None, "r": None}
+    assert queue.page_calls == [(200, None)]
     assert EventType.JOB_DEAD in queue.events
+    await adapter.close()
+
+
+async def test_reconcile_dead_first_walk_reads_history_page_by_page() -> None:
+    adapter, queue = _adapter()
+    newest = _dead_job(adapter, queue, "job-3")
+    middle = _dead_job(adapter, queue, "job-2")
+    oldest = _dead_job(adapter, queue, "job-1")
+    queue.pages = {
+        None: _Page([_letter("job-3", 300), _letter("job-2", 200)], "page-2"),
+        "page-2": _Page([_letter("job-1", 100)], None),
+    }
+
+    head = await adapter.reconcile_dead(None)
+    # Обход не закончен: водяной знак ещё прежний, курсор помнит страницу flexiq.
+    assert head.item_ids == (newest, middle)
+    assert head.more
+    assert _cursor(head) == {"w": None, "h": 300, "r": "page-2"}
+
+    tail = await adapter.reconcile_dead(head.cursor)
+    assert tail.item_ids == (oldest,)
+    assert not tail.more
+    assert _cursor(tail) == {"w": 300, "h": None, "r": None}
+    assert queue.page_calls == [(200, None), (200, "page-2")]
+    await adapter.close()
+
+
+async def test_reconcile_dead_rewalks_overlap_and_stops_below_it() -> None:
+    queue = _FakeQueue()
+    adapter = FlexiqAdapter(
+        cast("Queue", cast("object", queue)), dead_letter_overlap=timedelta(milliseconds=100)
+    )
+    adapter.install_runtime(_services(adapter=adapter))
+    fresh = _dead_job(adapter, queue, "fresh")
+    # failed_at ставит воркер: запись воркера с отстающими часами появляется
+    # ниже водяного знака и находится только благодаря перекрытию.
+    late = _dead_job(adapter, queue, "late")
+    _ = _dead_job(adapter, queue, "old")
+    queue.pages = {
+        None: _Page([_letter("fresh", 1_100), _letter("late", 950), _letter("old", 850)], "deep"),
+    }
+    since = json.dumps({"w": 1_000, "h": None, "r": None})
+
+    result = await adapter.reconcile_dead(since)
+
+    assert result.item_ids == (fresh, late)
+    # Запись ниже перекрытия закрывает обход: глубже flexiq не читается.
+    assert not result.more
+    assert _cursor(result) == {"w": 1_100, "h": None, "r": None}
+    assert queue.job_calls == ["fresh", "late"]
+
+    # Следующий обход отдаёт записи перекрытия повторно, но джобы уже не читает.
+    again = await adapter.reconcile_dead(result.cursor)
+    assert again.item_ids == (fresh,)
+    assert _cursor(again) == {"w": 1_100, "h": None, "r": None}
+    assert queue.job_calls == ["fresh", "late"]
+    assert queue.page_calls == [(200, None), (200, None)]
+    await adapter.close()
+
+
+async def test_reconcile_dead_walk_continues_through_full_overlap_pages() -> None:
+    adapter, queue = _adapter()
+    first = _dead_job(adapter, queue, "job-2")
+    second = _dead_job(adapter, queue, "job-1")
+    queue.pages = {
+        None: _Page([_letter("job-2", 2_000)], "next"),
+        "next": _Page([_letter("job-1", 1_500)], None),
+    }
+    since = json.dumps({"w": 1_000, "h": None, "r": None})
+
+    head = await adapter.reconcile_dead(since)
+    assert (head.item_ids, head.more) == ((first,), True)
+    # Водяной знак не двигается, пока обход не дошёл до уже разобранного.
+    assert _cursor(head) == {"w": 1_000, "h": 2_000, "r": "next"}
+    tail = await adapter.reconcile_dead(head.cursor)
+    assert (tail.item_ids, tail.more) == ((second,), False)
+    assert _cursor(tail) == {"w": 2_000, "h": None, "r": None}
+    await adapter.close()
+
+
+async def test_reconcile_dead_watermark_never_moves_back() -> None:
+    adapter, queue = _adapter()
+    _ = _dead_job(adapter, queue, "job-1")
+    since = json.dumps({"w": 5_000, "h": None, "r": None})
+
+    # DLQ очищен retention или в нём остались только старые записи.
+    empty = await adapter.reconcile_dead(since)
+    assert _cursor(empty) == {"w": 5_000, "h": None, "r": None}
+    queue.page = _Page([_letter("job-1", 4_990)], None)
+    older = await adapter.reconcile_dead(empty.cursor)
+
+    assert len(older.entries) == 1
+    assert _cursor(older) == {"w": 5_000, "h": None, "r": None}
+    await adapter.close()
+
+
+async def test_reconcile_dead_does_not_trust_future_timestamps(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    queue = _FakeQueue()
+    adapter = FlexiqAdapter(
+        cast("Queue", cast("object", queue)), dead_letter_overlap=timedelta(milliseconds=100)
+    )
+    adapter.install_runtime(_services(adapter=adapter))
+    _ = _dead_job(adapter, queue, "job-1")
+    queue.page = _Page([_letter("job-1", 10**15)], None)
+
+    def now_ms() -> int:
+        return 1_000
+
+    monkeypatch.setattr(adapter_module, "_now_ms", now_ms)
+
+    result = await adapter.reconcile_dead(None)
+
+    # Запись «из будущего» разобрана, но водяной знак не уходит дальше часов процесса.
+    assert len(result.entries) == 1
+    assert _cursor(result) == {"w": 1_100, "h": None, "r": None}
+    await adapter.close()
+
+
+@pytest.mark.parametrize(
+    "since",
+    ["not-json", "[]", "{}", '{"w":"1","h":null,"r":null}', '{"w":true,"h":null,"r":null}', "7"],
+)
+async def test_reconcile_dead_restarts_from_unknown_cursor(
+    since: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    adapter, queue = _adapter()
+    item_id = _dead_job(adapter, queue, "job-1")
+    queue.page = _Page([_letter("job-1", 100)], "ignored")
+
+    with caplog.at_level(logging.WARNING):
+        result = await adapter.reconcile_dead(since)
+
+    assert "не распознан" in caplog.text
+    assert result.item_ids == (item_id,)
+    assert queue.page_calls == [(200, None)]
+    await adapter.close()
+
+
+async def test_reconcile_dead_skips_undecodable_and_malformed_jobs(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    adapter, queue = _adapter()
+    _ = _dead_job(adapter, queue, "bad-generation", generation=-1)
+    payload = adapter.encode("echo", (), {"_th": {"i": str(uuid4()), "b": str(uuid4()), "g": True}})
+    queue.jobs["bool-generation"] = _Job(_StoredJob("echo", payload))
+    callback = adapter.encode("echo", (), {"_th": {"c": str(uuid4()), "b": str(uuid4())}})
+    queue.jobs["callback"] = _Job(_StoredJob("echo", callback))
+    queue.page = _Page(
+        [
+            _letter("bad-generation", 4),
+            _letter("bool-generation", 3),
+            _letter("callback", 2),
+            {"original_job_id": "no-stamp"},
+        ],
+        None,
+    )
+    assert (await adapter.reconcile_dead(None)).entries == ()
+
+    _ = _dead_job(adapter, queue, "broken")
+    queue.page = _Page([_letter("broken", 5)], None)
+    queue.decode_error = RuntimeError(_FAILURE)
+    with caplog.at_level(logging.WARNING):
+        result = await adapter.reconcile_dead(None)
+    # Одна нечитаемая запись не останавливает сверку: курсор идёт дальше.
+    assert result.entries == ()
+    assert _cursor(result) == {"w": 5, "h": None, "r": None}
+    assert "не декодируется" in caplog.text
+    await adapter.close()
+
+
+async def test_reconcile_dead_fails_when_job_cannot_be_read() -> None:
+    adapter, queue = _adapter()
+    queue.page = _Page([_letter("job-1", 1)], None)
+    queue.job_error = RuntimeError(_FAILURE)
+
+    with pytest.raises(TallyhoError) as info:
+        _ = await adapter.reconcile_dead(None)
+
+    assert info.value.__cause__ is queue.job_error
+    # Сбой чтения не запоминается: следующий проход прочитает джобу снова.
+    queue.job_error = None
+    item_id = _dead_job(adapter, queue, "job-1")
+    assert (await adapter.reconcile_dead(None)).item_ids == (item_id,)
+    await adapter.close()
+
+
+async def test_reconcile_dead_cache_is_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
+    adapter, queue = _adapter()
+    monkeypatch.setattr(adapter_module, "_DLQ_CACHE", 1)
+    first = _dead_job(adapter, queue, "job-1")
+    second = _dead_job(adapter, queue, "job-2")
+    queue.page = _Page([_letter("job-2", 2), _letter("job-1", 1)], None)
+
+    for _ in range(2):
+        assert (await adapter.reconcile_dead(None)).item_ids == (second, first)
+
+    # Влезает одна запись: вытесненную джобу адаптер читает заново.
+    assert queue.job_calls == ["job-2", "job-1", "job-2", "job-1"]
+    await adapter.close()
+
+
+def test_negative_dead_letter_overlap_is_rejected() -> None:
+    with pytest.raises(ConfigurationError, match="dead_letter_overlap"):
+        _ = FlexiqAdapter(
+            cast("Queue", cast("object", _FakeQueue())), dead_letter_overlap=timedelta(seconds=-1)
+        )
+
+
+async def test_item_marker_carries_generation_only_after_redispatch() -> None:
+    adapter, queue = _adapter()
+    name = adapter.task_name(adapter.task(name="echo")(_echo))
+    first = _message(adapter, name)
+    again = replace(_message(adapter, name), generation=2)
+
+    await adapter.dispatch([first, again])
+
+    markers = [
+        kwargs["_th"] for kwargs in cast("list[dict[str, object]]", queue.many[0]["kwargs_list"])
+    ]
+    assert markers == [
+        {"i": str(first.id), "b": str(first.batch_id), "r": 3},
+        {"i": str(again.id), "b": str(again.batch_id), "r": 3, "g": 2},
+    ]
     await adapter.close()
 
 
@@ -563,7 +836,7 @@ def test_uuid_marker_parser_rejects_bad_dlq_identity() -> None:
 
     result = asyncio.run(adapter.reconcile_dead(None))
 
-    assert result.item_ids == ()
+    assert result.entries == ()
 
 
 def test_uninstalled_operations_and_unknown_task_are_rejected() -> None:

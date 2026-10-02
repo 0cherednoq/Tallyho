@@ -1,4 +1,4 @@
-"""Миграции без БД: проверка имён, DDL версии 1 против golden-снимка, операции версий 2-4."""
+"""Миграции без БД: проверка имён, DDL версии 1 против golden-снимка, операции версий 2-5."""
 
 from __future__ import annotations
 
@@ -109,6 +109,24 @@ def test_earlier_versions_do_not_create_lease_redelivered(version: int) -> None:
     # Версии 1-3 заморожены: колонку добавляет только миграция 4.
     sql = "\n".join(compiled(s) for s in migration_statements(version, schema="app"))
     assert "redelivered" not in sql
+
+
+def test_version_five_adds_item_generation() -> None:
+    statements = migration_statements(5, schema='we"ird; DROP', prefix="acme_")
+    sql = [compiled(statement).strip() for statement in statements]
+    assert sql[0] == "SET LOCAL lock_timeout = '5000ms'"
+    assert sql[1] == (
+        'ALTER TABLE "we""ird; DROP".acme_item ADD COLUMN generation INTEGER DEFAULT 0 NOT NULL'
+    )
+    assert "VALUES ('schema_version', '5')" in sql[2]
+    assert len(sql) == 3
+
+
+@pytest.mark.parametrize("version", [1, 2, 3, 4])
+def test_earlier_versions_do_not_create_item_generation(version: int) -> None:
+    # Версии 1-4 заморожены: колонку добавляет только миграция 5.
+    sql = "\n".join(compiled(s) for s in migration_statements(version, schema="app"))
+    assert "generation" not in sql
 
 
 def test_version_three_uses_prefix_and_quotes_schema() -> None:

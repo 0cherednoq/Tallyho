@@ -53,6 +53,12 @@ async def attempt_of(env: Env, item_id: UUID) -> int:
         return int(await conn.scalar(select(item.c.attempt).where(item.c.id == item_id)) or 0)
 
 
+async def generation_of(env: Env, item_id: UUID) -> int:
+    item = env.tables.item
+    async with env.connection() as conn:
+        return int(await conn.scalar(select(item.c.generation).where(item.c.id == item_id)) or 0)
+
+
 async def test_fresh_lease_is_not_redelivered(env: Env) -> None:
     seeded = await seed(env, 1)
     ref = seeded.refs[0]
@@ -133,6 +139,9 @@ async def test_release_after_duplicate_returns_item_to_outbox(env: Env) -> None:
     assert await lease_row(env, ref.id) is None
     assert await attempt_of(env, ref.id) == 1
     assert await attempt_of(env, plain.id) == 1
+    # Возврат в outbox — новое поколение отправки; обычный release его не меняет.
+    assert await generation_of(env, ref.id) == 1
+    assert await generation_of(env, plain.id) == 0
     # Из двух отправленных Items у брокера остался один: второй вернулся в outbox.
     assert (await env.counters(seeded.batch_id)).dispatched == 1
 

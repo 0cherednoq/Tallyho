@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, TypeVar
 
 from tallyho.engine.completer import Completer, CompleterSettings, CompleterTriggers
+from tallyho.engine.dead_letters import DeadLetterReconciler, DeadLetterSettings
 from tallyho.engine.finalizer import Finalizer, FinalizerSettings
 from tallyho.engine.installation import RuntimeServices, create_installation, migrate_installation
 from tallyho.engine.maintenance import (
@@ -302,6 +303,9 @@ class _Facade:
         self._maintenance = Maintenance(
             engine=value.engine,
             relay=relay,
+            dead_letters=self._build_dead_letters(
+                adapter, relay=relay, finalizer=finalizer, slot=slot, retry=retry
+            ),
             sweeper=sweeper,
             snapshotter=snapshotter,
             settings=MaintenanceSettings(
@@ -357,6 +361,31 @@ class _Facade:
             retry=retry,
             autostart=adapter.relay_autostart if isinstance(adapter, RelayPolicy) else True,
         )
+
+    def _build_dead_letters(
+        self,
+        adapter: object,
+        *,
+        relay: Relay | None,
+        finalizer: Finalizer,
+        slot: int,
+        retry: RetryPolicy,
+    ) -> DeadLetterReconciler | None:
+        # Читать DLQ умеет только адаптер брокера: сверку выполняют процессы,
+        # где он установлен, в цикле relay после каждого scan (ARCHITECTURE UC-15).
+        if relay is None or not isinstance(adapter, Runtime):
+            return None
+        reconciler = DeadLetterReconciler(
+            tables=self.installation.tables,
+            engine=self.installation.engine,
+            clock=self.clock,
+            source=adapter,
+            finalizer=finalizer,
+            relay=relay,
+            settings=DeadLetterSettings(slot=slot, retry=retry),
+        )
+        relay.after_scan = reconciler.reconcile_once
+        return reconciler
 
     def _install_worker(
         self,

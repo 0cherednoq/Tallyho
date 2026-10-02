@@ -82,3 +82,14 @@ def test_version_four_offline_script_is_safe_and_complete() -> None:
     assert "VALUES ('schema_version', '4')" in sql
     assert "%(" not in sql
     assert "th_" not in sql
+
+
+def test_version_five_offline_script_is_safe_and_complete() -> None:
+    sql = offline_sql(version=5, schema='we"ird', prefix="acme_")
+    assert sql.startswith("SET LOCAL lock_timeout = '5000ms';")
+    assert (
+        'ALTER TABLE "we""ird".acme_item ADD COLUMN generation INTEGER DEFAULT 0 NOT NULL;'
+    ) in sql
+    assert "VALUES ('schema_version', '5')" in sql
+    assert "%(" not in sql
+    assert "th_" not in sql

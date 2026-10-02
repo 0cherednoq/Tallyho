@@ -157,7 +157,12 @@ async def test_claim_during_pause_parks_dispatched_item(env: Env) -> None:
             .select_from(env.tables.outbox)
             .where(env.tables.outbox.c.item_id == item_id)
         )
+        generation = await conn.scalar(
+            select(env.tables.item.c.generation).where(env.tables.item.c.id == item_id)
+        )
     assert parked == 1
+    # Возврат в outbox — новое поколение отправки (ARCHITECTURE §5.1).
+    assert generation == 1
 
 
 async def test_retry_stage_rejects_terminal_downstream(env: Env) -> None:
@@ -304,6 +309,12 @@ async def test_retry_failed_requeues_selected_label(env: Env) -> None:
                 finished_at=func.now(),
             )
         )
+        # Второй Item уже возвращался в outbox трижды: повтор увеличивает поколение.
+        _ = await conn.execute(
+            update(env.tables.item)
+            .where(env.tables.item.c.id == second_hard_id)
+            .values(generation=3)
+        )
         _ = await conn.execute(
             update(env.tables.item)
             .where(env.tables.item.c.id == soft_id)
@@ -367,17 +378,26 @@ async def test_retry_failed_requeues_selected_label(env: Env) -> None:
                     env.tables.item.c.result,
                     env.tables.item.c.error,
                     env.tables.item.c.finished_at,
+                    env.tables.item.c.generation,
                 )
                 .where(env.tables.item.c.id.in_(hard_ids))
                 .order_by(env.tables.item.c.id)
             )
         ] == [
-            (int(ItemState.ACTIVE), None, 0, None, None, None),
-            (int(ItemState.ACTIVE), None, 0, None, None, None),
+            (int(ItemState.ACTIVE), None, 0, None, None, None, 1),
+            (int(ItemState.ACTIVE), None, 0, None, None, None, 4),
         ]
         assert await conn.scalar(
             select(env.tables.item.c.state).where(env.tables.item.c.id == soft_id)
         ) == int(ItemState.ERROR)
+        # Не повторённые Items остаются в прежнем поколении.
+        assert list(
+            await conn.scalars(
+                select(env.tables.item.c.generation).where(
+                    env.tables.item.c.id.in_([soft_id, active_id])
+                )
+            )
+        ) == [0, 0]
         outbox = (
             await conn.execute(
                 select(

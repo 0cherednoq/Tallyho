@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from tallyho.protocols.broker import (
+    DeadLetter,
     DeadLetters,
     Dispatcher,
     Message,
@@ -28,6 +29,7 @@ from tallyho.protocols.serialization import (
 __all__ = [
     "CallArgs",
     "Clock",
+    "DeadLetter",
     "DeadLetters",
     "Dispatcher",
     "IdFactory",

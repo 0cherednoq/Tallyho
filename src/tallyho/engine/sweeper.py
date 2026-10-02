@@ -7,18 +7,22 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import timedelta
 from functools import partial
+from itertools import starmap
 from typing import TYPE_CHECKING, Protocol, TypeVar, cast
 
 from sqlalchemy import (
     DateTime,
     SmallInteger,
+    Uuid,
     delete,
     func,
+    literal,
     literal_column,
     or_,
     select,
     update,
 )
+from sqlalchemy.dialects.postgresql import ARRAY, JSONB
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from tallyho.engine.operations import Operations
@@ -45,7 +49,7 @@ from tallyho.storage.now import sql_now
 from tallyho.storage.tx import RetryPolicy, TxSettings, run_transaction
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable, Iterable, Sequence
+    from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
     from datetime import datetime
     from uuid import UUID
 
@@ -57,7 +61,7 @@ if TYPE_CHECKING:
     from tallyho.protocols.observer import Observer
     from tallyho.storage.tables import Tables
 
-__all__ = ["SweepResult", "Sweeper", "SweeperSettings"]
+__all__ = ["FinishRow", "SweepResult", "Sweeper", "SweeperSettings", "finish_active"]
 
 _ACTIVE = literal_column(str(int(ItemState.ACTIVE)), SmallInteger())
 _ITEM = literal_column(str(int(OutboxKind.ITEM)), SmallInteger())
@@ -183,10 +187,96 @@ class _LeaseRow:
 
 
 @dataclass(frozen=True, slots=True)
-class _FinishRow:
+class FinishRow:
+    """Item, который восстановительный проход завершает сам, без задачи."""
+
     item_id: UUID
     batch_id: UUID
     weight: int
+
+
+async def finish_active(  # ruff: ignore[too-many-arguments]  # итог и учёт Item задаются именованными параметрами
+    conn: AsyncConnection,
+    tables: Tables,
+    rows: Sequence[FinishRow],
+    *,
+    slot: int,
+    state: ItemState,
+    label: str,
+    now: datetime,
+    errors: Mapping[UUID, object] | None = None,
+) -> tuple[int, tuple[UUID, ...]]:
+    """Завершить активные Items идемпотентным CAS и учесть только изменённые.
+
+    Общий путь восстановительных проходов: истёкший lease и срок ``expires``
+    (Sweeper), мёртвая джоба (сверка с DLQ). Вызывающий держит блокировки
+    строк ``th_item``.
+
+    Args:
+        conn: Соединение в открытой транзакции.
+        tables: Таблицы установки.
+        rows: Кандидаты; уже терминальные Items пропускаются.
+        slot: Слот ``th_counter`` и ``th_metric``.
+        state: Терминальное состояние.
+        label: Метка итога.
+        now: Время завершения.
+        errors: ``th_item.error`` по id Item; ``None`` — колонку не менять.
+
+    Returns:
+        Число завершённых Items и батчи, в окне которых освободились места.
+    """
+    if not rows:
+        return 0, ()
+    item = tables.item
+    item_ids = [row.item_id for row in rows]
+    values: dict[str, object] = {"state": int(state), "label": label, "finished_at": now}
+    statement = update(item).where(item.c.state == _ACTIVE)
+    if errors is None:
+        statement = statement.where(item.c.id.in_(item_ids))
+    else:
+        details = (
+            func.unnest(
+                literal(item_ids, ARRAY(Uuid())),
+                literal([errors.get(item_id) for item_id in item_ids], ARRAY(JSONB())),
+            )
+            .table_valued("id", "error")
+            .render_derived("u")
+        )
+        statement = statement.where(item.c.id == details.c.id)
+        values["error"] = details.c.error
+    changed_result = await conn.execute(
+        statement.values(**values).returning(item.c.id, item.c.batch_id, item.c.weight)
+    )
+    changed = list(starmap(FinishRow, cast("Iterable[tuple[UUID, UUID, int]]", changed_result)))
+    changed_ids = [row.item_id for row in changed]
+    if not changed:
+        return 0, ()
+    for side in (tables.lease, tables.expiry):
+        _ = await conn.execute(delete(side).where(side.c.item_id.in_(changed_ids)))
+    deltas: defaultdict[UUID, CounterDelta] = defaultdict(CounterDelta)
+    metrics: defaultdict[tuple[UUID, str, int], int] = defaultdict(int)
+    counter_name = state.name.lower()
+    for row in changed:
+        deltas[row.batch_id] += CounterDelta(**{counter_name: 1, "w_done": row.weight})
+        metrics[row.batch_id, label, slot] += 1
+    await upsert_slots(
+        conn,
+        tables,
+        {(batch_id, slot): delta for batch_id, delta in deltas.items()},
+    )
+    await upsert_metrics(conn, tables, metrics)
+    if state is ItemState.ERROR:
+        mark = tables.item_mark
+        mark_stmt = pg_insert(mark).values(
+            [{"batch_id": row.batch_id, "label": label, "item_id": row.item_id} for row in changed]
+        )
+        _ = await conn.execute(
+            mark_stmt.on_conflict_do_nothing(
+                index_elements=[mark.c.batch_id, mark.c.label, mark.c.item_id]
+            )
+        )
+    kick = tuple(await release_window(conn, tables, changed_ids))
+    return len(changed), kick
 
 
 @dataclass(eq=False, kw_only=True)
@@ -364,29 +454,31 @@ class Sweeper:
         )
         rows = await self._lock_lease_rows(conn, candidate_ids)
         requeue: list[_LeaseRow] = []
-        finishes: list[_FinishRow] = []
+        finishes: list[FinishRow] = []
         terminal: list[UUID] = []
-        cancelled: list[_FinishRow] = []
+        cancelled: list[FinishRow] = []
         for row in rows:
             if row.item_state.is_terminal:
                 terminal.append(row.item_id)
             elif row.cancelled:
-                cancelled.append(_FinishRow(row.item_id, row.batch_id, row.weight))
+                cancelled.append(FinishRow(row.item_id, row.batch_id, row.weight))
             elif row.attempt < self._max_retries(row):
                 requeue.append(row)
             else:
-                finishes.append(_FinishRow(row.item_id, row.batch_id, row.weight))
+                finishes.append(FinishRow(row.item_id, row.batch_id, row.weight))
         handled_ids = [row.item_id for row in requeue] + terminal
         if handled_ids:
             _ = await conn.execute(delete(lease).where(lease.c.item_id.in_(handled_ids)))
         if requeue:
             await self._requeue(conn, requeue, now)
             # Истёкший lease тратит попытку, как перехват lease в claim (UC-15).
+            # Возврат в outbox — новое поколение отправки: мёртвую джобу
+            # прошлой отправки сверка с DLQ к Item уже не отнесёт.
             item = self.tables.item
             _ = await conn.execute(
                 update(item)
                 .where(item.c.id.in_([row.item_id for row in requeue]))
-                .values(attempt=item.c.attempt + 1)
+                .values(attempt=item.c.attempt + 1, generation=item.c.generation + 1)
             )
             deltas: defaultdict[UUID, CounterDelta] = defaultdict(CounterDelta)
             for row in requeue:
@@ -473,55 +565,15 @@ class Sweeper:
     async def _finish_rows(
         self,
         conn: AsyncConnection,
-        rows: Sequence[_FinishRow],
+        rows: Sequence[FinishRow],
         *,
         state: ItemState,
         label: str,
         now: datetime,
     ) -> tuple[int, tuple[UUID, ...]]:
-        if not rows:
-            return 0, ()
-        item = self.tables.item
-        item_ids = [row.item_id for row in rows]
-        changed_result = await conn.execute(
-            update(item)
-            .where(item.c.id.in_(item_ids), item.c.state == _ACTIVE)
-            .values(state=int(state), label=label, finished_at=now)
-            .returning(item.c.id, item.c.batch_id, item.c.weight)
+        return await finish_active(
+            conn, self.tables, rows, slot=self.settings.slot, state=state, label=label, now=now
         )
-        changed = [self._finish_row(row) for row in changed_result]
-        changed_ids = [row.item_id for row in changed]
-        if not changed:
-            return 0, ()
-        for side in (self.tables.lease, self.tables.expiry):
-            _ = await conn.execute(delete(side).where(side.c.item_id.in_(changed_ids)))
-        deltas: defaultdict[UUID, CounterDelta] = defaultdict(CounterDelta)
-        metrics: defaultdict[tuple[UUID, str, int], int] = defaultdict(int)
-        counter_name = state.name.lower()
-        for row in changed:
-            deltas[row.batch_id] += CounterDelta(**{counter_name: 1, "w_done": row.weight})
-            metrics[row.batch_id, label, self.settings.slot] += 1
-        await upsert_slots(
-            conn,
-            self.tables,
-            {(batch_id, self.settings.slot): delta for batch_id, delta in deltas.items()},
-        )
-        await upsert_metrics(conn, self.tables, metrics)
-        if state is ItemState.ERROR:
-            mark = self.tables.item_mark
-            mark_stmt = pg_insert(mark).values(
-                [
-                    {"batch_id": row.batch_id, "label": label, "item_id": row.item_id}
-                    for row in changed
-                ]
-            )
-            _ = await conn.execute(
-                mark_stmt.on_conflict_do_nothing(
-                    index_elements=[mark.c.batch_id, mark.c.label, mark.c.item_id]
-                )
-            )
-        kick = tuple(await release_window(conn, self.tables, changed_ids))
-        return len(changed), kick
 
     async def _finalize_candidates(self, conn: AsyncConnection) -> tuple[UUID, ...]:
         now = await self._now(conn)
@@ -835,9 +887,9 @@ class Sweeper:
         )
 
     @staticmethod
-    def _finish_row(row: object) -> _FinishRow:
+    def _finish_row(row: object) -> FinishRow:
         values = tuple(cast("Iterable[object]", row))
-        return _FinishRow(
+        return FinishRow(
             item_id=cast("UUID", values[0]),
             batch_id=cast("UUID", values[1]),
             weight=cast("int", values[2]),

@@ -129,6 +129,7 @@ CREATE TABLE th_item (
 	error JSONB,
 	created_at TIMESTAMP WITH TIME ZONE NOT NULL,
 	finished_at TIMESTAMP WITH TIME ZONE,
+	generation INTEGER DEFAULT 0 NOT NULL,
 	PRIMARY KEY (id)
 )
  WITH (fillfactor = 85);

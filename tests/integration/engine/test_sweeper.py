@@ -213,8 +213,19 @@ async def test_expire_leases_requeues_exhausts_and_cleans_terminal(env: Env) -> 
         cancelled_state = await conn.scalar(
             select(env.tables.item.c.state).where(env.tables.item.c.id == cancelled_ids[0])
         )
+        generations = dict(
+            (
+                await conn.execute(
+                    select(env.tables.item.c.id, env.tables.item.c.generation).where(
+                        env.tables.item.c.id.in_(ids)
+                    )
+                )
+            ).all()
+        )
     assert rows[ids[0]] == int(ItemState.ACTIVE)
     assert [row[2] for row in await item_rows(env, ids[:2])] == [1, 1]
+    # Возврат в outbox — новое поколение отправки; завершённые Items его не меняют.
+    assert [generations[item_id] for item_id in ids] == [1, 0, 0]
     assert rows[ids[1]] == int(ItemState.ERROR)
     assert rows[ids[2]] == int(ItemState.OK)
     assert queued == 1

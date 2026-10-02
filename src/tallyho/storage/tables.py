@@ -204,6 +204,8 @@ class ItemColumns(TypedColumns):
     error = _jsonb(nullable=True)
     created_at = _utc()
     finished_at = _utc(nullable=True)
+    generation = _int(default=0)
+    """Поколение отправки: растёт при каждом возврате Item в outbox (ARCHITECTURE §5.1)."""
 
 
 @final
@@ -359,6 +361,7 @@ def build_metadata(
     *,
     _delta_timestamps: bool = True,
     _lease_redelivery: bool = True,
+    _item_generation: bool = True,
 ) -> Tables:
     """Описать таблицы tallyho с префиксом ``prefix`` в новом ``MetaData``.
 
@@ -374,7 +377,7 @@ def build_metadata(
         metadata=metadata,
         batch=_batch(metadata, prefix),
         batch_attr=_batch_attr(metadata, prefix),
-        item=_item(metadata, prefix),
+        item=_item(metadata, prefix, generation=_item_generation),
         outbox=_outbox(metadata, prefix),
         lease=_lease(metadata, prefix, redelivery=_lease_redelivery),
         feed=_feed(metadata, prefix),
@@ -460,9 +463,38 @@ def _batch_attr(metadata: MetaData, prefix: str) -> Table[BatchAttrColumns]:
     return attr
 
 
-def _item(metadata: MetaData, prefix: str) -> Table[ItemColumns]:
+def _item(metadata: MetaData, prefix: str, *, generation: bool) -> Table[ItemColumns]:
     name = f"{prefix}item"
-    item = Table(name, metadata, ItemColumns, postgresql_with={"fillfactor": _ITEM_FILLFACTOR})
+    item: Table[ItemColumns]
+    if generation:
+        item = Table(name, metadata, ItemColumns, postgresql_with={"fillfactor": _ITEM_FILLFACTOR})
+    else:
+        # Схема до версии 5 заморожена без generation; колонку добавляет
+        # миграция v5. Этот путь используется только генератором миграций v1-v4.
+        item = cast(
+            "Table[ItemColumns]",
+            Table(
+                name,
+                metadata,
+                Column("id", Uuid(), primary_key=True),
+                Column("batch_id", Uuid(), nullable=False),
+                Column("state", SmallInteger(), nullable=False),
+                Column("label", Text(), nullable=True),
+                Column("attempt", SmallInteger(), nullable=False, server_default=text("0")),
+                Column("depth", SmallInteger(), nullable=False, server_default=text("0")),
+                Column("task_name", Text(), nullable=False),
+                Column("payload", LargeBinary(), nullable=False),
+                Column("options", JSONB(), nullable=True),
+                Column("key", Text(), nullable=True),
+                Column("child_batch_id", Uuid(), nullable=True),
+                Column("weight", Integer(), nullable=False, server_default=text("1")),
+                Column("result", JSONB(), nullable=True),
+                Column("error", JSONB(), nullable=True),
+                Column("created_at", DateTime(timezone=True), nullable=False),
+                Column("finished_at", DateTime(timezone=True), nullable=True),
+                postgresql_with={"fillfactor": _ITEM_FILLFACTOR},
+            ),
+        )
     c = item.c
     # Только неизменяемые колонки: finish остаётся HOT update.
     Index(f"{name}_batch_idx", c.batch_id, c.id)

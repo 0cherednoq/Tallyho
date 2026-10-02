@@ -481,6 +481,8 @@ class Operations:
                     state=int(ItemState.ACTIVE),
                     label=None,
                     attempt=0,
+                    # Новая отправка: записи DLQ прошлых джоб этот Item больше не завершают (UC-15).
+                    generation=item.c.generation + 1,
                     result=None,
                     error=None,
                     finished_at=None,

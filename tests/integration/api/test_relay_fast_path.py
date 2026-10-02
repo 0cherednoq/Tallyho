@@ -10,7 +10,7 @@ import asyncio
 import itertools
 from datetime import timedelta
 from time import monotonic
-from typing import TYPE_CHECKING, Protocol, final
+from typing import TYPE_CHECKING, ParamSpec, Protocol, TypeVar, final
 
 import pytest
 from sqlalchemy import func, select
@@ -18,15 +18,20 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from typing_extensions import override
 
 from tallyho import Tallyho
+from tallyho.model.states import BatchState
+from tallyho.protocols.broker import DeadLetter, DeadLetters, Verdict
 from tests.helpers.relay import RecordingDispatcher
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator, Callable
+    from collections.abc import AsyncGenerator, Awaitable, Callable
     from uuid import UUID
 
     from tests.integration.engine.conftest import Env
 
 __all__: list[str] = []
+
+P = ParamSpec("P")
+R = TypeVar("R")
 
 RELAY_GRACE = timedelta(seconds=5)
 """Умолчание ``relay_grace``: раньше этого срока запись отправляет только fast-path."""
@@ -46,6 +51,25 @@ class CrashedBeforeDispatch(RecordingDispatcher):
     @override
     async def dispatch(self, messages: object) -> None:
         raise AssertionError(messages)
+
+
+@final
+class BrokerWithDeadLetters(RecordingDispatcher):
+    """Брокер, который принял сообщения и отправил все их джобы в DLQ, не выполнив."""
+
+    def wrap(self, fn: Callable[P, Awaitable[R]]) -> Callable[P, Awaitable[R]]:
+        return fn
+
+    def retry_verdict(self, exc: BaseException) -> Verdict:
+        _ = exc
+        return Verdict.FINAL
+
+    async def reconcile_dead(self, since: str | None) -> DeadLetters:
+        await asyncio.sleep(0)
+        offset = 0 if since is None else int(since)
+        dead = self.messages
+        entries = tuple(DeadLetter(message.id, message.generation) for message in dead[offset:])
+        return DeadLetters(entries, str(len(dead)))
 
 
 async def send_email(address: str) -> None:
@@ -218,3 +242,31 @@ async def test_maintenance_in_process_with_adapter_scans_immediately(
 
     assert {message.batch_id for message in dispatcher.messages} == {lost}
     assert await outbox_size(env) == 0
+
+
+async def test_dead_letters_are_reconciled_by_process_with_adapter_not_by_leader(
+    env: Env, clients: Clients
+) -> None:
+    """Fix-6: лидер maintenance без адаптера DLQ не читает — сверяет процесс с брокером."""
+    leader = Tallyho(env.engine, schema=env.schema, sweep_interval=timedelta(milliseconds=50))
+    leader.install(None)
+    runner = leader.maintenance()
+    task = asyncio.create_task(runner.run())
+    broker = BrokerWithDeadLetters()
+    th = clients(broker, sweep_interval=timedelta(milliseconds=50))
+    try:
+        # Commit запускает цикл relay процесса: fast-path отправляет Items, а
+        # после каждого scan идёт сверка с DLQ.
+        batch_id = await create_batch(th, "dead", addresses=3)
+        handle = th.handle(batch_id)
+        view = await handle.wait(timeout=timedelta(seconds=15))
+    finally:
+        runner.stop()
+        await task
+        await leader.aclose()
+
+    assert len(broker.messages) == 3
+    assert view.state is BatchState.COMPLETED_WITH_ERRORS
+    assert (view.progress.error, view.labels) == (3, {"exhausted": 3})
+    # В процессе без адаптера сверки нет вовсе.
+    assert getattr(await leader.run_maintenance_once(), "dead_letters", None) == 0
