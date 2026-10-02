@@ -51,6 +51,7 @@ class RunConfig:
         lease_ttl: ``lease_ttl`` стенда, секунды.
         sweep_interval: ``sweep_interval`` стенда, секунды.
         threads: Параллельность одного воркера.
+        drain_timeout: Сколько секунд воркер flexiq ждёт выполняющиеся джобы по ``SIGTERM``.
         artifacts: Каталог артефактов всех прогонов.
         keep_stand: Не удалять стенд после прогона (разбор упавшего прогона).
     """
@@ -62,6 +63,7 @@ class RunConfig:
     lease_ttl: float = 60.0
     sweep_interval: float = 5.0
     threads: int = 8
+    drain_timeout: int = 20
     artifacts: Path = ARTIFACTS
     keep_stand: bool = False
 
@@ -142,6 +144,7 @@ def _settings(config: RunConfig) -> StandSettings:
         lease_ttl=config.lease_ttl,
         heartbeat_every=config.lease_ttl / 3,
         sweep_interval=config.sweep_interval,
+        drain_timeout=config.drain_timeout,
     )
 
 
