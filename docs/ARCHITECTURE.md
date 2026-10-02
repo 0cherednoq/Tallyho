@@ -131,14 +131,14 @@ flowchart LR
 flowchart TB
     subgraph apiproc["API-процесс"]
         A1["Tallyho client"]
-        A2["Relay: fast-path после commit<br/>и страховочный scan"]
+        A2["Relay: fast-path после commit,<br/>страховочный scan, сверка с DLQ"]
         A3["Maintenance в lifespan<br/>Sweeper, Snapshotter"]
     end
     subgraph wproc["Процесс воркера flexiq (N штук)"]
         B1["flexiq worker, pool=thread"]
         B2["th.tracked обёртка"]
         B3["Completer<br/>в async-loop flexiq"]
-        B4["Relay: fast-path и scan"]
+        B4["Relay: fast-path, scan,<br/>сверка с DLQ"]
         B5["Finalizer + tx-хуки"]
     end
     subgraph opt["Альтернатива"]
@@ -153,7 +153,8 @@ flowchart TB
   * **страховочный scan** — раз в `sweep_interval` отправляет все записи старше `relay_grace`: потерянный `kick`, записи упавшего процесса, отложенный старт, возврат после `relay_claim_ttl`.
 
   Цикл стартует лениво, в event loop первого `kick` (как Completer), и сразу — при запуске `th.maintenance().run()` в этом процессе (тогда первый scan выполняется немедленно). Scan **не привязан к лидерству** maintenance: захват записей идёт через `FOR UPDATE SKIP LOCKED`, поэтому несколько процессов не отправляют одну запись дважды. Цикл останавливает `await th.aclose()`; выход из `th.maintenance().run()` тоже останавливает его, следующий `kick` запустит цикл заново.
-* **Процесс без адаптера** (`th.install(None)`, CLI `tallyho maintenance`) relay не создаёт: outbox не захватывает и ничего не отправляет. Sweeper, Finalizer и Snapshotter в нём работают; записи, которые они кладут в outbox (повтор Item, колбэк финализации), отправит scan любого процесса с адаптером.
+* **Сверка с DLQ брокера** (UC-15) идёт в том же фоновом цикле, сразу после каждого страховочного scan: прочитать DLQ может только процесс с адаптером, а лидером maintenance бывает и процесс без него, поэтому к лидерству сверка тоже не привязана. Два процесса не делают одну работу: проход начинается с захвата строки курсора в `th_meta` через `FOR UPDATE SKIP LOCKED`, и процесс, не получивший строку, свой проход пропускает.
+* **Процесс без адаптера** (`th.install(None)`, CLI `tallyho maintenance`) relay не создаёт: outbox не захватывает, ничего не отправляет и DLQ не сверяет. Sweeper, Finalizer и Snapshotter в нём работают; записи, которые они кладут в outbox (повтор Item, колбэк финализации), отправит scan любого процесса с адаптером.
 * **Maintenance** (sweeper, снимки прогресса) работает в одном экземпляре-лидере. Лидер выбирается через advisory lock; лидером может быть и процесс без адаптера.
 * **Finalizer** работает там, где завершился последний Item (воркер), либо в sweeper'е. Поэтому **модули с tx-хуками должны импортироваться и в воркерах, и в maintenance**: `Tallyho(..., hook_modules=[...])` импортирует их при инициализации (§7.5).
 * **Completer** живёт в event loop исполнителя async-задач flexiq и создаётся лениво при первой задаче.
@@ -307,6 +308,9 @@ classDiagram
         +reconcile_drift() int
         +retention() int
     }
+    class DeadLetterReconciler {
+        +reconcile_once() int
+    }
     class Dispatcher {
         <<Protocol>>
         +task_name(fn) str
@@ -331,6 +335,9 @@ classDiagram
     BatchSummary --> Progress
     Snapshotter ..> BatchSummary : передаёт в on_progress
     Relay --> Dispatcher
+    Relay ..> DeadLetterReconciler : после каждого scan
+    DeadLetterReconciler --> Runtime : reconcile_dead
+    DeadLetterReconciler ..> Finalizer
     Runtime ..> ItemContext : создаёт на время задачи
 ```
 
@@ -356,7 +363,7 @@ UUIDv7 генерируем сами (≈30 строк). В Python 3.14+ исп�
 
 | Протокол | Кто реализует | Для чего |
 |---|---|---|
-| `Dispatcher`, `Runtime`, `PayloadCodec` | адаптер брокера | отправка; обёртка исполнения, вердикт ретрая, сверка с DLQ по курсору (§11.3); кодек payload Items (без своего кодека — `SerializerCodec` поверх `Serializer`) |
+| `Dispatcher`, `Runtime`, `PayloadCodec` | адаптер брокера | отправка; обёртка исполнения, вердикт ретрая, сверка с DLQ: `reconcile_dead(cursor)` отдаёт порцию мёртвых джоб — Item и поколение отправки из служебного маркера — и новый непрозрачный курсор (UC-15, §11.3); кодек payload Items (без своего кодека — `SerializerCodec` поверх `Serializer`) |
 | `RetryLimits` | адаптер брокера (необязательно) | умолчание `max_retries` задачи по её имени — для sweeper, когда у вызова нет своей опции (UC-15) |
 | `RelayPolicy` | тестовый брокер | `relay_autostart = False`: relay не запускает фоновый цикл по `kick`, его проходы вызывает сам адаптер (`InlineBroker.step/drain`); так тест остаётся детерминированным |
 | Tx-хуки `on_finalized / on_progress / on_policy_breach` | пользователь | перенос итога и прогресса в доменные таблицы (§7) |
@@ -434,6 +441,7 @@ erDiagram
         jsonb error "NULL"
         timestamptz created_at
         timestamptz finished_at "NULL"
+        int generation "поколение отправки, схема v5"
     }
     TH_OUTBOX {
         uuid id PK
@@ -513,7 +521,9 @@ erDiagram
     }
 ```
 
-`th_meta(key PK, value)` хранит версию схемы и на диаграмме не показана.
+`th_meta(key PK, value)` хранит версию схемы (`schema_version`) и курсор сверки с DLQ брокера (`dead_letter_cursor`, UC-15); на диаграмме не показана.
+
+`th_item.generation` — **поколение отправки**: сколько раз Item возвращался в outbox после первой отправки. Растёт на 1 в той же транзакции, что вставляет новую запись outbox: возврат по истёкшему lease (sweeper), `release` после подтверждённого дубля, `close(requeue_held=True)`, claim при паузе, `retry_failed()`. Это редкие пути: первая отправка и обычное завершение колонку не трогают, индекса на ней нет, finish остаётся HOT. Relay кладёт поколение в сообщение, адаптер — в служебный маркер джобы. По нему сверка с DLQ отличает мёртвую джобу текущей отправки от джобы, после которой Item уже переотправлен (UC-15).
 
 Доменного состояния у батча нет: колонок `status` и `data` не существует, статус и данные живут у пользователя. Есть только неизменяемый контекст корреляции — `attributes` и `memo` корня. Он хранится в side-таблице `th_batch_attr`, а не в `th_batch`: строка батча часто обновляется (состояние, `snap_seq`, `updated_at`), и каждое не-HOT обновление заново писало бы jsonb в GIN-индекс. Строка `th_batch_attr` пишется один раз в транзакции создания корня и удаляется retention вместе с деревом; для корня без атрибутов и `memo` её нет.
 
@@ -647,6 +657,7 @@ stateDiagram-v2
     queued --> cancelled : cancel()
     parked --> cancelled : cancel()
     dispatched --> cancelled : cancel(), ленивая отмена при claim
+    dispatched --> error : джоба текущего поколения в DLQ (событие или сверка)
     ok --> [*]
     skip --> [*]
     error --> [*]
@@ -669,7 +680,7 @@ stateDiagram-v2
 
 At-least-once отправка. Дубль в брокере отсекает claim по `th_lease` и состоянию Item.
 
-Запись outbox появляется повторно, когда Item возвращается в очередь: lease истёк (sweeper), воркер останавливается (`close(requeue_held=True)`), батч на паузе при claim, а также при `release` по вердикту `RETRY`, если за время выполнения брокеру был подтверждён дубль доставки (`th_lease.redelivered`, UC-04).
+Запись outbox появляется повторно, когда Item возвращается в очередь: lease истёк (sweeper), воркер останавливается (`close(requeue_held=True)`), батч на паузе при claim, `retry_failed()`, а также при `release` по вердикту `RETRY`, если за время выполнения брокеру был подтверждён дубль доставки (`th_lease.redelivered`, UC-04). Каждый такой возврат в той же транзакции увеличивает `th_item.generation` (§5.1): джоба, которую relay создаст по новой записи, несёт новое поколение.
 Захватывают записи только процессы с адаптером брокера (§3.2): fast-path — записи батчей из `kick`, scan — все записи старше `relay_grace`. Параллельные проходы разных процессов расходятся по `SKIP LOCKED`, а захваченная запись невидима остальным до `relay_claim_ttl`.
 
 ---
@@ -869,7 +880,7 @@ flowchart LR
     ops --> UC12["UC-12 Отмена"]
     ops --> UC13["UC-13 Прогресс и watch"]
     time --> UC14["UC-14 Retention и release"]
-    time --> UC15["UC-15 Sweeper: восстановление"]
+    time --> UC15["UC-15 Sweeper: восстановление, сверка с DLQ"]
     ops --> UC16["UC-16 Повтор упавших"]
     work --> UC17["UC-17 Конвейер этапов: into, авто-seal, каскад"]
 ```
@@ -991,8 +1002,11 @@ sequenceDiagram
         MW-->>B: пробросить exc, брокер отправит в DLQ
     end
     opt брокер всё же отправил в DLQ после вердикта RETRY
-        B-->>A: DLQ-хук или сверка reconcile_dead
+        B-->>A: DLQ-хук
         A->>C: finish(item, error, exhausted), CAS идемпотентен
+    end
+    opt DLQ-хук потерян или не смог записать итог
+        A-->>DB: сверка с DLQ (UC-15): error(exhausted), если джоба — текущее поколение Item
     end
 ```
 
@@ -1269,6 +1283,53 @@ sequenceDiagram
 
 Истёкший lease тратит попытку: при возврате в outbox sweeper делает `attempt += 1`, так же как claim при перехвате истёкшего lease (UC-03) и `release` при ретрае брокера (UC-04). Item, исполнитель которого погибает каждый раз, получит `error("lease_expired")` после `max` возвратов, а не будет переотправляться бесконечно.
 
+#### Сверка с DLQ брокера
+
+Sweeper видит только Items с lease. Джоба, которая ушла в DLQ, не взяв lease, оставляет Item `active` без lease, outbox и джобы: claim падал с `CompleterError`, пока PostgreSQL был недоступен дольше, чем брокер повторяет джобу, а обработчик события DLQ не смог записать итог по той же причине (либо событие потеряно — брокер доставляет его без гарантий). По данным tallyho такой Item неотличим от Item, который ждёт в очереди брокера, поэтому его находит только сверка с DLQ.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant R as Цикл relay (процесс с адаптером)
+    participant DB as PostgreSQL
+    participant A as Adapter
+    participant F as Finalizer
+
+    loop после каждого scan, раз в sweep_interval
+        R->>DB: BEGIN, строка курсора в th_meta FOR UPDATE SKIP LOCKED
+        alt строка занята другим процессом
+            R-->>R: пропустить проход
+        else
+            R->>A: reconcile_dead(cursor)
+            A-->>R: мёртвые джобы (item, generation), новый курсор, есть ли ещё
+            R->>DB: th_batch FOR SHARE → th_item FOR UPDATE → th_lease FOR UPDATE
+            R->>DB: осиротевшие Items → CAS error(exhausted), счётчики, th_item_mark
+            R->>DB: живой lease того же поколения → redelivered = true
+            R->>DB: UPDATE курсора, COMMIT
+            R->>F: try_finalize затронутых батчей
+        end
+    end
+```
+
+Мёртвая джоба несёт в служебном маркере Item и **поколение отправки**, с которым relay её поставил (§5.1). Под блокировками строк сверка применяет правило:
+
+| Состояние Item | Действие | Почему |
+|---|---|---|
+| Item нет или он терминальный | ничего | CAS идемпотентен, итог уже записан |
+| `th_item.generation` ≠ поколению джобы | ничего | после этой джобы Item вернулся в outbox: за него отвечает более новая отправка — ждёт relay, ждёт в очереди брокера, выполняется или получит свою запись DLQ. Мёртвая джоба прошлой отправки его не касается |
+| поколение совпало, есть запись outbox | ничего | relay ещё не подтвердил отправку и поставит джобу снова |
+| поколение совпало, lease живой | `th_lease.redelivered = true`, Item не завершается | выполнение ещё идёт (жёсткий таймаут брокера не отменяет корутину, §11.3), и его итог запишет оно само. Джоба закрыта, ретрая от брокера не будет — отметка заставит `release` вернуть Item в outbox (UC-04) |
+| поколение совпало, lease истёк | ничего | переотправит или завершит sweeper |
+| поколение совпало, нет ни lease, ни outbox | батч отменяется → `cancelled`, иначе `error("exhausted")` | у Item не осталось исполнителя |
+
+Правило не зависит от времени и от того, насколько сверка отстала: запись DLQ можно разобрать через секунду или через сутки, повторный разбор той же записи ничего не меняет. Item, который переотправлен после мёртвой джобы и снова выполняется, сверка не трогает — у него другое поколение; `retry_failed()` тоже увеличивает поколение, поэтому старые записи DLQ не задевают повторённые Items.
+
+Курсор — непрозрачная строка адаптера в `th_meta` (`dead_letter_cursor`). Он читается под блокировкой строки и записывается в той же транзакции, что и завершения Items: проход либо применён целиком вместе со сдвигом курсора, либо не применён вовсе. Адаптер не возвращает курсор назад. Один проход — до 5 порций (порция — одна страница DLQ); остаток разбирает следующий проход. Чтение DLQ ограничено 30 с и идёт внутри транзакции, которая держит только строку курсора; строки Items блокируются после чтения и на время записи.
+
+Событие DLQ (`JOB_DEAD` у flexiq) остаётся основным путём и завершает Item сразу; сверка — страховка с задержкой до `sweep_interval`. Сверку выполняют только процессы, где работает цикл relay: установка, в которой после рестарта нет ни одного такого процесса (только воркеры без spawn и CLI `tallyho maintenance`), DLQ не сверяет, как и не сканирует outbox.
+
+Что сверка не покрывает: у брокера, который дедуплицирует постановку по ключу, повторная отправка нового поколения может слиться с ещё живой джобой прошлого (у flexiq — `idempotency_key`, пока джоба pending/running). Если эта джоба потом уйдёт в DLQ, не взяв lease, а событие DLQ потеряется, сверка увидит прошлое поколение и Item не завершит. Нужны два отказа подряд; такой Item снимает дедлайн батча (§10).
+
 ### UC-16 Повтор упавших
 
 ```mermaid
@@ -1280,7 +1341,7 @@ sequenceDiagram
 
     O->>DB: retry_failed(labels=[exhausted], session): CAS completed_with_errors / failed → sealed
     O->>DB: корень: finished_at = NULL, released_at = NULL
-    O->>DB: чанками по th_item_mark: state=active, attempt=0, error −n, INSERT outbox
+    O->>DB: чанками по th_item_mark: state=active, attempt=0, generation += 1, error −n, INSERT outbox
     O->>DB: доменный статус меняет сам пользователь в этой же транзакции
     R->>R: отправка → UC-03 … UC-07, on_finalized вызовется снова с новым итогом
 ```
@@ -1438,6 +1499,7 @@ ratio_корня = Σ w_done_детей / Σ ожидаемый w_total_дете
 | Брокер доставил дважды | claim через `th_lease` + CAS state | мгновенно |
 | Дубль закрыл джобу брокера при живом lease, а исходное выполнение упало с вердиктом RETRY | claim помечает `th_lease.redelivered`, `release` возвращает Item в outbox (UC-04) | мгновенно (kick relay) / `relay_grace` |
 | PostgreSQL недоступен при claim, release или finish | операция бросает `CompleterError`; адаптер flexiq добавляет её в `retry_on` задачи, поэтому джоба уходит в ретрай брокера, а не сразу в DLQ (§11.3) | как у брокера; незавершённый lease — `lease_ttl` |
+| Джоба ушла в DLQ, не завершив Item и не оставив lease: PostgreSQL недоступен дольше ретраев брокера, событие DLQ потеряно или его обработчик тоже не смог записать итог | сверка с DLQ в процессах с адаптером: `error("exhausted")`, если мёртвая джоба — текущее поколение отправки Item (UC-15) | `sweep_interval` после восстановления PostgreSQL |
 | Воркер убит посреди задачи | lease + heartbeat → sweeper | `lease_ttl` (60 с) |
 | Воркер убит посреди flush Completer | транзакция откатилась, задача не вернула результат → повтор брокера | как у брокера |
 | Две параллельные «последние» задачи | проверка после commit + CAS финализации | мгновенно |
@@ -1479,10 +1541,10 @@ th.install(fq)  # системная задача tallyho.system и DLQ-хук
 async def my_task(x: int) -> None: ...
 
 
-await th.migrate()  # или ревизии Alembic: upgrade(..., version=1), затем version=2, 3 и 4
+await th.migrate()  # или ревизии Alembic: upgrade(..., version=1), затем version=2, 3, 4 и 5
 ```
 
-`th.install(adapter)` запускает в процессе relay (§3.2): отправка после commit не требует отдельного процесса maintenance. `th.install(None)` — установка без брокера для процессов обслуживания и чтения (CLI): `th.batch` и `th.call` в ней бросают `ConfigurationError`, relay не создаётся, `th.maintenance()` выполняет sweeper, финализацию и снимки.
+`th.install(adapter)` запускает в процессе relay (§3.2): отправка после commit не требует отдельного процесса maintenance. В том же цикле идёт сверка с DLQ брокера (UC-15). `th.install(None)` — установка без брокера для процессов обслуживания и чтения (CLI): `th.batch` и `th.call` в ней бросают `ConfigurationError`, relay не создаётся, `th.maintenance()` выполняет sweeper, финализацию и снимки.
 
 `await th.aclose()` останавливает фоновый цикл relay и дожидается его; вызывается при остановке процесса в том же event loop. После `aclose` `kick` только копит id — их отправит scan другого процесса.
 
@@ -1538,11 +1600,12 @@ await th.migrate()  # или ревизии Alembic: upgrade(..., version=1), з
 
 | Факт о flexiq | Следствие | Решение в адаптере |
 |---|---|---|
-| Нет своего job id при enqueue: id генерирует Rust (`Uuid::now_v7()`) | `item.id` ≠ id джобы flexiq | Relay добавляет в kwargs служебный `_th={"i": item_id, "b": batch_id, "r": effective_max_retries}` (`r` нужен runtime, потому что `current_job` лимит не показывает), обёртка `th.tracked` вынимает его до вызова функции. Kwargs переносятся в DLQ, по ним идёт сверка. **`metadata` и `notes` пользователя не трогаем** (§11.4) |
+| Нет своего job id при enqueue: id генерирует Rust (`Uuid::now_v7()`) | `item.id` ≠ id джобы flexiq | Relay добавляет в kwargs служебный `_th={"i": item_id, "b": batch_id, "r": effective_max_retries}` (`r` нужен runtime, потому что `current_job` лимит не показывает), а при повторной отправке — ещё и поколение `"g": generation` (у первой отправки ключа нет, это поколение 0). Обёртка `th.tracked` вынимает маркер до вызова функции. Kwargs переносятся в DLQ, по ним идёт сверка. **`metadata` и `notes` пользователя не трогаем** (§11.4) |
 | Middleware только синхронные `before/after`, around-хука нет; `on_retry/on_dead_letter` вызываются вне задачи с `SimpleNamespace(id, task_name)` | На sync-хуках нельзя `await` Completer | **`@fq.task(...)` = `queue.task(...)(th.tracked(fn))`**: обёртка — `async def` в том же event loop, что и задача, то есть настоящий around. `functools.wraps` сохраняет `module.qualname`, имя задачи не меняется |
 | Async-задачи идут в одном event loop на процесс (поток `flexiq-async-executor`, семафор `async_concurrency=100`) | Completer должен жить в этом loop | Completer создаётся лениво в loop первой задачи. Отслеживаемые задачи — только `async def` (проверка при декорировании) |
 | Prefork-пул исполняет async-задачу через `asyncio.run` в новом event loop на каждую джобу, на Windows — `NotImplementedError` (спайк T8.0) | Completer и lease не переживают джобу | v1 поддерживает только `pool="thread"`. Prefork — ошибка при `install` |
-| В задаче известен `current_job.retry_count`, но не `max_retries`; решение «ретрай или DLQ» принимает Rust **после** задачи (`retry_on/dont_retry_on`, `retry_budget`, circuit breaker) | Задача не знает точно, последняя ли это попытка | `retry_verdict(exc)` считает по конфигу `TaskWrapper` и `retry_count`. Страховка: событие `JOB_DEAD` (`queue.on_event`, пул `flexiq-events`) через `loop.call_soon_threadsafe` + периодическая сверка `dead_letters_after(cursor)` → `get_job(original_job_id)` → `_th` из payload (D-014) → `finish(error)` с идемпотентным CAS |
+| В задаче известен `current_job.retry_count`, но не `max_retries`; решение «ретрай или DLQ» принимает Rust **после** задачи (`retry_on/dont_retry_on`, `retry_budget`, circuit breaker) | Задача не знает точно, последняя ли это попытка | `retry_verdict(exc)` считает по конфигу `TaskWrapper` и `retry_count`. Страховка: событие `JOB_DEAD` (`queue.on_event`, пул `flexiq-events`) через `loop.call_soon_threadsafe` → `finish(error)` с идемпотентным CAS + периодическая сверка `dead_letters_after` → `get_job(original_job_id)` → `_th` из payload (D-014) → правило UC-15 |
+| `dead_letters_after` листает DLQ **от новых записей к старым** (`failed_at DESC`), курсор страницы ведёт вглубь истории и равен `None` на последней странице; `failed_at` ставит воркер по своим часам | Курсором flexiq нельзя «дочитать новое»; запись воркера с отстающими часами появляется ниже уже разобранных | Курсор сверки — свой: водяной знак `failed_at` самой новой разобранной записи и позиция незаконченного обхода. Каждый обход идёт от самой новой записи вниз до `водяной знак − dead_letter_overlap` (15 мин, параметр `FlexiqAdapter`), по странице в 200 записей за вызов. Записи внутри перекрытия отдаются повторно на каждом обходе — правило UC-15 идемпотентно; соответствие «запись DLQ → Item» кэшируется в процессе. Первый обход разбирает всю сохранившуюся историю DLQ |
 | Нет transactional enqueue: у flexiq свой пул соединений в Rust | Без нашего outbox — dual write | Наш outbox и relay обязательны. Это прямая ценность библиотеки для flexiq |
 | `idempotency_key` дедуплицирует только пока джоба pending/running | Повтор relay после падения может создать дубль | Relay передаёт `idempotency_key=f"th:{item_id}"`. Поздние дубли отсекает наш claim |
 | `aenqueue_many` — это sync `enqueue_many` в общем `ThreadPoolExecutor(max_workers=2)`; один набор `task_name, queue, priority, max_retries, timeout` на вызов; `None` берёт умолчания Queue, а не `@task`; дубль `idempotency_key` роняет всю пачку | Узкое место отправки, потеря опций задачи | Relay передаёт опции задачи явно, группирует по `(task_name, queue, priority, max_retries, timeout)`, шлёт чанками по 1 000 через **свой** executor; при дубле ключа — поштучный `enqueue`. То же умолчание `max_retries` адаптер отдаёт sweeper-у через `RetryLimits` (UC-15) |
@@ -1564,7 +1627,7 @@ sequenceDiagram
     participant F as Функция пользователя
     participant H as on_dead_letter (sync)
 
-    R->>Q: enqueue_many(task, kwargs_list с _th={i,b,r}, metadata, idempotency_key=th:item)
+    R->>Q: enqueue_many(task, kwargs_list с _th={i,b,r[,g]}, metadata, idempotency_key=th:item)
     Q->>X: run_coroutine_threadsafe(job)
     X->>W: await wrapper(*args, _th=...)
     W->>C: claim(item)
@@ -2581,7 +2644,7 @@ xychart-beta
 | `estimate_min_basis` / `estimate_min_share` | 20 / 5% | минимальная выборка родителей для оценки итога |
 | `eta_window` | 60 с | окно скользящего среднего скорости |
 | `max_items` | `None` | лимит на дерево, задаётся на корне |
-| `sweep_interval` | 5 с | период sweeper у лидера и страховочного scan relay в каждом процессе с адаптером |
+| `sweep_interval` | 5 с | период sweeper у лидера, страховочного scan relay и сверки с DLQ в каждом процессе с адаптером |
 | `lock_timeout` | 5 с | retry на `55P03/40P01/40001` |
 | `retention` | 14 дней | `None` — вечно; учитывает `release_required` |
 | `watch_throttle` | 500 мс | NOTIFY не чаще на батч |
