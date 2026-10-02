@@ -224,6 +224,43 @@ async def test_upgrade_from_v3_keeps_leases_and_marks_them_not_redelivered(
     assert await stored_version(engine, schema) == str(SCHEMA_VERSION)
 
 
+async def test_upgrade_from_v4_keeps_items_in_generation_zero(
+    engine: AsyncEngine, schema: str
+) -> None:
+    tables = build_metadata()
+    item = tables.item
+    item_id = uuid4()
+    async with engine.begin() as raw:
+        for version in (1, 2, 3, 4):
+            for statement in migration_statements(version, schema=schema):
+                await raw.execute(statement)
+        conn = await raw.execution_options(schema_translate_map={None: schema})
+        # Item, созданный до обновления библиотеки: колонки generation ещё нет.
+        await conn.execute(
+            insert(item).values(
+                id=item_id,
+                batch_id=uuid4(),
+                state=0,
+                task_name="task",
+                payload=b"",
+                created_at=func.now(),
+            )
+        )
+    assert await stored_version(engine, schema) == "4"
+
+    assert await migrate(engine, schema) == SCHEMA_VERSION
+
+    async with engine.connect() as raw:
+        conn = await raw.execution_options(schema_translate_map={None: schema})
+        rows = (await conn.execute(select(item.c.id, item.c.generation))).all()
+    assert [tuple(row) for row in rows] == [(item_id, 0)]
+    async with temporary_schema(engine) as reference:
+        await create_all(engine, reference, tables)
+        async with engine.connect() as conn:
+            assert await catalog(conn, schema) == await catalog(conn, reference)
+    assert await stored_version(engine, schema) == str(SCHEMA_VERSION)
+
+
 async def test_migrate_creates_missing_schema(engine: AsyncEngine) -> None:
     async with dropped_after(engine, unique_schema_name()) as schema:
         await migrate(engine, schema)
