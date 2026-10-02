@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
@@ -53,6 +54,33 @@ class _FinalizerSpy:
     async def try_finalize(self, batch_id: UUID) -> bool:
         self.tried.append(batch_id)
         return True
+
+
+class _SlowFinalizer:
+    release: asyncio.Event
+    tried: list[UUID]
+
+    def __init__(self) -> None:
+        self.release = asyncio.Event()
+        self.tried = []
+
+    async def try_finalize(self, batch_id: UUID) -> bool:
+        _ = await self.release.wait()
+        self.tried.append(batch_id)
+        return True
+
+
+class _BrokenFinalizer:
+    tried: list[UUID]
+
+    def __init__(self) -> None:
+        self.tried = []
+
+    async def try_finalize(self, batch_id: UUID) -> bool:
+        await asyncio.sleep(0)
+        self.tried.append(batch_id)
+        message = "хук упал"
+        raise RuntimeError(message)
 
 
 def operations(env: Env) -> Operations:
@@ -698,3 +726,66 @@ async def test_retry_finalize_release_triggers_and_invalid_states(env: Env) -> N
             _ = await subject.retry_failed(conn, missing)
         with pytest.raises(NotFoundError):
             await subject.release(conn, missing)
+
+
+async def test_shut_operations_start_no_post_commit_tasks(env: Env) -> None:
+    root_id, child_id = await tree(env)
+    relay = _RelaySpy()
+    finalizer = _FinalizerSpy()
+    progress = RecordingProgress()
+    subject = Operations(
+        tables=env.tables,
+        clock=SystemClock(),
+        triggers=OperationTriggers(relay=relay, finalizer=finalizer, progress=progress),
+    )
+    async with env.transaction() as conn:
+        await subject.retry_finalize(conn, root_id)
+        # Закрытие установки посреди транзакции: ещё не запущенные задачи забирать нечего.
+        assert subject.shut() == ()
+        await subject.resume(conn, root_id)
+    await subject.close()
+
+    # Commit прошёл; kick только копит id, фоновых задач нет (ARCHITECTURE §11.1).
+    assert set(relay.kicked) == {root_id, child_id}
+    assert finalizer.tried == []
+    assert progress.calls == []
+    assert [task for task in asyncio.all_tasks() if "operation" in task.get_name()] == []
+
+
+async def test_failed_post_commit_finalize_is_logged_and_does_not_stop_the_rest(
+    env: Env, caplog: pytest.LogCaptureFixture
+) -> None:
+    root_id, child_id = await tree(env)
+    finalizer = _BrokenFinalizer()
+    subject = Operations(
+        tables=env.tables, clock=SystemClock(), triggers=OperationTriggers(finalizer=finalizer)
+    )
+    with caplog.at_level(logging.ERROR, logger="tallyho.engine.operations"):
+        async with env.transaction() as conn:
+            await subject.retry_finalize(conn, root_id)
+        await subject.close()
+
+    # Commit состоялся: ошибка финализации не теряется молча и не обрывает остальные батчи.
+    assert set(finalizer.tried) == {root_id, child_id}
+    assert caplog.text.count("после операции упал") == 2
+
+
+async def test_close_waits_for_post_commit_tasks_still_running(env: Env) -> None:
+    root_id, child_id = await tree(env)
+    finalizer = _SlowFinalizer()
+    subject = Operations(
+        tables=env.tables, clock=SystemClock(), triggers=OperationTriggers(finalizer=finalizer)
+    )
+    async with env.transaction() as conn:
+        await subject.retry_finalize(conn, root_id)
+    [pending] = subject.shut()
+    assert pending.get_name() == "tallyho-operation-post-commit"
+
+    closing = asyncio.create_task(subject.close())
+    await asyncio.sleep(0.05)
+    assert not closing.done()
+    finalizer.release.set()
+    await asyncio.wait_for(closing, timeout=10)
+
+    assert pending.done()
+    assert set(finalizer.tried) == {root_id, child_id}

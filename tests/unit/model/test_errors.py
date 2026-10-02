@@ -18,6 +18,7 @@ PARENTS: dict[type[errors.TallyhoError], type[errors.TallyhoError]] = {
     errors.ConcurrentModification: errors.TallyhoError,
     errors.CompleterError: errors.TallyhoError,
     errors.HookTransactionError: errors.TallyhoError,
+    errors.ClosedError: errors.InvalidStateError,
     errors.SealError: errors.InvalidStateError,
     errors.SpawnTargetError: errors.InvalidStateError,
     errors.DownstreamFinalized: errors.InvalidStateError,
@@ -78,6 +79,11 @@ def test_model_package_reexports_public_names() -> None:
     assert set(tallyho.model.__all__) == set(sources)
     for name, obj in sources.items():
         assert getattr(tallyho.model, name) is obj
+
+
+def test_closed_error_explains_itself_and_accepts_detail() -> None:
+    assert "aclose" in str(errors.ClosedError())
+    assert str(errors.ClosedError("Completer закрыт")) == "Completer закрыт"
 
 
 def test_unsupported_option_without_hint() -> None:

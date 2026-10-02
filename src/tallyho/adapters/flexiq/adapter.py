@@ -21,6 +21,7 @@ from flexiq.notes import validate_and_encode_notes
 from typing_extensions import override
 
 from tallyho.model.errors import (
+    ClosedError,
     CompleterError,
     ConfigurationError,
     TallyhoError,
@@ -69,8 +70,12 @@ _BATCH_OPTION = "batch"
 _ENCODE_PAYLOAD = "_encode_payload"
 _DECODE_PAYLOAD = "_deserialize_payload"
 _PY_JOB = "_py_job"
-_INFRASTRUCTURE_ERRORS: tuple[type[Exception], ...] = (CompleterError,)
-"""Ошибки tallyho, которые брокер повторяет независимо от ``retry_on`` задачи."""
+_INFRASTRUCTURE_ERRORS: tuple[type[Exception], ...] = (CompleterError, ClosedError)
+"""Ошибки tallyho, которые брокер повторяет независимо от ``retry_on`` задачи.
+
+``ClosedError`` получает задача, не доработавшая до закрытия установки: её
+Item уже возвращён в outbox, и уводить джобу в DLQ нельзя.
+"""
 
 _CALL_OPTIONS = frozenset(
     {
@@ -475,9 +480,16 @@ class FlexiqAdapter(
         self._queue.on_event(EventType.JOB_DEAD, self._on_dead)
 
     async def close(self) -> None:
-        """Дождаться DLQ-задач и остановить собственный dispatch executor."""
-        if self._background:
-            await asyncio.gather(*tuple(self._background))
+        """Дождаться DLQ-задач и остановить собственный dispatch executor.
+
+        Вызывается после ``Tallyho.aclose()``. DLQ-задачи живут в event loop
+        исполнителя flexiq; из другого loop дождаться их нельзя, и они
+        пропускаются — потерянное событие закрывает сверка ``reconcile_dead``.
+        """
+        current = asyncio.get_running_loop()
+        own = [task for task in self._background if task.get_loop() is current]
+        if own:
+            _ = await asyncio.gather(*own)
         self._executor.shutdown(wait=True)
 
     def _prepare(self, message: Message) -> _Prepared:
@@ -687,8 +699,9 @@ def _with_infrastructure_retries(config: _TaskConfig) -> _TaskConfig:
 
     ``retry_on`` во flexiq — белый список: исключение не из него сразу уводит
     джобу в DLQ. Отказ PostgreSQL на claim, release или finish
-    (:class:`CompleterError`) — не ошибка задачи, и терять на нём джобу нельзя,
-    поэтому он повторяется наравне с ошибками из списка пользователя. Пустой
+    (:class:`CompleterError`) и закрытие установки посреди задачи
+    (:class:`ClosedError`) — не ошибки задачи, и терять на них джобу нельзя,
+    поэтому они повторяются наравне с ошибками из списка пользователя. Пустой
     список («повторять всё») и список, уже покрывающий эти ошибки, не меняются.
     ``dont_retry_on`` пользователя остаётся сильнее.
 

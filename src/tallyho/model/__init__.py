@@ -11,6 +11,7 @@ from tallyho.model.attributes import (
 from tallyho.model.calls import TaskCall
 from tallyho.model.errors import (
     BatchPurged,
+    ClosedError,
     CompleterError,
     ConcurrentModification,
     ConfigurationError,
@@ -69,6 +70,7 @@ __all__ = [
     "BatchSummary",
     "BatchView",
     "CancelReason",
+    "ClosedError",
     "CompleterError",
     "ConcurrentModification",
     "ConfigurationError",

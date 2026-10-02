@@ -114,12 +114,27 @@ class Operations:
     clock: Clock
     triggers: OperationTriggers = field(default_factory=OperationTriggers)
     slot: int = 0
-    _background: set[asyncio.Task[object]] = field(default_factory=set, init=False)
+    _background: set[asyncio.Task[None]] = field(default_factory=set, init=False)
+    _closed: bool = field(default=False, init=False)
+
+    def shut(self) -> tuple[asyncio.Task[None], ...]:
+        """Перестать создавать после-коммитные задачи (закрытие установки, §11.1).
+
+        Returns:
+            Ещё не завершённые задачи: их дожидается тот, кто закрывает установку.
+        """
+        self._closed = True
+        return tuple(self._background)
 
     async def close(self) -> None:
-        """Дождаться фоновых подсказок финализатору."""
-        if self._background:
-            _ = await asyncio.gather(*tuple(self._background), return_exceptions=True)
+        """Перестать создавать после-коммитные задачи и дождаться уже созданных.
+
+        Без ограничения по времени и только для задач текущего event loop;
+        закрытие установки с бюджетом — ``Tallyho.aclose()``.
+        """
+        tasks = self.shut()
+        if tasks:
+            _ = await asyncio.wait(tasks)
 
     async def pause(self, target: AsyncSession | AsyncConnection, batch_id: UUID) -> None:
         """Поставить батч и его активных потомков на паузу."""
@@ -641,6 +656,9 @@ class Operations:
         def callback() -> None:
             if self.triggers.relay is not None and relay_ids:
                 self.triggers.relay.kick(relay_ids)
+            if self._closed:
+                # Установка закрыта: финализацию выполнит sweeper, watch перечитает сам.
+                return
             if (self.triggers.progress is not None and progress_ids) or (
                 self.triggers.finalizer is not None and finalize_ids
             ):
@@ -669,4 +687,7 @@ class Operations:
     @staticmethod
     async def _finalize(finalizer: _Finalizer, ids: Sequence[UUID]) -> None:
         for batch_id in ids:
-            _ = await finalizer.try_finalize(batch_id)
+            try:
+                _ = await finalizer.try_finalize(batch_id)
+            except Exception:  # ruff: ignore[blind-except]  # commit состоялся; финализацию повторит sweeper
+                _log.exception("try_finalize(%s) после операции упал", batch_id)
