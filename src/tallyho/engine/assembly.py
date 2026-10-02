@@ -181,6 +181,7 @@ class _Facade:
     _relay: Relay | None = None
     _finalizer: Finalizer | None = None
     _completer: Completer | None = None
+    _dead_letters: DeadLetterReconciler | None = None
     _closing: bool = False
     _closed: bool = False
     _background: set[asyncio.Task[None]] = field(default_factory=set, init=False)
@@ -380,6 +381,7 @@ class _Facade:
     ) -> DeadLetterReconciler | None:
         # Читать DLQ умеет только адаптер брокера: сверку выполняют процессы,
         # где он установлен, в цикле relay после каждого scan (ARCHITECTURE UC-15).
+        self._dead_letters = None
         if relay is None or not isinstance(adapter, Runtime):
             return None
         reconciler = DeadLetterReconciler(
@@ -392,6 +394,7 @@ class _Facade:
             settings=DeadLetterSettings(slot=slot, retry=retry),
         )
         relay.after_scan = reconciler.reconcile_once
+        self._dead_letters = reconciler
         return reconciler
 
     def _install_worker(
@@ -415,7 +418,10 @@ class _Facade:
             tree_cache=tree_cache,
             heartbeat_every=heartbeat,
         )
-        adapter.install_runtime(RuntimeServices(completer, tree_cache, heartbeat, runtime))
+        adapter.install_runtime(
+            # Событие DLQ брокера разбирается по правилу сверки (UC-15).
+            RuntimeServices(completer, tree_cache, heartbeat, runtime, self._dead_letters)
+        )
 
     async def migrate(self) -> int:
         return await migrate_installation(

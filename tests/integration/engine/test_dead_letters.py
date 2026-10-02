@@ -442,3 +442,69 @@ async def test_empty_cursor_from_adapter_is_stored_as_start(env: Env) -> None:
 def test_settings_are_validated(build: Callable[[], DeadLetterSettings]) -> None:
     with pytest.raises(ConfigurationError):
         _ = build()
+
+
+# --- событие DLQ брокера (JOB_DEAD): то же правило без курсора (Fix-18) ---------------
+
+
+async def test_event_applies_rule_without_touching_cursor(env: Env) -> None:
+    seeded = await seed(env, 4)
+    orphan, resent, running, queued = seeded.refs
+    item = env.tables.item
+    async with env.transaction() as conn:
+        _ = await conn.execute(update(item).where(item.c.id == resent.id).values(generation=2))
+        _ = await conn.execute(
+            insert(env.tables.outbox).values(
+                id=queued.id,
+                kind=int(OutboxKind.ITEM),
+                batch_id=seeded.batch_id,
+                item_id=queued.id,
+                task_name="send",
+                available_at=NOW + timedelta(seconds=30),
+            )
+        )
+    await add_lease(env, running.id, seeded.batch_id, live=True)
+    env_rig = rig(env)
+    entries = [
+        DeadLetter(orphan.id, 0, "boom"),
+        DeadLetter(resent.id, 1, "old"),
+        DeadLetter(running.id, 0, "closed"),
+        DeadLetter(queued.id, 0, "again"),
+    ]
+
+    assert await env_rig.reconciler.settle(entries, error_type="FlexiqDeadLetter") == 1
+    assert await env_rig.reconciler.settle(entries, error_type="FlexiqDeadLetter") == 0
+
+    assert await item_row(env, orphan.id) == (
+        int(ItemState.ERROR),
+        "exhausted",
+        {"type": "FlexiqDeadLetter", "message": "boom"},
+    )
+    for ref in (resent, running, queued):
+        assert (await item_row(env, ref.id))[:2] == (int(ItemState.ACTIVE), None)
+    live = await lease_row(env, running.id)
+    assert live is not None
+    assert live["redelivered"] is True
+    assert env_rig.finalizer.calls == [seeded.batch_id]
+    # Курсор — только у прохода сверки; DLQ брокера событие не читает.
+    assert await cursor(env) is None
+    assert env_rig.dlq.calls == []
+
+
+async def test_event_releases_window_slot_and_kicks_relay(env: Env) -> None:
+    seeded = await seed(env, 1)
+    ref = seeded.refs[0]
+    async with env.transaction() as conn:
+        _ = await conn.execute(
+            insert(env.tables.window).values(item_id=ref.id, batch_id=seeded.batch_id)
+        )
+    env_rig = rig(env)
+
+    assert await env_rig.reconciler.settle([DeadLetter(ref.id)]) == 1
+
+    assert (await item_row(env, ref.id))[2] == {
+        "type": "DeadLetter",
+        "message": "брокер перенёс джобу в DLQ, итог Item записан сверкой",
+    }
+    assert await env.count(env.tables.window) == 0
+    assert env_rig.relay.calls == [[seeded.batch_id]]

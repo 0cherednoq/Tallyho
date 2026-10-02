@@ -744,9 +744,11 @@ class FlexiqAdapter(
         services = self._services
         if services is None:
             raise ConfigurationError(_NOT_INSTALLED)
+        # Правило сверки (UC-15): событие о джобе прошлого поколения или о
+        # джобе, закрытой при живом выполнении, Item не завершает.
         await services.finish_dead(
             marker.item_id,
-            marker.batch_id,
+            generation=marker.generation,
             error_type="FlexiqDeadLetter",
             detail=detail,
         )

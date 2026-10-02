@@ -5,8 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-from tallyho.engine.completer import FinishResult, ItemRef
-from tallyho.model.states import ResultClass
+from tallyho.model.errors import ConfigurationError
+from tallyho.protocols.broker import DeadLetter
 from tallyho.storage.migrations import migrate, validate_prefix, validate_schema
 from tallyho.storage.tables import build_metadata
 
@@ -17,11 +17,14 @@ if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncEngine
 
     from tallyho.engine.completer import Completer
+    from tallyho.engine.dead_letters import DeadLetterReconciler
     from tallyho.engine.spawn import TreeCache
     from tallyho.protocols.broker import WorkerRuntime
     from tallyho.storage.tables import Tables
 
 __all__ = ["Installation", "RuntimeServices", "create_installation", "migrate_installation"]
+
+_NO_RECONCILER = "сверка с DLQ не собрана: процессу без relay события DLQ не принадлежат"
 
 
 @dataclass(frozen=True, slots=True)
@@ -55,18 +58,24 @@ class RuntimeServices:
     tree_cache: TreeCache
     heartbeat_every: timedelta
     runtime: WorkerRuntime
+    dead_letters: DeadLetterReconciler | None = None
 
     async def finish_dead(
-        self, item_id: UUID, batch_id: UUID, *, error_type: str, detail: str
+        self, item_id: UUID, *, generation: int, error_type: str, detail: str
     ) -> None:
-        """Завершить Item, который брокер окончательно перенёс в DLQ."""
-        _ = await self.completer.finish(
-            ItemRef(item_id, batch_id),
-            FinishResult(
-                result_class=ResultClass.ERROR,
-                label="exhausted",
-                error={"type": error_type, "message": detail},
-            ),
+        """Применить правило сверки к джобе, которую брокер перенёс в DLQ (UC-15).
+
+        Item завершается, только если джоба — его текущее поколение отправки,
+        а lease и записи outbox нет; живой lease того же поколения получает
+        ``redelivered``.
+
+        Raises:
+            ConfigurationError: установка собрана без сверки с DLQ.
+        """
+        if self.dead_letters is None:
+            raise ConfigurationError(_NO_RECONCILER)
+        _ = await self.dead_letters.settle(
+            (DeadLetter(item_id, generation, detail),), error_type=error_type
         )
 
 
