@@ -365,6 +365,26 @@ async def test_child_context_with_feeder_does_not_seal_stage() -> None:
         assert UUID(int=3) not in facade.writer_value.sealed
 
 
+async def test_streaming_builder_commits_without_sealing_the_tree() -> None:
+    facade = Facade()
+    root = BatchBuilder(facade, Adapter(), BatchDefinition(kind="root"), _auto_seal=False)
+    async with root:
+        await root.add(task, 1)
+        part = root.sub_batch("part")
+        async with part:
+            await part.add(task, 2)
+    # Под-батч создан и наполнен, но ни он, ни корень не закрыты; транзакция завершена.
+    assert facade.writer_value.children[0][1].key == "part"
+    assert len(facade.writer_value.additions) == 2
+    assert facade.writer_value.sealed == []
+    assert facade.context.exits == [None]
+
+    closing = BatchBuilder(facade, Adapter(), BatchDefinition(kind="root"), _auto_seal=False)
+    async with closing:
+        await closing.seal()  # явный seal работает и при seal=False
+    assert facade.writer_value.sealed == [ROOT_ID]
+
+
 async def test_enter_and_exit_failures_close_writer_context() -> None:
     failed_create = Facade(writer_value=Writer(fail_create=True))
     root, _ = builder(failed_create)

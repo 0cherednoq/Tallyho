@@ -90,6 +90,8 @@ class BatchBuilder:
     _id: UUID | None = None
     _root_id: UUID | None = None
     _sealed: bool = False
+    _auto_seal: bool = True
+    """Закрывать ли батчи дерева при выходе из ``async with`` (``seal=False`` — UC-02)."""
 
     async def __aenter__(self) -> Self:
         """Открыть writer и создать батч в его транзакции.
@@ -117,7 +119,7 @@ class BatchBuilder:
         exc: BaseException | None,
         traceback: TracebackType | None,
     ) -> bool:
-        """Закрыть батчи при успехе и завершить writer-транзакцию.
+        """Закрыть батчи при успехе (кроме ``seal=False``) и завершить writer-транзакцию.
 
         Returns:
             ``False``: исключения пользователя не подавляются.
@@ -125,8 +127,9 @@ class BatchBuilder:
         Raises:
             ConfigurationError: корневой builder не был открыт.
         """
+        auto_seal = self._root()._auto_seal  # ruff: ignore[private-member-access]  # флаг принадлежит корню дерева
         if self._parent is not None:
-            if exc_type is None and not self._feeders:
+            if exc_type is None and auto_seal and not self._feeders:
                 await self.seal()
             return False
         context = self._writer_context
@@ -134,18 +137,24 @@ class BatchBuilder:
             raise ConfigurationError(_NOT_ENTERED)
         try:
             if exc_type is None:
-                for child in self._walk_children():
-                    await child._ensure_created()  # ruff: ignore[private-member-access]  # узлы одного builder-дерева
-                for child in reversed(self._walk_children()):
-                    if not child._feeders:  # ruff: ignore[private-member-access]  # узлы одного builder-дерева
-                        await child.seal()
-                await self.seal()
+                await self._close_tree(seal=auto_seal)
         except BaseException as close_exc:
             _ = await context.__aexit__(type(close_exc), close_exc, close_exc.__traceback__)
             raise
         finally:
             self._writer = None
         return bool(await context.__aexit__(exc_type, exc, traceback))
+
+    async def _close_tree(self, *, seal: bool) -> None:
+        """Создать объявленные под-батчи и, если нужно, закрыть дерево снизу вверх."""
+        for child in self._walk_children():
+            await child._ensure_created()  # ruff: ignore[private-member-access]  # узлы одного builder-дерева
+        if not seal:
+            return
+        for child in reversed(self._walk_children()):
+            if not child._feeders:  # ruff: ignore[private-member-access]  # узлы одного builder-дерева
+                await child.seal()
+        await self.seal()
 
     async def add(
         self,
