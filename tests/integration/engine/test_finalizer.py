@@ -27,6 +27,8 @@ from tallyho.model.states import (
 from tallyho.protocols.clock import SystemClock
 from tallyho.protocols.observer import NullObserver
 from tallyho.storage.counters import CounterDelta, upsert_slots
+from tallyho.storage.tx import RetryPolicy
+from tests.helpers.db import backend_pid, wait_blocked_by
 from tests.helpers.probe import committed_ids, create_probe, insert_id
 from tests.integration.engine.completer_env import (
     NOW,
@@ -465,6 +467,116 @@ async def test_two_sources_racing_always_close_stage(env: Env, registry: HookReg
     )
     for _left, _right, stage_id in pairs:
         assert (await env.batch(stage_id))["state"] == BatchState.SUCCEEDED
+
+
+def _retry_recording_finalizer(env: Env, registry: HookRegistry, retried: list[str]) -> Finalizer:
+    return Finalizer(
+        tables=env.tables,
+        engine=schema_engine(env),
+        clock=SystemClock(),
+        ids=env.producer.ids,
+        hooks=registry,
+        settings=FinalizerSettings(retry=RetryPolicy(on_retry=retried.append)),
+    )
+
+
+async def test_finalizer_locks_fed_stage_before_parent_counters(
+    env: Env, registry: HookRegistry
+) -> None:
+    # Fix-4: финализатор источника брал слот счётчика родителя раньше строки этапа,
+    # а Completer и финализатор этапа идут в порядке th_batch → th_counter (§9.2).
+    async with env.transaction() as conn:
+        root = await env.producer.create_root(conn, RootSpec(kind="lock-order"))
+        source = await env.producer.create_sub_batch(conn, root.id, SubBatchSpec(key="source"))
+        stage = await env.producer.create_sub_batch(
+            conn, root.id, SubBatchSpec(key="stage", fed_by=(source.id,))
+        )
+        _ = await env.producer.seal(conn, source.id)
+
+    retried: list[str] = []
+    subject = _retry_recording_finalizer(env, registry, retried)
+    batch = env.tables.batch
+    async with env.connection() as watcher, env.transaction() as holder:
+        # Как транзакция Completer со spawn в этап: строка этапа под FOR SHARE,
+        # слот счётчика корня (tree_total) — последним шагом.
+        _ = await holder.execute(
+            select(batch.c.id).where(batch.c.id == stage.id).with_for_update(read=True)
+        )
+        finishing = asyncio.create_task(subject.try_finalize(source.id))
+        await wait_blocked_by(watcher, await backend_pid(holder))
+        await upsert_slots(
+            holder,
+            env.tables,
+            {(root.id, subject.settings.slot): CounterDelta(tree_total=1)},
+        )
+
+    assert await asyncio.wait_for(finishing, timeout=10)
+    assert retried == []
+    assert (await env.batch(source.id))["state"] == BatchState.SUCCEEDED
+    assert (await env.batch(stage.id))["state"] == BatchState.SUCCEEDED
+    counters = await env.counters(root.id)
+    assert (counters.ok, counters.tree_total) == (2, 1)
+
+
+async def test_finalizer_locks_batch_and_fed_stages_in_id_order(
+    env: Env, registry: HookRegistry
+) -> None:
+    # Этап старше своего источника (связь добавлена позже через add_feed): обе
+    # строки th_batch берутся одним FOR UPDATE по возрастанию id, как в pause/cancel.
+    async with env.transaction() as conn:
+        root = await env.producer.create_root(conn, RootSpec(kind="id-order"))
+        stage = await env.producer.create_sub_batch(conn, root.id, SubBatchSpec(key="stage"))
+        source = await env.producer.create_sub_batch(conn, root.id, SubBatchSpec(key="source"))
+        await env.producer.add_feed(conn, stage.id, [source.id])
+        _ = await env.producer.seal(conn, source.id)
+    assert stage.id < source.id
+
+    retried: list[str] = []
+    subject = _retry_recording_finalizer(env, registry, retried)
+    batch = env.tables.batch
+    async with env.connection() as watcher, env.transaction() as holder:
+        _ = await holder.execute(select(batch.c.id).where(batch.c.id == stage.id).with_for_update())
+        finishing = asyncio.create_task(subject.try_finalize(source.id))
+        await wait_blocked_by(watcher, await backend_pid(holder))
+        # Операция над поддеревом идёт дальше по id: строка источника свободна.
+        _ = await holder.execute(
+            select(batch.c.id).where(batch.c.id == source.id).with_for_update(nowait=True)
+        )
+
+    assert await asyncio.wait_for(finishing, timeout=10)
+    assert retried == []
+    assert (await env.batch(stage.id))["state"] == BatchState.SUCCEEDED
+
+
+async def test_feed_committed_before_batch_lock_restarts_finalization(
+    env: Env, registry: HookRegistry
+) -> None:
+    # add_feed держит строку источника; финализатор прочитал связи до его commit и
+    # ждёт CAS. После commit связь видна только повторному чтению: попытка
+    # начинается заново, и новый этап закрывается этой же финализацией.
+    calls = 0
+
+    @registry.on_finalized("late-feed.source")
+    async def save(_session: AsyncSession, _summary: BatchSummary) -> None:
+        nonlocal calls
+        await asyncio.sleep(0)
+        calls += 1
+
+    async with env.transaction() as conn:
+        root = await env.producer.create_root(conn, RootSpec(kind="late-feed"))
+        source = await env.producer.create_sub_batch(conn, root.id, SubBatchSpec(key="source"))
+        stage = await env.producer.create_sub_batch(conn, root.id, SubBatchSpec(key="stage"))
+        _ = await env.producer.seal(conn, source.id)
+
+    async with env.connection() as watcher, env.transaction() as holder:
+        await env.producer.add_feed(holder, stage.id, [source.id])
+        running = asyncio.create_task(finalizer(env, registry).try_finalize(source.id))
+        await wait_blocked_by(watcher, await backend_pid(holder))
+
+    assert await asyncio.wait_for(running, timeout=10)
+    assert calls == 2
+    assert (await env.batch(source.id))["state"] == BatchState.SUCCEEDED
+    assert (await env.batch(stage.id))["state"] == BatchState.SUCCEEDED
 
 
 def test_finalizer_settings_validate_ranges() -> None:
