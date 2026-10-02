@@ -6,6 +6,7 @@ import asyncio
 import json
 import time
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from importlib.metadata import version
 from typing import TYPE_CHECKING, cast
@@ -291,6 +292,51 @@ async def test_a_fq_06_user_deduplication_and_relay_repeat(  # ruff: ignore[too-
     assert "user-unique" in unique_keys
     assert any(key.startswith("th:") for key in unique_keys)
     assert view.progress.ok == 3
+
+
+async def test_a_fq_06_new_generation_is_not_merged_with_live_previous_job(
+    flexiq_contract: FlexiqContract,
+) -> None:
+    app = flexiq_contract.app
+    async with app.th.batch("a-fq-06", key="generations") as batch:
+        await batch.add_calls([app.th.call(app.probe, "generation").opts(delay=3.0)])
+
+    _ = await app.th.run_maintenance_once()
+    task_name = app.adapter.task_name(app.probe)
+    async with asyncio.timeout(5):
+        while True:
+            jobs = await asyncio.to_thread(app.queue.list_jobs, task_name=task_name, limit=10)
+            if len(jobs) == 1:
+                break
+            await asyncio.sleep(0.05)
+    full = await app.queue.aget_job(jobs[0].id)
+    assert full is not None
+    stored = full._py_job  # ruff: ignore[private-member-access]  # exact stored payload is the redispatch fixture
+    args, kwargs = app.adapter.decode(stored.task_name, stored.payload_bytes)
+    marker = cast("dict[str, object]", kwargs.pop("_th"))
+    first = Message(
+        id=UUID(cast("str", marker["i"])),
+        batch_id=UUID(cast("str", marker["b"])),
+        kind=OutboxKind.ITEM,
+        task_name=stored.task_name,
+        payload=app.adapter.encode(stored.task_name, args, kwargs),
+        options={"delay": 3.0},
+    )
+    # Повтор relay той же отправки сливается с живой джобой (D-013), а новое
+    # поколение — нет: у него своя джоба и, если она умрёт, своя запись DLQ (UC-15).
+    await app.adapter.dispatch([first])
+    await app.adapter.dispatch([replace(first, generation=1)])
+
+    jobs = await asyncio.to_thread(app.queue.list_jobs, task_name=task_name, limit=10)
+    raw = [cast("dict[str, object]", job.to_dict()) for job in jobs]
+    assert sorted(cast("str", row["unique_key"]) for row in raw) == [
+        f"th:{first.id}:0",
+        f"th:{first.id}:1",
+    ]
+    # Выполнит Item одна из джоб, вторую claim отсечёт как дубль или терминальный Item.
+    view = await flexiq_contract.wait_terminal(batch.handle)
+    assert view.progress.ok == 1
+    assert len(await flexiq_contract.wait_events("probe")) >= 1
 
 
 async def test_a_fq_07_incompatible_options_fail_explicitly(

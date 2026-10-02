@@ -363,7 +363,7 @@ async def test_dispatch_maps_options_markers_and_user_keys_exactly() -> None:
     assert batch["notes_list"] == [notes, None]
     assert batch["expires_list"] == [2.5, 30.0]
     assert batch["result_ttl_list"] == [44, None]
-    assert batch["idempotency_keys"] == [f"th:{first.id}", f"th:{second.id}"]
+    assert batch["idempotency_keys"] == [f"th:{first.id}:0", f"th:{second.id}:0"]
     markers = [kwargs["_th"] for kwargs in cast("list[dict[str, object]]", batch["kwargs_list"])]
     assert markers == [
         {"i": str(first.id), "b": str(first.batch_id), "r": 6},
@@ -397,15 +397,16 @@ async def test_dispatch_groups_by_task_and_chunks_at_one_thousand() -> None:
 async def test_duplicate_batch_falls_back_to_idempotent_single_enqueue() -> None:
     adapter, queue = _adapter()
     name = adapter.task_name(adapter.task(name="echo")(_echo))
-    messages = [_message(adapter, name), _message(adapter, name)]
+    messages = [_message(adapter, name), replace(_message(adapter, name), generation=4)]
     queue.reject_many_once = True
 
     await adapter.dispatch(messages)
 
+    # D-013: дубль ключа в пачке — поштучный повтор с теми же ключами поколений.
     assert queue.many == []
     assert [item["idempotency_key"] for item in queue.one] == [
-        f"th:{messages[0].id}",
-        f"th:{messages[1].id}",
+        f"th:{messages[0].id}:0",
+        f"th:{messages[1].id}:4",
     ]
     await adapter.close()
 
@@ -809,6 +810,30 @@ async def test_item_marker_carries_generation_only_after_redispatch() -> None:
     assert markers == [
         {"i": str(first.id), "b": str(first.batch_id), "r": 3},
         {"i": str(again.id), "b": str(again.batch_id), "r": 3, "g": 2},
+    ]
+    await adapter.close()
+
+
+async def test_own_idempotency_key_separates_send_generations() -> None:
+    adapter, queue = _adapter()
+    name = adapter.task_name(adapter.task(name="echo")(_echo))
+    first = _message(adapter, name)
+    resent = replace(first, generation=1)
+    custom = replace(first, generation=1, options={"idempotency_key": "user-idem"})
+    unique = replace(first, generation=1, options={"unique_key": "user-unique"})
+
+    await adapter.dispatch([first, first, resent, custom, unique])
+
+    # Повтор relay той же записи outbox — тот же ключ; новое поколение — свой ключ,
+    # иначе flexiq слил бы его с ещё живой джобой прошлой отправки. Ключи
+    # пользователя не меняются, а при unique_key свой ключ не подставляется.
+    keys = [key for call in queue.many for key in cast("list[object]", call["idempotency_keys"])]
+    assert keys == [
+        f"th:{first.id}:0",
+        f"th:{first.id}:0",
+        f"th:{first.id}:1",
+        "user-idem",
+        None,
     ]
     await adapter.close()
 
