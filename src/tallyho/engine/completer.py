@@ -769,11 +769,21 @@ class _Tx:
             insert(outbox)
             .from_select(["id", "kind", "batch_id", "item_id", "task_name", "available_at"], source)
             .on_conflict_do_nothing(index_elements=[outbox.c.id])
-            .returning(outbox.c.batch_id)
+            .returning(outbox.c.id, outbox.c.batch_id)
         )
-        for (batch_id,) in result:
+        returned: list[UUID] = []
+        for item_id, batch_id in result:
             # Item больше не у брокера: окно max_in_flight считает dispatched - done.
             self.deltas[batch_id] += CounterDelta(dispatched=-1)
+            returned.append(item_id)
+        if returned:
+            # Новая запись outbox — новая отправка: мёртвые джобы прошлого
+            # поколения сверка с DLQ к этому Item уже не относит (UC-15).
+            _ = await self.conn.execute(
+                update(item)
+                .where(item.c.id == any_(_uuids(sorted(returned))))
+                .values(generation=item.c.generation + 1)
+            )
 
     async def requeue(self, refs: Iterable[ItemRef]) -> None:
         """Свои lease — сразу обратно в outbox, как после их истечения (A-CH-08).

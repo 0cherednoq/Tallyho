@@ -59,6 +59,10 @@ class Message:
             :class:`~tallyho.protocols.PayloadCodec` адаптера.
         options: опции постановки брокера из ``th.call(...).opts`` (priority,
             queue, delay, metadata, …); JSON-совместимые значения.
+        generation: поколение отправки Item (``th_item.generation``): 0 у
+            первой отправки, растёт при каждом возврате Item в outbox. Адаптер
+            кладёт его в служебный маркер джобы и возвращает из
+            :meth:`Runtime.reconcile_dead` (ARCHITECTURE UC-15). Для колбэков — 0.
     """
 
     id: UUID
@@ -67,6 +71,7 @@ class Message:
     task_name: str
     payload: bytes
     options: Mapping[str, object] = field(default_factory=_no_options)
+    generation: int = 0
 
 
 class Verdict(StrEnum):

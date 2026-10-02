@@ -92,6 +92,21 @@ async def test_dispatch_groups_by_task_name(rel: RelayEnv) -> None:
     ]
 
 
+async def test_message_carries_item_generation(rel: RelayEnv) -> None:
+    """Поколение отправки уходит в сообщение: по нему сверка с DLQ узнаёт джобу (UC-15)."""
+    _ = await add_batch(rel, [call(1), call(2)])
+    item = rel.tables.item
+    async with rel.env.transaction() as conn:
+        first, second = list(await conn.scalars(select(item.c.id).order_by(item.c.id)))
+        _ = await conn.execute(update(item).where(item.c.id == second).values(generation=2))
+    rel.clock.advance(GRACE)
+    assert await rel.relay.scan_once() == 2
+    assert {message.id: message.generation for message in rel.dispatcher.messages} == {
+        first: 0,
+        second: 2,
+    }
+
+
 async def test_scan_waits_for_grace_kick_does_not(rel: RelayEnv) -> None:
     first = await add_batch(rel, [call(1)])
     second = await add_batch(rel, [call(2)])
@@ -263,6 +278,7 @@ async def test_callback_record_uses_own_payload_and_options(rel: RelayEnv) -> No
     (message,) = rel.dispatcher.messages
     assert (message.id, message.kind, message.payload) == (callback_id, OutboxKind.CALLBACK, b"cb")
     assert dict(message.options) == {"queue": "hooks"}
+    assert message.generation == 0
     assert await outbox_rows(rel) == []
     # Колбэк — не Item: dispatched батча не растёт.
     assert (await rel.env.counters(batch_id)).dispatched == 0

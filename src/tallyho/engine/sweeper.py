@@ -382,11 +382,13 @@ class Sweeper:
         if requeue:
             await self._requeue(conn, requeue, now)
             # Истёкший lease тратит попытку, как перехват lease в claim (UC-15).
+            # Возврат в outbox — новое поколение отправки: мёртвую джобу
+            # прошлой отправки сверка с DLQ к Item уже не отнесёт.
             item = self.tables.item
             _ = await conn.execute(
                 update(item)
                 .where(item.c.id.in_([row.item_id for row in requeue]))
-                .values(attempt=item.c.attempt + 1)
+                .values(attempt=item.c.attempt + 1, generation=item.c.generation + 1)
             )
             deltas: defaultdict[UUID, CounterDelta] = defaultdict(CounterDelta)
             for row in requeue:

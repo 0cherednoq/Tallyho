@@ -106,6 +106,7 @@ _SelectedRow = tuple[
     int | None,
     int | None,
     float,
+    int | None,
 ]
 
 
@@ -168,6 +169,7 @@ class _Row:
     max_in_flight: int | None
     item_state: int | None
     lag: float
+    generation: int
 
     @property
     def broken(self) -> bool:
@@ -187,6 +189,7 @@ class _Row:
             task_name=self.task_name or "",
             payload=self.payload or b"",
             options=options,
+            generation=self.generation,
         )
 
 
@@ -539,6 +542,7 @@ class Relay:
                 batch.c.max_in_flight,
                 item.c.state,
                 lag,
+                item.c.generation,
             )
             .select_from(
                 outbox.outerjoin(item, item.c.id == outbox.c.item_id).outerjoin(
@@ -566,6 +570,8 @@ class Relay:
                 max_in_flight=max_in_flight,
                 item_state=item_state,
                 lag=max(0.0, float(lag_seconds)),
+                # Колбэк — не Item: поколение есть только у Items.
+                generation=generation or 0,
             )
             for (
                 row_id,
@@ -578,6 +584,7 @@ class Relay:
                 max_in_flight,
                 item_state,
                 lag_seconds,
+                generation,
             ) in typed_rows
         ]
 
