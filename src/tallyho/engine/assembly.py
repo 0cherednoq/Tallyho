@@ -29,7 +29,12 @@ from tallyho.engine.spawn import TreeCache
 from tallyho.engine.sweeper import Sweeper, SweeperSettings
 from tallyho.model.errors import ConfigurationError
 from tallyho.model.progress import ProgressSettings
-from tallyho.protocols.broker import CallOptionsValidator, Runtime, RuntimeInstaller
+from tallyho.protocols.broker import (
+    CallOptionsValidator,
+    RetryLimits,
+    Runtime,
+    RuntimeInstaller,
+)
 from tallyho.protocols.serialization import PayloadCodec, SerializerCodec
 from tallyho.storage.tx import RetryPolicy, after_commit, resolve_connection
 
@@ -306,6 +311,7 @@ class _Facade:
             clock=self.clock,
             finalizer=finalizer,
             relay=relay,
+            limits=adapter if isinstance(adapter, RetryLimits) else None,
             settings=SweeperSettings(
                 slot=slot,
                 finalize_grace=settings.finalize_grace,

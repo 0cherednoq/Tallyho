@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING
 import pytest
 
 from tallyho import Tallyho, callback, item
-from tallyho.model.states import BatchState
+from tallyho.model.states import BatchState, ItemState
 from tallyho.testing import FakeClock, InlineBroker
 
 if TYPE_CHECKING:
@@ -36,9 +36,10 @@ async def make_client(
     *,
     duplicates: float = 0.0,
     lease_seconds: float = 60,
+    max_retries: int = 0,
 ) -> AsyncGenerator[tuple[Tallyho, InlineBroker, FakeClock]]:
     clock = FakeClock(datetime(2026, 10, 1, 9, tzinfo=UTC))
-    broker = InlineBroker(duplicate_delivery_rate=duplicates, seed=42)
+    broker = InlineBroker(duplicate_delivery_rate=duplicates, seed=42, max_retries=max_retries)
     th = Tallyho(
         engine,
         schema=schema,
@@ -173,6 +174,64 @@ async def test_kill_leaves_lease_until_maintenance_then_redelivers(
         assert await broker.drain() >= 1
         assert calls == [1]
         assert (await batch.handle.view()).state is BatchState.SUCCEEDED
+
+
+async def test_broker_default_retries_bound_lease_recovery(
+    engine: AsyncEngine, schema: str
+) -> None:
+    """Fix-5: лимит задан только настройкой брокера, у вызова опции нет."""
+    calls: list[int] = []
+    async with make_client(engine, schema, lease_seconds=1, max_retries=2) as (th, broker, clock):
+
+        async def record(value: int) -> None:
+            await asyncio.sleep(0)
+            calls.append(value)
+
+        async with th.batch("inline-default-retries", key="one") as batch:
+            await batch.add_calls([th.call(record, 1)])
+
+        async def lose_worker() -> list[tuple[str, int, str | None]]:
+            broker.kill_worker_after(1)
+            _ = await broker.drain()
+            assert len(await batch.handle.in_flight()) == 1
+            _ = clock.advance(seconds=2)
+            _ = await th.run_maintenance_once()
+            return [
+                (view.state.name, view.attempt, view.label)
+                async for view in batch.handle.items(states=[ItemState.ACTIVE, ItemState.ERROR])
+            ]
+
+        # Первые два истёкших lease возвращают Item в outbox и тратят попытку.
+        assert await lose_worker() == [("ACTIVE", 1, None)]
+        assert await lose_worker() == [("ACTIVE", 2, None)]
+        assert (await batch.handle.view()).state is BatchState.SEALED
+        # Попытки исчерпаны: третий истёкший lease — окончательная ошибка.
+        assert await lose_worker() == [("ERROR", 2, "lease_expired")]
+        # Брокер ещё раз доставит потерянное сообщение, но Item уже терминален.
+        assert await broker.drain() == 1
+        assert calls == []
+        assert (await batch.handle.view()).state is BatchState.COMPLETED_WITH_ERRORS
+
+
+async def test_broker_default_retries_apply_to_task_errors(
+    engine: AsyncEngine, schema: str
+) -> None:
+    runs = 0
+    async with make_client(engine, schema, max_retries=1) as (th, broker, _clock):
+
+        async def flaky() -> None:
+            nonlocal runs
+            await asyncio.sleep(0)
+            runs += 1
+            raise RetryableError
+
+        async with th.batch("inline-default-errors", key="one") as batch:
+            await batch.add(flaky)
+
+        assert await broker.drain() == 2
+        assert runs == 2
+        assert len(broker.dead_letters) == 1
+        assert (await batch.handle.view()).state is BatchState.COMPLETED_WITH_ERRORS
 
 
 async def test_kill_callback_requeues_it_without_item_lease(

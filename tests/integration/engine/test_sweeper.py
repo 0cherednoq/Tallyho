@@ -48,7 +48,25 @@ class _Relay:
         self.kicked.extend(batch_ids)
 
 
-def sweeper(env: Env, finalizer: _Finalizer | None = None, relay: _Relay | None = None) -> Sweeper:
+class _Limits:
+    """Умолчания ``max_retries`` задач, как их отдаёт адаптер брокера."""
+
+    defaults: dict[str, int]
+
+    def __init__(self, defaults: dict[str, int]) -> None:
+        self.defaults = defaults
+
+    def max_retries(self, task_name: str) -> int:
+        return self.defaults.get(task_name, 0)
+
+
+def sweeper(
+    env: Env,
+    finalizer: _Finalizer | None = None,
+    relay: _Relay | None = None,
+    *,
+    limits: _Limits | None = None,
+) -> Sweeper:
     """Sweeper над схемой теста без grace-периода."""
     return Sweeper(
         tables=env.tables,
@@ -56,8 +74,46 @@ def sweeper(env: Env, finalizer: _Finalizer | None = None, relay: _Relay | None 
         clock=SystemClock(),
         finalizer=finalizer or _Finalizer(),
         relay=relay,
+        limits=limits,
         settings=SweeperSettings(finalize_grace=timedelta(0)),
     )
+
+
+async def expire_lease(env: Env, batch_id: UUID, item_id: UUID) -> None:
+    """Оставить Item с уже истёкшим lease погибшего воркера."""
+    async with env.transaction() as conn:
+        _ = await conn.execute(
+            env.tables.outbox.delete().where(env.tables.outbox.c.item_id == item_id)
+        )
+        _ = await conn.execute(
+            insert(env.tables.lease).values(
+                item_id=item_id,
+                batch_id=batch_id,
+                lease_until=datetime.now(UTC) - timedelta(seconds=1),
+                worker_id="dead",
+                attempt=0,
+            )
+        )
+
+
+async def item_rows(env: Env, ids: list[UUID]) -> list[tuple[int, str | None, int, int]]:
+    """``(state, label, attempt, записей outbox)`` по Items в порядке ``ids``."""
+    item = env.tables.item
+    outbox = env.tables.outbox
+    queued = (
+        select(func.count())
+        .select_from(outbox)
+        .where(outbox.c.item_id == item.c.id)
+        .scalar_subquery()
+    )
+    async with env.connection() as conn:
+        result = await conn.execute(
+            select(item.c.id, item.c.state, item.c.label, item.c.attempt, queued).where(
+                item.c.id.in_(ids)
+            )
+        )
+        rows = {row[0]: (int(row[1]), row[2], int(row[3]), int(row[4])) for row in result}
+    return [rows[item_id] for item_id in ids]
 
 
 async def make_items(
@@ -158,6 +214,7 @@ async def test_expire_leases_requeues_exhausts_and_cleans_terminal(env: Env) -> 
             select(env.tables.item.c.state).where(env.tables.item.c.id == cancelled_ids[0])
         )
     assert rows[ids[0]] == int(ItemState.ACTIVE)
+    assert [row[2] for row in await item_rows(env, ids[:2])] == [1, 1]
     assert rows[ids[1]] == int(ItemState.ERROR)
     assert rows[ids[2]] == int(ItemState.OK)
     assert queued == 1
@@ -166,6 +223,62 @@ async def test_expire_leases_requeues_exhausts_and_cleans_terminal(env: Env) -> 
     assert cancelled_state == int(ItemState.CANCELLED)
     assert set(finalizer.tried) == {batch_id, cancelled_batch}
     assert batch_id in relay.kicked
+
+
+async def test_expire_leases_uses_task_default_until_exhausted(env: Env) -> None:
+    """Fix-5: лимит только у задачи (декоратор), в ``th_item.options`` его нет."""
+    batch_id, ids = await make_items(env, 3)
+    active, error = int(ItemState.ACTIVE), int(ItemState.ERROR)
+    async with env.transaction() as conn:
+        # Опция вызова сильнее умолчания задачи, в том числе явный ноль.
+        _ = await conn.execute(
+            update(env.tables.item)
+            .where(env.tables.item.c.id == ids[1])
+            .values(options={"max_retries": 0})
+        )
+        _ = await conn.execute(
+            update(env.tables.item)
+            .where(env.tables.item.c.id == ids[2])
+            .values(options={"max_retries": 3, "queue": "slow"})
+        )
+    finalizer = _Finalizer()
+    relay = _Relay()
+    value = sweeper(env, finalizer, relay, limits=_Limits({"task": 2}))
+
+    for item_id in ids:
+        await expire_lease(env, batch_id, item_id)
+    assert await value.expire_leases() == 3
+    assert await item_rows(env, ids) == [
+        (active, None, 1, 1),
+        (error, "lease_expired", 0, 0),
+        (active, None, 1, 1),
+    ]
+    assert await env.count(env.tables.lease) == 0
+    assert relay.kicked == [batch_id]
+
+    for expected in ((active, None, 2, 1), (error, "lease_expired", 2, 0)):
+        await expire_lease(env, batch_id, ids[0])
+        assert await value.expire_leases() == 1
+        assert (await item_rows(env, ids))[0] == expected
+    assert finalizer.tried.count(batch_id) == 2
+
+
+async def test_expire_leases_without_adapter_limits_defaults_to_zero(env: Env) -> None:
+    batch_id, ids = await make_items(env, 2)
+    async with env.transaction() as conn:
+        _ = await conn.execute(
+            update(env.tables.item)
+            .where(env.tables.item.c.id == ids[1])
+            .values(options={"max_retries": "many"})
+        )
+    for item_id in ids:
+        await expire_lease(env, batch_id, item_id)
+
+    assert await sweeper(env).expire_leases() == 2
+    assert [row[:2] for row in await item_rows(env, ids)] == [
+        (int(ItemState.ERROR), "lease_expired"),
+        (int(ItemState.ERROR), "lease_expired"),
+    ]
 
 
 async def test_finalize_stuck_and_deadline(env: Env) -> None:

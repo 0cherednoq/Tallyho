@@ -52,6 +52,7 @@ if TYPE_CHECKING:
     from sqlalchemy import ColumnElement
     from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
+    from tallyho.protocols.broker import RetryLimits
     from tallyho.protocols.clock import Clock
     from tallyho.protocols.observer import Observer
     from tallyho.storage.tables import Tables
@@ -197,6 +198,8 @@ class Sweeper:
     clock: Clock
     finalizer: _Finalizer
     relay: _Relay | None = None
+    limits: RetryLimits | None = None
+    """Умолчания ``max_retries`` задач у адаптера; без него умолчание — 0."""
     settings: SweeperSettings = field(default_factory=SweeperSettings)
     observer: Observer = field(default_factory=NullObserver)
 
@@ -369,7 +372,7 @@ class Sweeper:
                 terminal.append(row.item_id)
             elif row.cancelled:
                 cancelled.append(_FinishRow(row.item_id, row.batch_id, row.weight))
-            elif row.attempt < self._max_retries(row.options):
+            elif row.attempt < self._max_retries(row):
                 requeue.append(row)
             else:
                 finishes.append(_FinishRow(row.item_id, row.batch_id, row.weight))
@@ -378,6 +381,13 @@ class Sweeper:
             _ = await conn.execute(delete(lease).where(lease.c.item_id.in_(handled_ids)))
         if requeue:
             await self._requeue(conn, requeue, now)
+            # Истёкший lease тратит попытку, как перехват lease в claim (UC-15).
+            item = self.tables.item
+            _ = await conn.execute(
+                update(item)
+                .where(item.c.id.in_([row.item_id for row in requeue]))
+                .values(attempt=item.c.attempt + 1)
+            )
             deltas: defaultdict[UUID, CounterDelta] = defaultdict(CounterDelta)
             for row in requeue:
                 deltas[row.batch_id] += CounterDelta(dispatched=-1)
@@ -796,9 +806,13 @@ class Sweeper:
         if self.relay is not None and ids:
             self.relay.kick(ids)
 
-    @staticmethod
-    def _max_retries(options: dict[str, object]) -> int:
-        value = options.get("max_retries", 0)
+    def _max_retries(self, row: _LeaseRow) -> int:
+        # Тот же лимит, с которым relay ставит задачу в брокер (D-012): опция
+        # вызова, иначе умолчание задачи, известное только адаптеру.
+        if "max_retries" in row.options or self.limits is None:
+            value = row.options.get("max_retries", 0)
+        else:
+            value = self.limits.max_retries(row.task_name)
         return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
 
     @staticmethod
