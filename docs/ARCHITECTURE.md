@@ -348,6 +348,7 @@ UUIDv7 генерируем сами (≈30 строк). В Python 3.14+ исп�
 | Протокол | Кто реализует | Для чего |
 |---|---|---|
 | `Dispatcher`, `Runtime`, `PayloadCodec` | адаптер брокера | отправка; обёртка исполнения, вердикт ретрая, сверка с DLQ по курсору (§11.3); кодек payload Items (без своего кодека — `SerializerCodec` поверх `Serializer`) |
+| `RetryLimits` | адаптер брокера (необязательно) | умолчание `max_retries` задачи по её имени — для sweeper, когда у вызова нет своей опции (UC-15) |
 | Tx-хуки `on_finalized / on_progress / on_policy_breach` | пользователь | перенос итога и прогресса в доменные таблицы (§7) |
 | `Serializer` | пользователь (есть json/msgspec) | аргументы задач, `result` Item |
 | `Observer` | пользователь | метрики, OpenTelemetry, логи — вне транзакций, fire-and-forget |
@@ -1219,7 +1220,7 @@ sequenceDiagram
 
     loop каждые sweep_interval
         SW->>DB: th_lease WHERE lease_until меньше now SKIP LOCKED
-        SW->>DB: attempt меньше max → DELETE lease, INSERT outbox
+        SW->>DB: attempt меньше max → DELETE lease, INSERT outbox, attempt += 1
         SW->>DB: attempt исчерпан → finish error, label=lease_expired
         SW->>DB: lease у терминального Item → DELETE
         SW->>F: sealed, pending 0, updated_at старше grace или hook_error и backoff истёк → try_finalize
@@ -1231,6 +1232,10 @@ sequenceDiagram
         SW->>R: kick
     end
 ```
+
+`max` в проверке lease — эффективный лимит повторов Item, тот же, с которым relay ставит задачу в брокер (D-012): опция вызова `max_retries` из `th_item.options`, а если её нет — умолчание задачи. Умолчание знает только адаптер (у flexiq это `max_retries` декоратора `@fq.task`, у `InlineBroker` — настройка брокера), поэтому sweeper спрашивает его по `task_name` через необязательный протокол `RetryLimits` (§4.2). Адаптер без `RetryLimits` или незнакомая ему задача дают умолчание 0. Sweeper работает в процессе maintenance рядом с relay, а relay без зарегистрированных задач отправлять не может, так что реестр задач там уже есть.
+
+Истёкший lease тратит попытку: при возврате в outbox sweeper делает `attempt += 1`, так же как claim при перехвате истёкшего lease (UC-03) и `release` при ретрае брокера (UC-04). Item, исполнитель которого погибает каждый раз, получит `error("lease_expired")` после `max` возвратов, а не будет переотправляться бесконечно.
 
 ### UC-16 Повтор упавших
 
@@ -1502,7 +1507,7 @@ await th.migrate()  # или ревизии Alembic: upgrade(..., version=1), з
 | В задаче известен `current_job.retry_count`, но не `max_retries`; решение «ретрай или DLQ» принимает Rust **после** задачи (`retry_on/dont_retry_on`, `retry_budget`, circuit breaker) | Задача не знает точно, последняя ли это попытка | `retry_verdict(exc)` считает по конфигу `TaskWrapper` и `retry_count`. Страховка: событие `JOB_DEAD` (`queue.on_event`, пул `flexiq-events`) через `loop.call_soon_threadsafe` + периодическая сверка `dead_letters_after(cursor)` → `get_job(original_job_id)` → `_th` из payload (D-014) → `finish(error)` с идемпотентным CAS |
 | Нет transactional enqueue: у flexiq свой пул соединений в Rust | Без нашего outbox — dual write | Наш outbox и relay обязательны. Это прямая ценность библиотеки для flexiq |
 | `idempotency_key` дедуплицирует только пока джоба pending/running | Повтор relay после падения может создать дубль | Relay передаёт `idempotency_key=f"th:{item_id}"`. Поздние дубли отсекает наш claim |
-| `aenqueue_many` — это sync `enqueue_many` в общем `ThreadPoolExecutor(max_workers=2)`; один набор `task_name, queue, priority, max_retries, timeout` на вызов; `None` берёт умолчания Queue, а не `@task`; дубль `idempotency_key` роняет всю пачку | Узкое место отправки, потеря опций задачи | Relay передаёт опции задачи явно, группирует по `(task_name, queue, priority, max_retries, timeout)`, шлёт чанками по 1 000 через **свой** executor; при дубле ключа — поштучный `enqueue` |
+| `aenqueue_many` — это sync `enqueue_many` в общем `ThreadPoolExecutor(max_workers=2)`; один набор `task_name, queue, priority, max_retries, timeout` на вызов; `None` берёт умолчания Queue, а не `@task`; дубль `idempotency_key` роняет всю пачку | Узкое место отправки, потеря опций задачи | Relay передаёт опции задачи явно, группирует по `(task_name, queue, priority, max_retries, timeout)`, шлёт чанками по 1 000 через **свой** executor; при дубле ключа — поштучный `enqueue`. То же умолчание `max_retries` адаптер отдаёт sweeper-у через `RetryLimits` (UC-15) |
 | Нет per-job heartbeat; мёртвый воркер обнаруживается через ~43 с (порог 30 с + heartbeat воркеров + цикл reaper), его джобы уходят в retry и тратят попытку | Ретрай flexiq может прийти при ещё живом нашем lease | Claim при живом чужом lease отдаёт успех. Item остаётся за lease, sweeper переотправит его по истечении. Задержка ≤ `lease_ttl` |
 | `retry_dead`, `replay` и авто-ретраи DLQ создают **новый** job id; kwargs (и `_th`) переносятся, `metadata` пользователя — нет (`retry_dead` добавляет служебные ключи, `replay` заменяет) | Повтор из UI flexiq исполнит Item повторно | Claim видит, что Item терминальный, → no-op. Перезапуск упавших — только `handle.retry_failed()` |
 | Встроенные `group/chord` — оркестрация в потоке вызывающего без записи в хранилище; `Workflow` — статичный DAG без добавления детей в работающий граф; прогресса группы нет | — | Не конфликтуем: tallyho закрывает то, чего во flexiq нет |
