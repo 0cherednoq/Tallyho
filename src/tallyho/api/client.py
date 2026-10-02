@@ -97,6 +97,7 @@ class Settings:
     max_items: int | None = None
     sweep_interval: timedelta = timedelta(seconds=5)
     lock_timeout: timedelta = timedelta(seconds=5)
+    close_timeout: timedelta = timedelta(seconds=10)
     retention: timedelta | None = timedelta(days=14)
     watch_throttle: timedelta = timedelta(milliseconds=500)
     items_scan_window: int = 5000
@@ -154,6 +155,7 @@ class Settings:
             "snapshot_tick": self.snapshot_tick,
             "sweep_interval": self.sweep_interval,
             "lock_timeout": self.lock_timeout,
+            "close_timeout": self.close_timeout,
             "watch_throttle": self.watch_throttle,
         }
 
@@ -212,6 +214,7 @@ class Settings:
             lock_timeout=self.lock_timeout,
             watch_throttle=self.watch_throttle,
             items_scan_window=self.items_scan_window,
+            close_timeout=self.close_timeout,
         )
 
 
@@ -277,9 +280,17 @@ class Tallyho:
         self._installed = True
 
     async def aclose(self) -> None:
-        """Остановить фоновый цикл relay и дождаться его.
+        """Корректно закрыть установку в этом процессе (ARCHITECTURE §11.1).
 
-        Вызывается при остановке процесса в том же event loop, где шла работа.
+        Новая фоновая работа не принимается, после-коммитные задачи
+        дожидаются, Completer досылает буфер и возвращает удержанные Items в
+        outbox, relay останавливается. На всё отведён ``close_timeout``: по
+        истечении оставшиеся задачи отменяются, их работу подберёт sweeper.
+
+        Вызывать можно из любого event loop: части, созданные в другом loop
+        (воркер flexiq), закрываются в нём. Повторный вызов — no-op. После
+        закрытия запись, операции над батчем и maintenance бросают
+        ``ClosedError``; чтение работает.
         """
         await self._engine.close()
 

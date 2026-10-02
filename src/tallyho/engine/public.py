@@ -118,6 +118,7 @@ class EngineSettings:
     lock_timeout: timedelta
     watch_throttle: timedelta
     items_scan_window: int
+    close_timeout: timedelta
 
 
 class MaintenanceRunner(Protocol):
@@ -159,7 +160,7 @@ class EngineFacade(Protocol):
         ...
 
     async def close(self) -> None:
-        """Остановить фоновый цикл relay и дождаться его."""
+        """Закрыть установку: дождаться фоновых задач, закрыть Completer и relay (§11.1)."""
         ...
 
     def writer(
