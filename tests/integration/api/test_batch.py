@@ -63,22 +63,13 @@ async def fail_after_add(builder: BatchBuilder) -> None:
         raise ScenarioFailedError
 
 
-async def settle() -> None:
-    """Дождаться разовых фоновых задач библиотеки, чтобы они не пересеклись с удалением схемы.
-
-    Цикл relay живёт до ``aclose`` — его останавливает фикстура ``th``.
-    """
-    own = [
-        task
-        for task in asyncio.all_tasks()
-        if task.get_name().startswith("tallyho-") and task.get_name() != "tallyho-relay"
-    ]
-    _ = await asyncio.gather(*own, return_exceptions=True)
-
-
 @pytest.fixture
 async def th(env: Env) -> AsyncGenerator[Tallyho]:
-    """Установленный публичный клиент над схемой теста; relay остановлен до DROP SCHEMA."""
+    """Установленный публичный клиент над схемой теста.
+
+    ``aclose`` дожидается фоновых задач библиотеки и останавливает relay до
+    ``DROP SCHEMA`` (Fix-11).
+    """
     value = Tallyho(env.engine, schema=env.schema)
     value.install(FakeBroker())
     yield value
@@ -188,7 +179,6 @@ async def test_cancel_right_after_seal_never_finalizes_succeeded(th: Tallyho) ->
         view = await root.handle.wait(timeout=timedelta(seconds=10))
         assert view.state is BatchState.CANCELLED
         assert (view.progress.ok, view.progress.cancelled) == (0, 4)
-    await settle()
 
 
 async def test_cancel_during_finalization_hook_finalizes_cancelled(th: Tallyho) -> None:
@@ -211,7 +201,8 @@ async def test_cancel_during_finalization_hook_finalizes_cancelled(th: Tallyho) 
     release.set()
 
     view = await root.handle.wait(timeout=timedelta(seconds=10))
-    await settle()
+    # Хук считается после закрытия: фоновые финализации к этому моменту завершены.
+    await th.aclose()
     assert view.state is BatchState.CANCELLED
     assert seen[0] is BatchState.SUCCEEDED
     assert set(seen[1:]) == {BatchState.CANCELLED}

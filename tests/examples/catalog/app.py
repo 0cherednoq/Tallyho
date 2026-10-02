@@ -106,8 +106,8 @@ class CatalogApp:
         return app
 
     async def close(self) -> None:
-        """Stop pending worker-runtime tasks."""
-        await self.broker.close()
+        """Close the installation: wait for background tasks, stop the worker runtime."""
+        await self.th.aclose()
 
     async def drain(self) -> int:
         """Run workers and one deterministic maintenance pass until idle."""

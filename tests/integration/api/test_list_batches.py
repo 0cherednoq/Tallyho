@@ -40,7 +40,7 @@ async def make_client(
     try:
         yield th, broker, clock
     finally:
-        await broker.close()
+        await th.aclose()
 
 
 async def noop(value: int) -> None:

@@ -112,7 +112,7 @@ async def _exercise_pool(engine: AsyncEngine, schema: str, driver: Driver) -> No
         assert (await batch.handle.view()).state is BatchState.SUCCEEDED
         assert await committed_ids(engine, probe) == [1, 2]
     finally:
-        await broker.close()
+        await th.aclose()
 
 
 @pytest.mark.parametrize("driver", ["asyncpg", "psycopg"])

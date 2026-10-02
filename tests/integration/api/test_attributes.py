@@ -84,7 +84,7 @@ async def make_client(
     try:
         yield th, broker, clock, observer
     finally:
-        await broker.close()
+        await th.aclose()
 
 
 @contextlib.contextmanager

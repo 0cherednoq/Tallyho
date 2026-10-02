@@ -156,7 +156,10 @@ def _render(view: BatchView, *, indent: str = "") -> list[str]:
 
 
 async def serve_maintenance(runner: MaintenanceRunner) -> None:
-    """Run maintenance until stopped, wiring SIGINT and SIGTERM when supported."""
+    """Run maintenance until stopped, wiring SIGINT and SIGTERM when supported.
+
+    The caller closes the installation afterwards with ``await th.aclose()``.
+    """
     loop = asyncio.get_running_loop()
     registered: list[signal.Signals] = []
     for candidate in (signal.SIGINT, signal.SIGTERM):
@@ -186,23 +189,31 @@ async def run(argv: Sequence[str] | None = None) -> int:
             schema=command.schema,
             hook_modules=command.hook_modules if isinstance(command, _Maintenance) else (),
         )
-        if isinstance(command, _Migrate):
-            version = await client.migrate()
-            _ = sys.stdout.write(f"schema={command.schema} version={version}\n")
-            return 0
-        client.install(None)
-        if isinstance(command, _Inspect):
-            view = await (await _resolve(client, command.target)).view()
-            _ = sys.stdout.write("\n".join(_render(view)) + "\n")
-            return 0
-        if command.once:
-            _ = await client.run_maintenance_once()
-            _ = sys.stdout.write("maintenance pass complete\n")
-            return 0
-        await serve_maintenance(client.maintenance())
-        return 0
+        try:
+            return await _execute(client, command)
+        finally:
+            # Остановка (SIGINT/SIGTERM) или конец команды: дождаться фоновых задач.
+            await client.aclose()
     finally:
         await engine.dispose()
+
+
+async def _execute(client: Tallyho, command: _Command) -> int:
+    if isinstance(command, _Migrate):
+        version = await client.migrate()
+        _ = sys.stdout.write(f"schema={command.schema} version={version}\n")
+        return 0
+    client.install(None)
+    if isinstance(command, _Inspect):
+        view = await (await _resolve(client, command.target)).view()
+        _ = sys.stdout.write("\n".join(_render(view)) + "\n")
+        return 0
+    if command.once:
+        _ = await client.run_maintenance_once()
+        _ = sys.stdout.write("maintenance pass complete\n")
+        return 0
+    await serve_maintenance(client.maintenance())
+    return 0
 
 
 def main(argv: Sequence[str] | None = None) -> int:

@@ -51,5 +51,9 @@ class TallyhoTestEnv:
         return await self.th.run_maintenance_once()
 
     async def close(self) -> None:
-        """Остановить фоновые операции тестового брокера."""
-        await self.broker.close()
+        """Закрыть установку: дождаться фоновых задач библиотеки (``th.aclose()``).
+
+        Вызывается до удаления схемы теста, иначе незавершённая финализация
+        столкнётся с ``DROP SCHEMA``. Фикстура ``tallyho_env`` вызывает сама.
+        """
+        await self.th.aclose()

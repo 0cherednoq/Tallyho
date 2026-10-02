@@ -322,7 +322,7 @@ async def test_randomized_pipelines_close_every_stage_once(
             await _run_pipelines(runtime, _random(seed))
         _assert_no_deadlocks(errors, runtime.observer)
     finally:
-        await runtime.broker.close()
+        await runtime.th.aclose()
 
 
 @pytest.mark.slow
@@ -352,7 +352,7 @@ async def test_ten_percent_duplicate_delivery_finalizes_once(
         assert runtime.observer.counts[view.id] == 1
         _assert_no_deadlocks(errors, runtime.observer)
     finally:
-        await runtime.broker.close()
+        await runtime.th.aclose()
 
 
 @pytest.mark.slow
@@ -393,5 +393,5 @@ async def test_parallel_pause_cancel_sources_and_hooks_have_no_deadlocks(
         work.release.set()
         if draining is not None:
             _ = await asyncio.gather(draining, return_exceptions=True)
-        await harness.broker.close()
+        await harness.th.aclose()
         await harness.engine.dispose()

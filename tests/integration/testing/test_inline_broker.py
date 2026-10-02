@@ -11,8 +11,10 @@ from typing import TYPE_CHECKING
 import pytest
 
 from tallyho import Tallyho, callback, item
+from tallyho.model.errors import ClosedError
 from tallyho.model.states import BatchState, ItemState
 from tallyho.testing import FakeClock, InlineBroker
+from tests.helpers.loops import library_tasks
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
@@ -52,7 +54,7 @@ async def make_client(
     try:
         yield th, broker, clock
     finally:
-        await broker.close()
+        await th.aclose()
 
 
 async def test_duplicates_are_delivered_but_task_side_effect_runs_once(
@@ -341,6 +343,41 @@ async def test_pytest_fixture_is_installed_and_ready(tallyho_env: TallyhoTestEnv
     assert await tallyho_env.drain() == 0
     assert seen == ["plain", "ok"]
     assert (await batch.handle.view()).state is BatchState.SUCCEEDED
+
+
+async def test_env_close_closes_the_whole_installation(tallyho_env: TallyhoTestEnv) -> None:
+    async with tallyho_env.th.batch("fixture-close", key="empty") as batch:
+        pass  # финализация пустого батча идёт в фоне
+
+    await tallyho_env.close()
+
+    # Фоновых задач не осталось: удалять схему теста после этого безопасно.
+    assert library_tasks() == []
+    assert (await batch.handle.view()).state is BatchState.SUCCEEDED
+    with pytest.raises(ClosedError):
+        _ = await tallyho_env.run_maintenance_once()
+
+
+async def test_broker_close_stops_only_the_worker(engine: AsyncEngine, schema: str) -> None:
+    async with make_client(engine, schema) as (th, broker, _clock):
+
+        async def noop(value: int) -> None:
+            _ = value
+            await asyncio.sleep(0)
+
+        async with th.batch("inline-broker-close", key="one") as batch:
+            await batch.add(noop, 1)
+        assert await broker.drain() == 1
+
+        await broker.close()
+
+        # Воркер остановлен, но установка открыта: продюсер и финализация работают.
+        async with th.batch("inline-broker-close", key="two") as second:
+            pass
+        assert (await second.handle.wait(timeout=timedelta(seconds=10))).state is (
+            BatchState.SUCCEEDED
+        )
+        assert (await batch.handle.view()).state is BatchState.SUCCEEDED
 
 
 async def test_drain_waits_for_post_commit_finalization_and_callback(

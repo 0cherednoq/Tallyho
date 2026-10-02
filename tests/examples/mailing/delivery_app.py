@@ -106,8 +106,8 @@ class DeliveryApp:
         return app
 
     async def close(self) -> None:
-        """Flush and stop the in-process worker runtime."""
-        await self.broker.close()
+        """Close the installation: flush the worker runtime, wait for background tasks."""
+        await self.th.aclose()
 
     async def drain(self) -> int:
         """Run the in-process worker until the application is idle."""
