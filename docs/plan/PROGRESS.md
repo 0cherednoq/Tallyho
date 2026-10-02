@@ -6,8 +6,8 @@
 ## Текущее состояние
 
 * **Ветка:** `impl/v1`
-* **Текущая волна:** 10 — Fix-6, Fix-8, Fix-11, Fix-12 влиты, идут гейты после вливания; затем Fix-13, Fix-15, Fix-16, Fix-18, далее Fix-14, Fix-17, Fix-19, Fix-20, T11.3b, T11.4, T11.5
-* **Последний зелёный коммит:** 72fbd65
+* **Текущая волна:** 11 — Fix-13, Fix-15, Fix-16, Fix-18; затем Fix-14, Fix-17, Fix-19, Fix-20, T11.3b, T11.4, T11.5
+* **Последний зелёный коммит:** 50623c2
 
 ## Задачи
 
@@ -75,19 +75,19 @@
 | Fix-3 | InlineBroker.drain дожидается после-коммитной работы Completer | — | done | 7d80183 |
 | Fix-4 | Редкий дедлок в стресс-файле test_concurrency и утечка статистики дедлоков между тестами | — | done | 96c0d33..908e889 (4), merge 4da9890 |
 | Fix-5 | Sweeper учитывает `max_retries` из декоратора задачи | — | done | 700f1dc..9ccde03 (5), merge 56b7a1f |
-| Fix-6 | Движок периодически вызывает `reconcile_dead` | — | in_progress | 51dff40..67059dc (9), merge 185d808 — G2 ожидает |
+| Fix-6 | Движок периодически вызывает `reconcile_dead` | — | done | 51dff40..67059dc (9), merge 185d808 |
 | Fix-7 | Повторная доставка не оставляет Item без исполнителя | — | done | 51fc8b8..ae2e22b (7), merge 15ed914 |
-| Fix-8 | `complete_in` учитывает результат CAS | — | in_progress | 276cc11..f51f630 (5), merge df7770a — G2 ожидает |
+| Fix-8 | `complete_in` учитывает результат CAS | — | done | 276cc11..f51f630 (5), merge df7770a |
 | Fix-9 | Отменённый до старта батч не финализируется как `succeeded` | — | done | 200a272..046b1a1 (3), merge 5b22aff |
 | Fix-10 | Быстрая отправка relay после commit в каждом процессе | — | done | 5de7d24..69d0d91 (5), merge d36a62f |
-| Fix-11 | Закрытие дожидается фоновых задач; SIGTERM возвращает удержанные Items | — | in_progress | e51a204..420923c (13), merge 1fa43ac — G2 ожидает |
-| Fix-12 | Запросы на соединении пользователя видят схему установки | — | in_progress | 180de5f..2b9ddc7 (3), merge ab23dcb — G2 ожидает |
-| Fix-13 | Публичный API ↔ ARCHITECTURE §11 | — | todo | |
+| Fix-11 | Закрытие дожидается фоновых задач; SIGTERM возвращает удержанные Items | — | done | e51a204..420923c (13), merge 1fa43ac |
+| Fix-12 | Запросы на соединении пользователя видят схему установки | — | done | 180de5f..2b9ddc7 (3), merge ab23dcb |
+| Fix-13 | Публичный API ↔ ARCHITECTURE §11 | — | in_progress | |
 | Fix-14 | Мелкие расхождения движка: backoff хуков, labels/metrics, lock с prefix, `found` корня | — | todo | |
-| Fix-15 | Дедлайн после явного `cancel()` не меняет итог на `failed` | — | todo | |
-| Fix-16 | `after_commit` для `AsyncConnection` срабатывает после COMMIT | — | todo | |
+| Fix-15 | Дедлайн после явного `cancel()` не меняет итог на `failed` | — | in_progress | |
+| Fix-16 | `after_commit` для `AsyncConnection` срабатывает после COMMIT | — | in_progress | |
 | Fix-17 | `watch()`/`wait()` не оставляет `LISTEN` на соединении пула | — | todo | |
-| Fix-18 | `finish` и `JOB_DEAD` проверяют владение lease и поколение; ключ идемпотентности с поколением | — | todo | |
+| Fix-18 | `finish` и `JOB_DEAD` проверяют владение lease и поколение; ключ идемпотентности с поколением | — | in_progress | |
 | Fix-19 | Зависание на S2: Item `active` без lease и outbox при живой джобе flexiq | — | todo | |
 | Fix-20 | `Completer._held` после `complete_in`; heartbeat против долгой транзакции пути B | — | todo | |
 
@@ -99,6 +99,15 @@
 - Отклонения от плана/доков: … (или «нет»)
 - Узнали / на что обратить внимание дальше: …
 -->
+### 2026-10-03 · волна 11 запущена · Fix-13, Fix-15, Fix-16, Fix-18
+- Четыре задачи в изолированных worktree от текущего HEAD: публичный API ↔ ARCHITECTURE §11, первая причина отмены выигрывает, момент `after_commit` для собственной транзакции, владение lease и поколение в пути A и `JOB_DEAD`. Fix-14 (пересекается с Fix-16 в maintenance/reads), Fix-17, Fix-19, Fix-20 — следующей волной. G2 и мутационный gate (Fix-18 меняет `_Tx.finish`) выполняет оркестратор после вливания.
+
+### 2026-10-03 · волна 10 прошла гейты · Fix-6, Fix-8, Fix-11, Fix-12 · done
+- `poe test-all` после вливания и исправления стыка Fix-6 × Fix-11 (`e4c7915`): **1910 passed, 1 skipped, 1 failed, покрытие 97,53%, seed 3100107841, 47:48.** Упавший `tests/unit/api/test_typing.py::test_negative_calls_fail_on_exact_lines[basedpyright]` — артефакт запуска, не кода волны: (1) `--basetemp` внутри `.work-tmp`, а basedpyright файлы этого каталога не проверяет; (2) в окружении оболочки появился `FORCE_COLOR=3`, и цветовые коды разрывали «файл:строка». Обе причины воспроизведены по отдельности; тест теперь вырезает ANSI-коды (`50623c2`) и зелёный с `FORCE_COLOR=3` и без него. Полный набор повторно не прогонялся.
+- Мутационный gate в Linux-контейнере на `50623c2` — код 0: 392 killed, 4 timeout (все в `_Tx.claim`), выживших, suspicious и no-tests нет. Проверка нужна была из-за правки `Operations._retry_items` в Fix-6.
+- pre-commit all-files — зелёный.
+- Узнали: окружение оболочки сменилось — `VIRTUAL_ENV` указывает на чужой проект (uv его игнорирует с предупреждением), `FORCE_COLOR=3`, консоль cp1251 роняет вывод import-linter в pre-commit. Команды запускать с `unset VIRTUAL_ENV FORCE_COLOR` и `PYTHONUTF8=1`; `--basetemp` держать вне репозитория.
+
 ### 2026-10-03 · волна 10 влита, гейты после вливания идут · Fix-6, Fix-8, Fix-11, Fix-12 · merge 185d808, df7770a, 1fa43ac, ab23dcb
 - **Статус.** Код всех четырёх задач в `impl/v1`; `poe check` — 1184 быстрых теста, зелёный. Быстрый интеграционный прогон без `slow`: 641 passed, **1 failed** — `tests/integration/api/test_relay_fast_path.py::test_dead_letters_are_reconciled_by_process_with_adapter_not_by_leader` бросает `ClosedError` (стык Fix-6 × Fix-11: тест сверки обращается к уже закрытой установке). Полный `poe test-all` и мутационный gate ещё не выполнялись — до них задачи остаются `in_progress`.
 - **Fix-6.** Проход `DeadLetterReconciler` (`engine/dead_letters.py`) идёт в цикле relay каждого процесса с адаптером после scan и в `run_maintenance_once()`; курсор — `th_meta.dead_letter_cursor` под `FOR UPDATE SKIP LOCKED`, двигается в транзакции завершений. Завершается только Item с мёртвой джобой **текущего поколения отправки** и без lease и outbox (D-051). Схема v5: `th_item.generation`, растёт при каждом возврате Item в outbox, уходит в `Message.generation` и маркер `_th["g"]`. `FlexiqAdapter.reconcile_dead` переписан на свой курсор: `dead_letters_after` листает от новых к старым (D-052). A-CH-04: S1 и S3 — 0 зависших Items; S2 — 2 зависших в одном прогоне из двух (Fix-19). **Изменена функция мутационного gate** `Operations._retry_items` (`generation + 1`).
