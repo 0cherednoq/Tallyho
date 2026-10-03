@@ -82,6 +82,8 @@ _FLUSH_SCRIPT = 'psql -U tallyho -d tallyho -v ON_ERROR_STOP=1 -qAt -c "$1" && k
 _FLUSH_MARK = "flush in progress: "
 _FLEXIQ_ERRORS = (RuntimeError, OSError, ValueError, KeyError)
 _PAGE = 200
+_READY_TIMEOUT = 60.0
+"""Сколько ждать ready-файла воркера перед SIGTERM, секунды."""
 
 
 @dataclass(slots=True)
@@ -174,6 +176,11 @@ class ChaosController:
 
     async def _term_workers(self, action: Action) -> None:
         budget = self.stand.settings.drain_timeout + 15
+        # Воркер - PID 1 контейнера: SIGTERM до установки обработчика ядро отбрасывает, и
+        # только что перезапущенный воркер «не услышал» бы остановку. Ждём его ready-файл.
+        waits = await asyncio.gather(
+            *(self.stand.wait_worker_ready(worker, _READY_TIMEOUT) for worker in WORKERS)
+        )
         started = time.monotonic()
 
         async def stop(worker: str) -> float | None:
@@ -189,6 +196,7 @@ class ChaosController:
             "term_workers",
             signal="TERM",
             exit_seconds=dict(zip(WORKERS, exits, strict=True)),
+            ready_wait=dict(zip(WORKERS, waits, strict=True)),
             leases_left=leases,
             planned_at=action.at,
         )

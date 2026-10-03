@@ -23,7 +23,7 @@ _CLOSE_RESERVE = 3.0
 """Seconds kept before FlexIQ's own drain deadline for closing the installation."""
 
 
-def _serve(app: AcceptanceApp, *, drain_timeout: float) -> None:
+def _serve(app: AcceptanceApp, *, drain_timeout: float, ready: Path | None) -> None:
     """Run the worker until SIGTERM/SIGINT, then close the installation in bounded time.
 
     FlexIQ 2.0 cannot be trusted with the deadline: if ``drain_timeout`` expires while
@@ -32,6 +32,10 @@ def _serve(app: AcceptanceApp, *, drain_timeout: float) -> None:
     called. So FlexIQ runs in a thread and the main thread owns the signals and an earlier
     deadline: jobs that are still running when it passes get their Items returned to the
     outbox by ``aclose`` (A-CH-08), and the process exits on its own.
+
+    The ready file appears only after the signal handlers are installed: the process is
+    PID 1 of its container, and the kernel drops a SIGTERM that PID 1 has no handler for,
+    so the chaos controller must not send it earlier (A-CH-08).
     """
     stop = threading.Event()
     failures: list[BaseException] = []
@@ -50,6 +54,8 @@ def _serve(app: AcceptanceApp, *, drain_timeout: float) -> None:
 
     for candidate in (signal.SIGINT, signal.SIGTERM):
         _ = signal.signal(candidate, request_stop)
+    if ready is not None:
+        _ = ready.write_text("ready", encoding="utf-8", newline="\n")
     worker = threading.Thread(target=run, name="flexiq-worker", daemon=True)
     worker.start()
     while worker.is_alive() and not stop.wait(0.2):
@@ -102,9 +108,7 @@ def main() -> None:
         worker_count=values.workers,
         tuning=tuning_from(values),
     )
-    if values.ready is not None:
-        values.ready.write_text("ready", encoding="utf-8")
-    _serve(app, drain_timeout=float(values.drain_timeout))
+    _serve(app, drain_timeout=float(values.drain_timeout), ready=values.ready)
 
 
 if __name__ == "__main__":
