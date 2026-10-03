@@ -22,6 +22,7 @@ from tallyho.protocols.observer import NullObserver
 from tallyho.storage.metric_names import METRIC_PREFIX
 from tallyho.storage.tx import resolve_connection
 from tests.helpers.after_commit import pause_commit_polling
+from tests.helpers.db import deadlocks, record_db_errors
 from tests.helpers.probe import committed_ids, create_probe, insert_id
 from tests.integration.engine.completer_env import (
     COMPLETER_SLOT,
@@ -37,6 +38,7 @@ from tests.integration.engine.completer_env import (
 )
 
 if TYPE_CHECKING:
+    from datetime import datetime
     from uuid import UUID
 
     from tests.integration.engine.conftest import Env
@@ -528,3 +530,138 @@ async def test_complete_in_terminal_item_with_stale_lease_is_rejected(env: Env) 
     assert await _state(env, cancelled.id) is ItemState.CANCELLED
     assert await _state(env, foreign.id) is ItemState.ACTIVE
     assert (await env.counters(seeded.batch_id)).pending == 2
+
+
+# --- метрики пути B, не перенесённые после commit (Fix-23) -----------------------------
+
+GRACE = timedelta(seconds=30)
+WITH_METRICS = FinishResult(result_class=ResultClass.OK, label="sent", metrics={"bytes": 42})
+
+
+def _grace_sweeper(env: Env, now: datetime) -> Sweeper:
+    return Sweeper(
+        tables=env.tables,
+        engine=schema_engine(env),
+        clock=MovableClock(now),
+        finalizer=Finalized(),
+        settings=SweeperSettings(finalize_grace=GRACE),
+    )
+
+
+async def _metric_slots(env: Env) -> list[tuple[str, int, int]]:
+    metric = env.tables.metric
+    async with env.connection() as conn:
+        rows = await conn.execute(
+            select(metric.c.name, metric.c.slot, metric.c.value).order_by(
+                metric.c.name, metric.c.slot
+            )
+        )
+        return [(name, slot, value) for name, slot, value in rows]
+
+
+def _sums(rows: list[tuple[str, int, int]]) -> dict[str, int]:
+    sums: dict[str, int] = {}
+    for name, _, value in rows:
+        sums[name] = sums.get(name, 0) + value
+    return sums
+
+
+async def _complete_and_crash(env: Env, monkeypatch: pytest.MonkeyPatch, ref: ItemRef) -> None:
+    """``complete_in`` закоммичен, а процесс «упал» до переноса после commit."""
+    pause_commit_polling(monkeypatch)
+    async with open_completer(env) as completer:
+        async with env.transaction() as conn:
+            assert await complete_in(conn, ref, WITH_METRICS, completer=completer)
+        # Колбэк после commit ещё не доставлен; Completer обрывается, как при падении.
+        await completer.abort()
+
+
+async def test_sweeper_moves_metric_slot_left_after_crash(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seeded = await seed(env, 1)
+    await _complete_and_crash(env, monkeypatch, seeded.refs[0])
+    before = await _metric_slots(env)
+    counters = await env.counters(seeded.batch_id)
+    assert len({slot for _, slot, _ in before}) == 1
+    assert all(slot < 0 for _, slot, _ in before)
+    assert await env.count(env.tables.counter_delta) == 1
+
+    # Моложе grace: перенос после commit ещё возможен, строки не трогаются.
+    assert await _grace_sweeper(env, NOW + GRACE - timedelta(seconds=1)).fold_stale_deltas() == 0
+    assert await _metric_slots(env) == before
+
+    assert await _grace_sweeper(env, NOW + GRACE).fold_stale_deltas() == 1
+    after = await _metric_slots(env)
+    assert after == [(METRIC_PREFIX + "bytes", 0, 42), ("sent", 0, 1)]
+    assert _sums(after) == _sums(before)
+    assert await env.counters(seeded.batch_id) == counters
+    assert await env.count(env.tables.counter_delta) == 0
+
+
+async def test_sweeper_skips_metric_slot_while_its_fold_is_in_progress(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seeded = await seed(env, 1)
+    await _complete_and_crash(env, monkeypatch, seeded.refs[0])
+    before = await _metric_slots(env)
+    sweeper = _grace_sweeper(env, NOW + GRACE)
+    delta = env.tables.counter_delta
+    async with env.connection() as holder:
+        # Свёртка Completer держит дельту: строки её слота она заберёт сама.
+        _ = await holder.execute(select(delta.c.id).with_for_update())
+        assert await sweeper.fold_stale_deltas() == 0
+        assert await _metric_slots(env) == before
+        await holder.rollback()
+
+    assert await sweeper.fold_stale_deltas() == 1
+    after = await _metric_slots(env)
+    assert all(slot == 0 for _, slot, _ in after)
+    assert _sums(after) == _sums(before)
+
+
+async def test_sweeper_races_settle_of_complete_in_without_deadlocks(env: Env) -> None:
+    """Sweeper без grace сворачивает дельты наперегонки со свёрткой Completer."""
+    items = 24
+    seeded = await seed(env, items)
+    sweeper = Sweeper(
+        tables=env.tables,
+        engine=schema_engine(env),
+        clock=MovableClock(),
+        finalizer=Finalized(),
+        settings=SweeperSettings(finalize_grace=timedelta(0)),
+    )
+    finished = asyncio.Event()
+
+    async def sweep() -> int:
+        folded = 0
+        while not finished.is_set():
+            folded += await sweeper.fold_stale_deltas()
+            await asyncio.sleep(0)
+        return folded
+
+    with record_db_errors(env.engine) as errors:
+        async with open_completer(env) as completer:
+
+            async def finish(ref: ItemRef) -> bool:
+                async with AsyncSession(schema_engine(env)) as session:
+                    changed = await complete_in(session, ref, WITH_METRICS, completer=completer)
+                    await session.commit()
+                    return changed
+
+            sweeping = asyncio.create_task(sweep())
+            try:
+                assert all(await asyncio.gather(*(finish(ref) for ref in seeded.refs)))
+                await completer.settled()
+            finally:
+                finished.set()
+                _ = await sweeping
+        _ = await sweeper.fold_stale_deltas()
+
+    assert deadlocks(errors) == []
+    rows = await _metric_slots(env)
+    assert all(slot >= 0 for _, slot, _ in rows)
+    assert _sums(rows) == {METRIC_PREFIX + "bytes": 42 * items, "sent": items}
+    counters = await env.counters(seeded.batch_id)
+    assert (counters.ok, counters.pending) == (items, 0)
+    assert await env.count(env.tables.counter_delta) == 0

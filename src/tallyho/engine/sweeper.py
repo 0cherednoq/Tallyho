@@ -43,8 +43,10 @@ from tallyho.storage.counters import (
     CounterDelta,
     fold_delta_ids,
     reconcile,
+    take_stale_metric_slots,
     upsert_metrics,
     upsert_slots,
+    user_metric_slot,
 )
 from tallyho.storage.now import sql_now
 from tallyho.storage.tx import RetryPolicy, TxSettings, run_transaction
@@ -409,6 +411,9 @@ class Sweeper:
     async def fold_stale_deltas(self) -> int:
         """Свернуть append-only дельты старше ``finalize_grace``.
 
+        Вместе с дельтой в слот sweeper переносятся строки ``th_metric`` её
+        отрицательного слота, если их не перенёс Completer (UC-08).
+
         Returns:
             Число свёрнутых строк дельт.
         """
@@ -730,24 +735,39 @@ class Sweeper:
         return tuple(result)
 
     async def _fold_deltas_in(self, conn: AsyncConnection) -> int:
+        # Порядок блокировок §9.2 как у после-коммитной свёртки Completer:
+        # th_counter_delta → отрицательные слоты th_metric (оба SKIP LOCKED) →
+        # th_counter → th_metric слота sweeper.
         delta = self.tables.counter_delta
         now = await self._now(conn)
-        ids = list(
-            await conn.scalars(
-                select(delta.c.id)
-                .where(delta.c.created_at <= now - self.settings.finalize_grace)
-                .order_by(delta.c.created_at, delta.c.id)
-                .limit(self.settings.batch_size)
-                .with_for_update(skip_locked=True)
-            )
+        result = await conn.execute(
+            select(delta.c.id, delta.c.batch_id)
+            .where(delta.c.created_at <= now - self.settings.finalize_grace)
+            .order_by(delta.c.created_at, delta.c.id)
+            .limit(self.settings.batch_size)
+            .with_for_update(skip_locked=True)
         )
-        folded = await fold_delta_ids(conn, self.tables, ids)
+        rows = list(cast("Iterable[tuple[int, UUID]]", result))
+        folded = await fold_delta_ids(conn, self.tables, [delta_id for delta_id, _ in rows])
+        # Перенос метрик этих дельт после commit не состоялся (UC-08): строки
+        # их слотов переходят в слот sweeper в той же транзакции.
+        taken = await take_stale_metric_slots(
+            conn,
+            self.tables,
+            [(batch_id, user_metric_slot(delta_id)) for delta_id, batch_id in rows],
+        )
+        slot = self.settings.slot
         await upsert_slots(
             conn,
             self.tables,
-            {(batch_id, self.settings.slot): value for batch_id, value in folded.items()},
+            {(batch_id, slot): value for batch_id, value in folded.items()},
         )
-        return len(ids)
+        await upsert_metrics(
+            conn,
+            self.tables,
+            {(batch_id, name, slot): value for (batch_id, name), value in taken.items()},
+        )
+        return len(rows)
 
     async def _expire_unclaimed_in(
         self, conn: AsyncConnection
