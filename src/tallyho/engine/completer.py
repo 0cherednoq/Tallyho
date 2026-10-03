@@ -49,7 +49,7 @@ from dataclasses import dataclass, field
 from datetime import timedelta
 from enum import StrEnum
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Final, Protocol, TypeVar, final
+from typing import TYPE_CHECKING, Final, Protocol, TypeVar, cast, final
 
 from sqlalchemy import (
     BigInteger,
@@ -69,6 +69,7 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB, insert
 
 from tallyho.engine.relay import release_window
+from tallyho.engine.retry_limits import effective_max_retries
 from tallyho.model.errors import (
     ClosedError,
     CompleterError,
@@ -108,6 +109,7 @@ if TYPE_CHECKING:
     from tallyho.engine.producer import Producer, SubBatchSpec
     from tallyho.engine.spawn import SpawnRoute, TreeCache
     from tallyho.model.calls import TaskCall
+    from tallyho.protocols.broker import RetryLimits
     from tallyho.protocols.clock import Clock
     from tallyho.protocols.observer import Observer
     from tallyho.storage.counters import CounterTotals
@@ -145,6 +147,7 @@ _ABORTED = "Completer остановлен до commit операции: зак�
 _SPAWN_SERVICES = "Completer не настроен для spawn: передайте Producer в CompleterTriggers"
 _SPAWN_ROUTE = "маршрут spawn не соответствует завершаемому Item или дереву"
 _SPAWN_TARGET_CLOSED = "целевой этап spawn уже закрыт"
+_REDELIVERY_EXHAUSTED_MESSAGE = "дубль доставки закрыл джобу, попытка упала с RETRY, попыток нет"
 
 
 class ClaimOutcome(StrEnum):
@@ -292,6 +295,9 @@ class CompleterTriggers:
     producer: Producer | None = None
     tree_cache: TreeCache | None = None
     progress: ProgressTrigger | None = None
+    limits: RetryLimits | None = None
+    """Умолчания ``max_retries`` задач от адаптера: ими ``release`` ограничивает
+    возврат Item в outbox после дубля доставки (UC-04); без них — 0."""
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -910,11 +916,44 @@ class _Tx:
         # ретрая не будет. Такой Item возвращаем в outbox сами, иначе он останется
         # active без lease, outbox и джобы.
         orphaned = [item_id for item_id in active if self.leases[item_id].redelivered]
-        await self._bump_attempts(active)
+        # Новая джоба начинает ретраи брокера с нуля: круг «дубль → RETRY → outbox»
+        # обрывает только лимит попыток Item, как у sweeper (UC-04, D-012).
+        exhausted = await self._out_of_attempts(orphaned)
+        await self.finish(
+            {
+                item_id: (ItemRef(item_id, self.items[item_id].batch_id), _REDELIVERY_EXHAUSTED)
+                for item_id in exhausted
+            }
+        )
+        requeued = [item_id for item_id in orphaned if item_id not in exhausted]
+        await self._bump_attempts([item_id for item_id in active if item_id not in exhausted])
         await self._delete_leases(own)
-        self.applied.kick.update(await self._back_to_outbox(orphaned))
-        self.applied.requeued.update(orphaned)
+        self.applied.kick.update(await self._back_to_outbox(requeued))
+        self.applied.requeued.update(requeued)
         self.applied.released.update(own)
+
+    async def _out_of_attempts(self, item_ids: list[UUID]) -> set[UUID]:
+        """Items, чей возврат в outbox превысил бы эффективный лимит повторов.
+
+        Returns:
+            Items с ``attempt`` не меньше лимита.
+        """
+        if not item_ids:
+            return set()
+        item = self.tables.item
+        rows = await self.conn.execute(
+            select(item.c.id, item.c.task_name, item.c.options).where(
+                item.c.id == any_(_uuids(sorted(item_ids)))
+            )
+        )
+        exhausted: set[UUID] = set()
+        for item_id, task_name, options in rows:
+            raw = cast("dict[object, object]", options) if isinstance(options, dict) else {}
+            values = {key: value for key, value in raw.items() if isinstance(key, str)}
+            limit = effective_max_retries(values, task_name, self.c.triggers.limits)
+            if self.items[item_id].attempt >= limit:
+                exhausted.add(item_id)
+        return exhausted
 
     async def heartbeat(self, beats: dict[UUID, _Progress]) -> None:
         own = self._owned(beats)
@@ -1045,7 +1084,8 @@ class _Tx:
 
     async def expand(self, values: dict[UUID, tuple[ItemRef, FinishResult]]) -> None:
         """Записать spawn/expect только для Items, чей CAS finish был успешен."""
-        successful = set(self.applied.finished)
+        # Items, завершённые release по исчерпанным попыткам, ничего не порождают.
+        successful = set(self.applied.finished).intersection(values)
         if not successful:
             return
         spawns: list[tuple[UUID, SpawnRequest]] = []
@@ -1270,6 +1310,15 @@ class _Tx:
 
 _ACTIVE: Final = literal_column(str(int(ItemState.ACTIVE)), SmallInteger())
 _INFINITY: Final = literal_column("'infinity'::timestamptz", DateTime(timezone=True))
+_REDELIVERY_EXHAUSTED: Final = FinishResult(
+    result_class=ResultClass.ERROR,
+    label="exhausted",
+    error={
+        "type": "RedeliveryExhausted",
+        "message": _REDELIVERY_EXHAUSTED_MESSAGE,
+    },
+)
+"""Итог Item, которому ``release`` после дубля доставки не вправе вернуть попытку (UC-04)."""
 
 
 def _expansion_batches(finish_ops: Sequence[_Finish], batch_ids: list[UUID]) -> bool:

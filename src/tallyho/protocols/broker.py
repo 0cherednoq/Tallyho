@@ -194,7 +194,8 @@ class RetryLimits(Protocol):
     Опция вызова ``max_retries`` хранится в ``th_item.options``, а умолчание
     задачи (декоратор или настройка брокера) знает только адаптер. Sweeper
     спрашивает его, когда решает, вернуть ли Item с истёкшим lease в outbox
-    (ARCHITECTURE UC-15, D-012).
+    (ARCHITECTURE UC-15, D-012), а Completer — когда ``release`` возвращает в
+    outbox Item, чью джобу закрыл дубль доставки (UC-04).
     """
 
     def max_retries(self, task_name: str) -> int:
