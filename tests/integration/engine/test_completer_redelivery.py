@@ -16,6 +16,7 @@ from tests.integration.engine.completer_env import (
     SETTINGS,
     MovableClock,
     RecordingRelay,
+    TaskLimits,
     lease_row,
     open_completer,
     seed,
@@ -30,6 +31,8 @@ if TYPE_CHECKING:
 
 OTHER = replace(SETTINGS, worker_id="worker-2", slot=SETTINGS.slot + 2)
 TTL = SETTINGS.lease_ttl
+LIMITS = TaskLimits(1)
+# Одна попытка в запасе: release после дубля возвращает Item в outbox (UC-04).
 
 
 async def redelivered(env: Env, item_id: UUID) -> bool:
@@ -122,8 +125,8 @@ async def test_release_after_duplicate_returns_item_to_outbox(env: Env) -> None:
     ref, plain = seeded.refs
     relay = RecordingRelay()
     async with (
-        open_completer(env, relay=relay) as owner,
-        open_completer(env, settings=OTHER) as other,
+        open_completer(env, relay=relay, limits=LIMITS) as owner,
+        open_completer(env, settings=OTHER, limits=LIMITS) as other,
     ):
         assert (await owner.claim(ref)).run
         assert (await owner.claim(plain)).run
@@ -150,7 +153,7 @@ async def test_release_after_duplicate_parks_item_of_paused_batch(env: Env) -> N
     seeded = await seed(env, 1)
     ref = seeded.refs[0]
     relay = RecordingRelay()
-    async with open_completer(env, relay=relay) as completer:
+    async with open_completer(env, relay=relay, limits=LIMITS) as completer:
         assert (await completer.claim(ref)).run
         assert (await completer.claim(ref)).outcome is ClaimOutcome.DUPLICATE
         await set_batch(env, seeded.batch_id, paused_at=NOW)
@@ -158,6 +161,44 @@ async def test_release_after_duplicate_parks_item_of_paused_batch(env: Env) -> N
     assert await outbox_rows(env) == [(ref.id, None)]
     assert relay.calls == []
     assert (await env.counters(seeded.batch_id)).dispatched == 0
+
+
+async def test_release_after_duplicate_without_attempts_left_finishes_item(env: Env) -> None:
+    # Fix-19: у Item не осталось попыток (умолчание 0 без RetryLimits) — release после
+    # дубля не возвращает его в outbox, а завершает error("exhausted"); обычный release
+    # в той же пачке отпускает lease как раньше.
+    seeded = await seed(env, 2)
+    ref, plain = seeded.refs
+    relay = RecordingRelay()
+    async with open_completer(env, relay=relay) as completer:
+        assert (await completer.claim(ref)).run
+        assert (await completer.claim(plain)).run
+        assert (await completer.claim(ref)).outcome is ClaimOutcome.DUPLICATE
+        released, released_plain = await asyncio.gather(
+            completer.release(ref), completer.release(plain)
+        )
+        assert released
+        assert released_plain
+        assert completer.held == frozenset()
+    assert await outbox_rows(env) == []
+    assert relay.calls == []
+    assert await lease_row(env, ref.id) is None
+    assert await lease_row(env, plain.id) is None
+    item = env.tables.item
+    async with env.connection() as conn:
+        row = (
+            await conn.execute(
+                select(item.c.state, item.c.label, item.c.error, item.c.attempt).where(
+                    item.c.id == ref.id
+                )
+            )
+        ).one()
+    assert (ItemState(row.state), row.label, row.attempt) == (ItemState.ERROR, "exhausted", 0)
+    assert row.error["type"] == "RedeliveryExhausted"
+    assert await attempt_of(env, plain.id) == 1
+    assert await generation_of(env, ref.id) == 0
+    counters = await env.counters(seeded.batch_id)
+    assert (counters.error, counters.dispatched) == (1, 2)
 
 
 async def test_release_and_retry_in_one_transaction_do_not_requeue(env: Env) -> None:

@@ -27,6 +27,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 
 from tallyho.engine.operations import Operations
 from tallyho.engine.relay import release_window
+from tallyho.engine.retry_limits import effective_max_retries
 from tallyho.model.errors import ConfigurationError, InvalidStateError
 from tallyho.model.states import (
     TERMINAL_THRESHOLD,
@@ -863,11 +864,7 @@ class Sweeper:
     def _max_retries(self, row: _LeaseRow) -> int:
         # Тот же лимит, с которым relay ставит задачу в брокер (D-012): опция
         # вызова, иначе умолчание задачи, известное только адаптеру.
-        if "max_retries" in row.options or self.limits is None:
-            value = row.options.get("max_retries", 0)
-        else:
-            value = self.limits.max_retries(row.task_name)
-        return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else 0
+        return effective_max_retries(row.options, row.task_name, self.limits)
 
     @staticmethod
     def _lease_row(row: object) -> _LeaseRow:

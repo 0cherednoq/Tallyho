@@ -257,6 +257,7 @@ class _Facade:
                 producer=producer,
                 tree_cache=tree_cache,
                 progress=notifier,
+                limits=self._retry_limits(adapter),
             ),
         )
         self._completer = completer
@@ -331,7 +332,8 @@ class _Facade:
 
     @staticmethod
     def _retry_limits(adapter: object) -> RetryLimits | None:
-        # Протокол необязателен: без него sweeper считает умолчание задачи равным 0 (UC-15).
+        # Протокол необязателен: без него sweeper и release после дубля доставки
+        # считают умолчание задачи равным 0 (UC-15, UC-04).
         return adapter if isinstance(adapter, RetryLimits) else None
 
     def _build_producer(self, adapter: object, *, slot: int) -> Producer:

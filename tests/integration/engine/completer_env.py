@@ -13,6 +13,7 @@ from typing_extensions import override
 from tallyho.engine.completer import Completer, CompleterSettings, CompleterTriggers, ItemRef
 from tallyho.engine.producer import RootSpec
 from tallyho.model.calls import TaskCall
+from tallyho.protocols.broker import RetryLimits
 from tallyho.protocols.clock import SystemClock
 from tallyho.storage.counters import CounterDelta, upsert_slots
 
@@ -40,6 +41,7 @@ __all__ = [
     "RecordingProgress",
     "RecordingRelay",
     "Seeded",
+    "TaskLimits",
     "lease_row",
     "open_completer",
     "schema_engine",
@@ -74,6 +76,17 @@ class Finalized:
     async def try_finalize(self, batch_id: UUID) -> bool:
         self.calls.append(batch_id)
         return False
+
+
+@dataclass(frozen=True)
+class TaskLimits(RetryLimits):
+    """Умолчание ``max_retries`` задачи ``send`` из :func:`seed`, как у адаптера."""
+
+    value: int
+
+    @override
+    def max_retries(self, task_name: str) -> int:
+        return self.value if task_name == "send" else 0
 
 
 @dataclass
@@ -165,6 +178,7 @@ async def open_completer(  # ruff: ignore[too-many-arguments]  # integration hel
     observer: Observer | None = None,
     counter: CommitCounter | None = None,
     settings: CompleterSettings = SETTINGS,
+    limits: RetryLimits | None = None,
 ) -> AsyncGenerator[Completer]:
     """Completer над схемой теста; закрывается на выходе."""
     engine = schema_engine(env)
@@ -181,6 +195,7 @@ async def open_completer(  # ruff: ignore[too-many-arguments]  # integration hel
             relay=relay,
             producer=env.producer,
             progress=progress,
+            limits=limits,
         ),
     )
     try:
