@@ -471,3 +471,5 @@ timeout_constant = 5.0
 [tool.codespell]
 skip = "*.lock,docs/*,.git,*.svg"
 check-filenames = true
+# «checkin» — имя события пула SQLAlchemy, не опечатка.
+ignore-words-list = "checkin"

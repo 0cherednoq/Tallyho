@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Protocol, cast
 from tallyho.model.states import OnFeederFailed
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Collection, Mapping, Sequence
+    from collections.abc import AsyncGenerator, AsyncIterator, Collection, Mapping, Sequence
     from contextlib import AbstractAsyncContextManager
     from datetime import datetime, timedelta
     from uuid import UUID
@@ -210,8 +210,8 @@ class EngineFacade(Protocol):
         """Найти прямого потомка."""
         ...
 
-    def watch(self, batch_id: UUID) -> AsyncIterator[BatchView]:
-        """Следить за снимками батча."""
+    def watch(self, batch_id: UUID) -> AsyncGenerator[BatchView]:
+        """Следить за снимками батча; ``aclose`` дожидается снятия подписки."""
         ...
 
     async def pause(self, target: AsyncSession | AsyncConnection | None, batch_id: UUID) -> None:

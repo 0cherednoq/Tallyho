@@ -21,7 +21,14 @@ from tallyho.model.views import BatchPage
 from tallyho.protocols.broker import Dispatcher
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Callable, Collection, Mapping, Sequence
+    from collections.abc import (
+        AsyncGenerator,
+        AsyncIterator,
+        Callable,
+        Collection,
+        Mapping,
+        Sequence,
+    )
     from types import TracebackType
 
     from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession
@@ -128,7 +135,7 @@ class View:
     state: BatchState
 
 
-async def views(values: Sequence[View]) -> AsyncIterator[BatchView]:
+async def views(values: Sequence[View]) -> AsyncGenerator[BatchView]:
     """Преобразовать минимальные view в тестовый поток."""
     await asyncio.sleep(0)
     for value in values:
@@ -234,7 +241,7 @@ class Facade(EngineFacade):
         return CHILD_ID
 
     @override
-    def watch(self, batch_id: UUID) -> AsyncIterator[BatchView]:
+    def watch(self, batch_id: UUID) -> AsyncGenerator[BatchView]:
         self.calls.append(("watch", batch_id))
         return views(self.views)
 

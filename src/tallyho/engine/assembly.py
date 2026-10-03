@@ -559,7 +559,7 @@ class _Facade:
     async def child(self, batch_id: UUID, key: str) -> UUID:
         return await self._require(self._reads).child(batch_id, key)
 
-    def watch(self, batch_id: UUID) -> AsyncIterator[BatchView]:
+    def watch(self, batch_id: UUID) -> AsyncGenerator[BatchView]:
         return self._require(self._watcher).watch(batch_id)
 
     async def pause(self, target: AsyncSession | AsyncConnection | None, batch_id: UUID) -> None:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import aclosing
 from dataclasses import dataclass, field, replace
 from datetime import timedelta
 from typing import TYPE_CHECKING, ParamSpec, Self, TypeVar, cast
@@ -355,8 +356,10 @@ class BatchHandle:
             Терминальный снимок.
         """
         seconds = timeout.total_seconds() if isinstance(timeout, timedelta) else timeout
-        async with asyncio.timeout(seconds):
-            async for value in self.watch():
+        # Поток закрывается здесь, а не сборщиком мусора: к возврату из ``wait``
+        # соединение подписки уже в пуле и без LISTEN (Fix-17).
+        async with asyncio.timeout(seconds), aclosing(self._engine.watch(self.id)) as stream:
+            async for value in stream:
                 if value.state.is_terminal:
                     return value
         return await self.view()

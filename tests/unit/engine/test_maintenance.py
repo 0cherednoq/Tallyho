@@ -6,7 +6,7 @@ import asyncio
 import contextlib
 from dataclasses import dataclass
 from datetime import timedelta
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Final, cast
 from uuid import uuid4
 
 import pytest
@@ -19,7 +19,7 @@ from tallyho.model.views import BatchView, Progress
 from tallyho.protocols.clock import SystemClock
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator, AsyncIterator
+    from collections.abc import AsyncGenerator, AsyncIterator, Callable
     from uuid import UUID
 
     from sqlalchemy.ext.asyncio import AsyncEngine
@@ -56,11 +56,17 @@ class Notification:
     payload: str
 
 
+class ListenerError(Exception):
+    """Сбой LISTEN/UNLISTEN или чтения уведомлений в фейковом драйвере."""
+
+
 class PsycopgDriver:
     payloads: list[str]
+    broken: bool
 
-    def __init__(self, payloads: list[str]) -> None:
+    def __init__(self, payloads: list[str], *, broken: bool = False) -> None:
         self.payloads = payloads
+        self.broken = broken
 
     async def notifies(
         self,
@@ -71,7 +77,49 @@ class PsycopgDriver:
         del timeout, stop_after
         for payload in self.payloads:
             yield Notification(payload)
+        if self.broken:
+            raise ListenerError
         await asyncio.Event().wait()
+
+
+class AsyncpgDriver:
+    """asyncpg: LISTEN и UNLISTEN идут по сети, их можно прервать посреди запроса."""
+
+    events: list[str]
+    delay: float
+    fail: str | None
+    sent: dict[str, asyncio.Event]
+
+    def __init__(self, *, delay: float = 0.0, fail: str | None = None) -> None:
+        self.events = []
+        self.delay = delay
+        self.fail = fail
+        self.sent = {"LISTEN": asyncio.Event(), "UNLISTEN": asyncio.Event()}
+
+    async def add_listener(
+        self,
+        channel: str,
+        callback: Callable[[object, int, str, str], None],
+    ) -> None:
+        del callback
+        await self._roundtrip("LISTEN", channel)
+
+    async def remove_listener(
+        self,
+        channel: str,
+        callback: Callable[[object, int, str, str], None],
+    ) -> None:
+        del callback
+        await self._roundtrip("UNLISTEN", channel)
+
+    async def _roundtrip(self, command: str, channel: str) -> None:
+        statement = f"{command} {channel}"
+        self.events.append(f"sent {statement}")
+        self.sent[command].set()
+        await asyncio.sleep(self.delay)
+        if command == self.fail:
+            raise ListenerError
+        self.events.append(statement)
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,11 +133,17 @@ class Connection:
     commits: int
     notifications: list[str]
 
+    invalidated: bool
+
     def __init__(self, driver: object) -> None:
         self.driver = driver
         self.commands = []
         self.commits = 0
         self.notifications = []
+        self.invalidated = False
+
+    async def invalidate(self) -> None:
+        self.invalidated = True
 
     async def get_raw_connection(self) -> Raw:
         return Raw(self.driver)
@@ -156,8 +210,10 @@ async def test_psycopg_notifications_drive_watch_and_cleanup_pump() -> None:
         BatchState.OPEN,
         BatchState.SUCCEEDED,
     ]
-    assert engine.connection.commands == ["LISTEN th_progress"]
-    assert engine.connection.commits == 1
+    # psycopg и пул SQLAlchemy подписку не снимают: UNLISTEN — забота watch (Fix-17).
+    assert engine.connection.commands == ["LISTEN th_progress", "UNLISTEN th_progress"]
+    assert engine.connection.commits == 2
+    assert not engine.connection.invalidated
 
 
 async def test_unsupported_listener_is_explicit_error() -> None:
@@ -175,7 +231,7 @@ async def test_closing_watch_cancels_and_awaits_listener_task() -> None:
         SequenceReads([view(batch_id, BatchState.OPEN)]),
         throttle=60,
     )
-    stream = cast("AsyncGenerator[BatchView, None]", subject.watch(batch_id))
+    stream = subject.watch(batch_id)
 
     assert (await anext(stream)).state is BatchState.OPEN
     await stream.aclose()
@@ -236,3 +292,89 @@ def invalid_service(kind: str, engine: AsyncEngine) -> object:
         return ProgressNotifier(engine=engine, throttle=timedelta(0))
     reads = cast("Reads", cast("object", SequenceReads([])))
     return ProgressWatcher(engine=engine, reads=reads, throttle=timedelta(0))
+
+
+LISTENED: Final = ["sent LISTEN th_progress", "LISTEN th_progress"]
+UNLISTENED: Final = ["sent UNLISTEN th_progress", "UNLISTEN th_progress"]
+
+
+async def test_asyncpg_listener_is_removed_after_terminal_view() -> None:
+    batch_id = uuid4()
+    driver = AsyncpgDriver()
+    engine = Engine(driver)
+    subject = watcher(engine, SequenceReads([view(batch_id, BatchState.SUCCEEDED)]))
+
+    assert [item.state async for item in subject.watch(batch_id)] == [BatchState.SUCCEEDED]
+    assert driver.events == LISTENED + UNLISTENED
+    assert not engine.connection.invalidated
+
+
+async def test_closing_watch_during_unlisten_waits_for_it() -> None:
+    """Fix-17: ``wait()`` выходит из цикла сразу, поток закрывают, пока идёт UNLISTEN."""
+    batch_id = uuid4()
+    driver = AsyncpgDriver(delay=0.02)
+    engine = Engine(driver)
+    subject = watcher(engine, SequenceReads([view(batch_id, BatchState.SUCCEEDED)]))
+    stream = subject.watch(batch_id)
+
+    assert (await anext(stream)).state is BatchState.SUCCEEDED
+    _ = await driver.sent["UNLISTEN"].wait()
+    await stream.aclose()
+
+    assert driver.events == LISTENED + UNLISTENED
+    assert not engine.connection.invalidated
+
+
+@pytest.mark.parametrize("cancels", [1, 2])
+async def test_cancelled_consumer_finishes_listen_and_unlisten(cancels: int) -> None:
+    """Отмена посреди LISTEN (в том числе повторная) не оставляет подписку на соединении."""
+    batch_id = uuid4()
+    driver = AsyncpgDriver(delay=0.02)
+    engine = Engine(driver)
+    subject = watcher(engine, SequenceReads([view(batch_id, BatchState.OPEN)]), throttle=60)
+
+    consumer = asyncio.create_task(anext(subject.watch(batch_id)))
+    _ = await driver.sent["LISTEN"].wait()
+    for _ in range(cancels):
+        _ = consumer.cancel()
+        await asyncio.sleep(0.005)
+    with pytest.raises(asyncio.CancelledError):
+        _ = await consumer
+
+    assert driver.events == LISTENED + UNLISTENED
+    assert not engine.connection.invalidated
+
+
+@pytest.mark.parametrize(
+    ("fail", "expected"),
+    [
+        ("LISTEN", ["sent LISTEN th_progress"]),
+        ("UNLISTEN", [*LISTENED, "sent UNLISTEN th_progress"]),
+    ],
+)
+async def test_failed_listener_step_invalidates_connection(fail: str, expected: list[str]) -> None:
+    batch_id = uuid4()
+    driver = AsyncpgDriver(fail=fail)
+    engine = Engine(driver)
+    subject = watcher(engine, SequenceReads([view(batch_id, BatchState.SUCCEEDED)]))
+
+    with pytest.raises(ListenerError):
+        _ = [item async for item in subject.watch(batch_id)]
+
+    assert driver.events == expected
+    assert engine.connection.invalidated
+
+
+async def test_psycopg_pump_failure_invalidates_connection() -> None:
+    batch_id = uuid4()
+    engine = Engine(PsycopgDriver([], broken=True))
+    subject = watcher(engine, SequenceReads([view(batch_id, BatchState.OPEN)]), throttle=60)
+    stream = subject.watch(batch_id)
+
+    assert (await anext(stream)).state is BatchState.OPEN
+    await asyncio.sleep(0.01)
+    with pytest.raises(ListenerError):
+        await stream.aclose()
+
+    assert engine.connection.commands == ["LISTEN th_progress"]
+    assert engine.connection.invalidated
