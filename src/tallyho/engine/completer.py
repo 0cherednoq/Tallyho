@@ -85,6 +85,7 @@ from tallyho.storage.counters import (
     fold_deltas,
     insert_delta,
     read_counters,
+    take_metric_slot,
     upsert_metrics,
     upsert_slots,
 )
@@ -396,6 +397,8 @@ class _Heartbeat:
     item: ItemRef
     progress: _Progress
     future: asyncio.Future[bool]
+    attempt: int | None = None
+    """Попытка-владелец lease (UC-03); ``None`` — проверка только по ``worker_id``."""
 
 
 @dataclass(eq=False, slots=True)
@@ -462,8 +465,8 @@ class _Applied:
     claims: dict[UUID, ClaimResult] = field(default_factory=dict["UUID", ClaimResult])
     claimed: list[tuple[UUID, UUID, int]] = field(default_factory=list[tuple["UUID", "UUID", int]])
     created: list[tuple[UUID, str]] = field(default_factory=list[tuple["UUID", str]])
-    beating: set[UUID] = field(default_factory=set["UUID"])
-    """Items, чей lease продлён heartbeat'ом: lease всё ещё у этого процесса."""
+    heartbeats: set[_Heartbeat] = field(default_factory=set[_Heartbeat])
+    """Операции heartbeat, продлившие lease: он всё ещё у этого процесса и попытки."""
     released: set[UUID] = field(default_factory=set["UUID"])
     releasers: dict[UUID, _Release] = field(default_factory=dict["UUID", _Release])
     """Операция release, применённая к Item: другие release того же Item в пачке — ``False``."""
@@ -492,9 +495,13 @@ class _Tx:
     побочных эффектов вне БД не имеет.
     """
 
-    def __init__(self, completer: Completer, conn: AsyncConnection) -> None:
+    def __init__(
+        self, completer: Completer, conn: AsyncConnection, *, user_tx: bool = False
+    ) -> None:
         self.c = completer
         self.conn = conn
+        self.user_tx = user_tx
+        """Транзакция пользователя (путь B): строку ``th_lease`` не меняем (UC-08)."""
         self.tables = completer.tables
         self.now = sql_now(completer.clock)
         self.batches: dict[UUID, _BatchFlags] = {}
@@ -573,12 +580,18 @@ class _Tx:
                 weight=weight,
             )
 
-    async def lock_leases(self, item_ids: Iterable[UUID]) -> None:
+    async def lock_leases(self, item_ids: Iterable[UUID], *, lock: bool = True) -> None:
+        """Прочитать строки ``th_lease``; с ``lock`` — под ``FOR UPDATE`` по порядку.
+
+        Без блокировки читает путь B (UC-08): владельца lease меняют только
+        операции, которые раньше блокируют строку ``th_item``, а её путь B уже
+        держит. Так транзакция пользователя не ждёт heartbeat и не мешает ему.
+        """
         ids = sorted(set(item_ids))
         if not ids:
             return
         lease = self.tables.lease
-        result = await self.conn.execute(
+        statement = (
             select(
                 lease.c.item_id,
                 lease.c.worker_id,
@@ -588,8 +601,10 @@ class _Tx:
             )
             .where(lease.c.item_id == any_(_uuids(ids)))
             .order_by(lease.c.item_id)
-            .with_for_update()
         )
+        if lock:
+            statement = statement.with_for_update()
+        result = await self.conn.execute(statement)
         for item_id, worker_id, live, attempt, redelivered in result:
             self.leases[item_id] = _LeaseRow(
                 worker_id=worker_id, live=live, attempt=attempt, redelivered=redelivered
@@ -699,7 +714,9 @@ class _Tx:
             self._result(item_id, ClaimOutcome.CANCELLED)
 
     async def _delete_leases(self, item_ids: list[UUID]) -> None:
-        if not item_ids:
+        if not item_ids or self.user_tx:
+            # Путь B lease не удаляет: это сделает Completer после commit (UC-08),
+            # иначе heartbeat ждал бы транзакцию пользователя, а та ловила 40001.
             return
         lease = self.tables.lease
         _ = await self.conn.execute(
@@ -955,8 +972,32 @@ class _Tx:
                 exhausted.add(item_id)
         return exhausted
 
-    async def heartbeat(self, beats: dict[UUID, _Progress]) -> None:
-        own = self._owned(beats)
+    def _beats(self, op: _Heartbeat) -> bool:
+        # Без attempt — прежняя проверка только по worker_id.
+        if op.attempt is not None:
+            return self.owns(op.item.id, op.attempt)
+        lease = self.leases.get(op.item.id)
+        return lease is not None and lease.worker_id == self.c.settings.worker_id
+
+    async def heartbeat(self, ops: Sequence[_Heartbeat]) -> None:
+        """Продлить lease, которые принадлежат попыткам операций (UC-03).
+
+        Операция с ``attempt`` продлевает lease, только если он взят этим
+        процессом для этой попытки: устаревшая попытка того же процесса lease
+        новой не продлевает. Прогресс нескольких операций Item сливается.
+        """
+        beats: dict[UUID, _Progress] = {}
+        for op in ops:
+            if not self._beats(op):
+                continue
+            self.applied.heartbeats.add(op)
+            old_done, old_total = beats.get(op.item.id, (None, None))
+            new_done, new_total = op.progress
+            beats[op.item.id] = (
+                old_done if new_done is None else new_done,
+                old_total if new_total is None else new_total,
+            )
+        own = sorted(beats)
         if not own:
             return
         lease = self.tables.lease
@@ -980,7 +1021,6 @@ class _Tx:
                 progress_total=func.coalesce(total, lease.c.progress_total),
             )
         )
-        self.applied.beating.update(own)
 
     # --- finish -------------------------------------------------------------------
 
@@ -1365,6 +1405,35 @@ def _owners(tx: _Tx, ops: Sequence[_Owned]) -> dict[UUID, _Owned]:
     return chosen
 
 
+_USER_SLOTS: Final = 32_767
+"""Сколько отрицательных слотов ``th_metric`` у транзакций пути B."""
+
+
+def _user_slot(delta_ids: Iterable[int]) -> int:
+    """Слот ``th_metric`` транзакции пути B.
+
+    Id дельт уникальны и растут, поэтому одновременные транзакции получают
+    разные слоты и не блокируют строки друг друга и групповой транзакции
+    Completer (слоты процессов неотрицательны).
+
+    Returns:
+        ``-1 - min(id дельт) mod 32767``: от ``-32767`` до ``-1``.
+    """
+    return -1 - min(delta_ids) % _USER_SLOTS
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class _UserCommit:
+    """Что сделать после commit транзакции пользователя с ``complete_in``."""
+
+    item_id: UUID
+    attempt: int | None
+    delta_ids: frozenset[int]
+    metric_slot: int
+    """Слот транзакции в ``th_metric``."""
+    metric_batches: tuple[UUID, ...]
+
+
 def _small(value: int) -> ColumnElement[int]:
     # Коды состояний — литералами, а не bind-параметрами (D-020).
     return literal_column(str(int(value)), SmallInteger())
@@ -1426,7 +1495,8 @@ class Completer:
         self._full = asyncio.Event()
         self._capacity = asyncio.Semaphore(settings.backpressure)
         self._closing = False
-        self._held: dict[UUID, ItemRef] = {}
+        self._held: dict[UUID, tuple[ItemRef, int]] = {}
+        """Items с lease этого процесса → попытка, для которой lease взят."""
         self._background: set[asyncio.Task[None]] = set()
         self._attached: set[asyncio.Task[None]] = set()
         self._flushing = False
@@ -1489,6 +1559,7 @@ class Completer:
         self,
         item: ItemRef,
         *,
+        attempt: int | None = None,
         progress_done: int | None = None,
         progress_total: int | None = None,
     ) -> bool:
@@ -1500,16 +1571,19 @@ class Completer:
 
         Args:
             item: Item, захваченный этим процессом.
+            attempt: Номер попытки из claim. С ним lease продлевается, только
+                если взят этим процессом для этой попытки (UC-03): попытка, чей
+                lease перехвачен, даже этим же процессом, его не продлевает.
+                ``None`` — проверка только по ``worker_id``.
             progress_done: Сколько сделано внутри задачи.
             progress_total: Сколько всего внутри задачи.
 
         Returns:
-            ``False``, если lease уже не у этого процесса (истёк и перехвачен,
-            отпущен или удалён sweeper'ом): результат задачи всё равно
-            запишет finish, CAS сделает его идемпотентным.
+            ``False``, если lease уже не у этого процесса или этой попытки
+            (истёк и перехвачен, отпущен или удалён sweeper'ом).
         """
         future = self._new_future(bool)
-        op = _Heartbeat(item, (progress_done, progress_total), future)
+        op = _Heartbeat(item, (progress_done, progress_total), future, attempt)
         return await self._submit(op, future)
 
     async def release(self, item: ItemRef, *, attempt: int | None = None) -> bool:
@@ -1608,7 +1682,7 @@ class Completer:
         if (value.spawns or value.sub_batches) and self.triggers.producer is None:
             raise ConfigurationError(_SPAWN_SERVICES)
         conn = await resolve_connection(target)
-        tx = _Tx(self, conn)
+        tx = _Tx(self, conn, user_tx=True)
         batch_ids: list[UUID] = []
         writes_structure = bool(value.sub_batches)
         for spawn_request in value.spawns:
@@ -1633,23 +1707,40 @@ class Completer:
             await tx.lock_batches(batch_ids, write=writes_structure)
         if attempt is not None:
             await tx.lock_items([item.id])
-            await tx.lock_leases([item.id])
+            # th_lease — без блокировки и без записи (UC-08): heartbeat этой же
+            # попытки не ждёт транзакцию пользователя и не даёт ей 40001.
+            await tx.lock_leases([item.id], lock=False)
             if not tx.holds(item, attempt):
+                self._forget(item.id, attempt)
                 return False
         values = {item.id: (item, value)}
         await tx.finish(values, scalar=True)
         await tx.expand(values)
+        if item.id not in tx.applied.finished:
+            # CAS не прошёл: Item уже терминальный, ни дельт, ни метрик нет.
+            self._forget(item.id, attempt)
+            return False
         inserted = await insert_delta(conn, self.tables, tx.deltas, created_at=tx.now)
-        await upsert_metrics(conn, self.tables, tx.metrics)
+        delta_ids = frozenset(delta_id for ids in inserted.values() for delta_id in ids)
+        # Метрики — в собственный слот транзакции, а не в слот процесса, который
+        # в это же время обновляет групповая транзакция Completer (UC-08).
+        # Дельта завершённого Item ненулевая, поэтому delta_ids не пуст.
+        slot = _user_slot(delta_ids)
+        await upsert_metrics(
+            conn,
+            self.tables,
+            {(batch_id, name, slot): n for (batch_id, name, _), n in tx.metrics.items()},
+        )
         tx.applied.progress.update(tx.deltas)
-        changed = item.id in tx.applied.finished
-        if changed:
-            delta_ids = {delta_id for ids in inserted.values() for delta_id in ids}
-            await after_commit(
-                target,
-                lambda: self._schedule_external(tx.applied, delta_ids),
-            )
-        return changed
+        done = _UserCommit(
+            item_id=item.id,
+            attempt=attempt,
+            delta_ids=delta_ids,
+            metric_slot=slot,
+            metric_batches=tuple(sorted({key[0] for key in tx.metrics})),
+        )
+        await after_commit(target, lambda: self._schedule_external(tx.applied, done))
+        return True
 
     async def fold(self, batch_id: UUID) -> bool:
         """Свернуть закоммиченные дельты батча и проверить финализацию.
@@ -1699,7 +1790,7 @@ class Completer:
         await self._stop(self._background, cancel=False)
         if not (requeue_held and self._held):
             return
-        refs = list(self._held.values())
+        refs = [ref for ref, _ in self._held.values()]
         self._held.clear()
         try:
             _ = await run_transaction(
@@ -1765,14 +1856,25 @@ class Completer:
         )
         return folded
 
-    def _schedule_external(self, applied: _Applied, delta_ids: set[int]) -> None:
+    def _forget(self, item_id: UUID, attempt: int | None) -> None:
+        """Убрать Item из удерживаемых, если его держит попытка ``attempt``.
+
+        ``None`` — без проверки попытки. Запись более новой попытки того же
+        Item (lease перехвачен этим же процессом) остаётся.
+        """
+        held = self._held.get(item_id)
+        if held is not None and (attempt is None or held[1] == attempt):
+            del self._held[item_id]
+
+    def _schedule_external(self, applied: _Applied, done: _UserCommit) -> None:
         if self._closing:
             # Completer закрыли, пока транзакция пользователя шла к commit: дельты
-            # свернёт и финализацию проверит sweeper.
+            # свернёт и финализацию проверит sweeper. Item остаётся удержанным,
+            # чтобы close(requeue_held=True) удалил его lease.
             return
         loop = self._bind()
         task = loop.create_task(
-            self._after_external_commit(applied, delta_ids),
+            self._after_external_commit(applied, done),
             name="tallyho-complete-in",
         )
         self._background.add(task)
@@ -1787,29 +1889,52 @@ class Completer:
         if not self._buffer and not self._flushing and not self._background:
             self._idle.set()
 
-    async def _after_external_commit(self, applied: _Applied, delta_ids: set[int]) -> None:
+    async def _after_external_commit(self, applied: _Applied, done: _UserCommit) -> None:
         try:
-            _ = await run_transaction(
+            await run_transaction(
                 self.engine,
-                lambda conn: self._fold_ids_in(conn, delta_ids),
+                lambda conn: self._settle_external(conn, done),
                 settings=self.settings.tx,
                 policy=self.settings.retry,
             )
             self._notify(len(applied.finished), 0.0, applied)
             await self._after_commit(applied)
-        except Exception:  # ruff: ignore[blind-except]  # commit уже состоялся; sweeper повторит fold/finalize
+        except Exception:  # ruff: ignore[blind-except]  # commit уже состоялся; sweeper повторит fold/finalize и удалит lease
             _log.exception("обработка complete_in после commit упала")
+        finally:
+            self._forget(done.item_id, done.attempt)
 
-    async def _fold_ids_in(
-        self, conn: AsyncConnection, delta_ids: Iterable[int]
-    ) -> dict[UUID, CounterDelta]:
-        folded = await fold_delta_ids(conn, self.tables, delta_ids)
+    async def _settle_external(self, conn: AsyncConnection, done: _UserCommit) -> None:
+        """Транзакция после commit пути B: lease, дельты, метрики (UC-08).
+
+        Порядок блокировок §9.2: ``th_item`` → ``th_lease`` → ``th_counter``
+        → ``th_metric``. Строки слота транзакции в ``th_metric`` другие
+        транзакции не трогают, поэтому они забираются до горячих строк: те
+        держатся до commit как можно меньше.
+        """
+        item = self.tables.item
+        lease = self.tables.lease
+        # Строка Item — под блокировкой; Item, переоткрытый retry_failed после
+        # commit, не терминальный, и его новый lease остаётся.
+        finished = (
+            select(item.c.id)
+            .where(item.c.id == done.item_id, item.c.state != _ACTIVE)
+            .with_for_update()
+            .scalar_subquery()
+        )
+        _ = await conn.execute(delete(lease).where(lease.c.item_id == finished))
+        folded = await fold_delta_ids(conn, self.tables, done.delta_ids)
+        taken = await take_metric_slot(
+            conn, self.tables, done.metric_batches, slot=done.metric_slot
+        )
+        slot = self.settings.slot
+        metrics = {(batch_id, name, slot): n for (batch_id, name), n in taken.items()}
         await upsert_slots(
             conn,
             self.tables,
             {(batch_id, self.settings.slot): delta for batch_id, delta in folded.items()},
         )
-        return folded
+        await upsert_metrics(conn, self.tables, metrics)
 
     # --- буфер -------------------------------------------------------------------------
 
@@ -1892,7 +2017,7 @@ class Completer:
         tx = _Tx(self, conn)
         claims: dict[UUID, ItemRef] = {}
         repeated: set[UUID] = set()
-        beats: dict[UUID, _Progress] = {}
+        beats: list[_Heartbeat] = []
         release_ops: list[_Release] = []
         finish_ops: list[_Finish] = []
         for op in ops:
@@ -1901,12 +2026,7 @@ class Completer:
                     repeated.add(op.item.id)
                 _ = claims.setdefault(op.item.id, op.item)
             elif isinstance(op, _Heartbeat):
-                done, total = beats.get(op.item.id, (None, None))
-                new_done, new_total = op.progress
-                beats[op.item.id] = (
-                    done if new_done is None else new_done,
-                    total if new_total is None else new_total,
-                )
+                beats.append(op)
             elif isinstance(op, _Release):
                 release_ops.append(op)
             else:
@@ -1920,12 +2040,14 @@ class Completer:
         touched = [op.item.id for op in release_ops]
         touched.extend(op.item.id for op in finish_ops)
         await tx.lock_items([*touched, *claims])
-        await tx.lock_leases([*touched, *claims, *beats])
+        await tx.lock_leases([*touched, *claims, *(op.item.id for op in beats)])
         # release раньше claim: ретрай брокера мог прийти в ту же пачку.
         tx.applied.releasers = _owners(tx, release_ops)
         await tx.release(tx.applied.releasers)
         await tx.claim(claims)
         await tx.mark_redelivered(repeated)
+        # Heartbeat — после claim: перехват lease этим же процессом в той же пачке
+        # отнимает lease у устаревшей попытки (UC-03).
         await tx.heartbeat(beats)
         # Владение — после claim: перехват lease в этой же пачке отнимает Item у
         # устаревшей попытки (UC-03).
@@ -1945,19 +2067,25 @@ class Completer:
                 seen.add(op.item.id)
                 continue
             if isinstance(op, _Heartbeat):
-                value = op.item.id in applied.beating
-                drop = not value
-            # Повторный release или finish того же Item в пачке уже ничего не
-            # меняет. Отброшенная операция попытки, потерявшей lease, не
-            # трогает _held: Item, возможно, снова у этого процесса.
-            elif isinstance(op, _Release):
-                drop = applied.releasers.get(op.item.id) is op
-                value = drop and op.item.id in applied.released
+                value = op in applied.heartbeats
+                if not value:
+                    # Lease не у этой попытки: она Item больше не держит.
+                    self._forget(op.item.id, op.attempt)
             else:
-                drop = applied.finishers.get(op.item.id) is op
-                value = drop and op.item.id in applied.finished
-            if drop:
-                _ = self._held.pop(op.item.id, None)
+                chosen = (
+                    applied.releasers.get(op.item.id)
+                    if isinstance(op, _Release)
+                    else applied.finishers.get(op.item.id)
+                )
+                done = applied.released if isinstance(op, _Release) else applied.finished
+                value = chosen is op and op.item.id in done
+                if chosen is op:
+                    _ = self._held.pop(op.item.id, None)
+                elif op.attempt is not None:
+                    # Попытка, потерявшая lease, забывает только свою запись: Item,
+                    # возможно, снова у этого процесса, но уже с другой попыткой.
+                    # Повторная операция того же Item в пачке ничего не меняет.
+                    self._forget(op.item.id, op.attempt)
             if not op.future.done():
                 op.future.set_result(value)
 
@@ -1968,7 +2096,7 @@ class Completer:
                 outcome=ClaimOutcome.DUPLICATE, attempt=result.attempt, depth=result.depth
             )
         elif result.run:
-            self._held[op.item.id] = op.item
+            self._held[op.item.id] = (op.item, result.attempt)
         if not op.future.done():
             op.future.set_result(result)
 

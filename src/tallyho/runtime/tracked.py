@@ -266,6 +266,7 @@ class TaskRuntime:
             await asyncio.sleep(self.heartbeat_every.total_seconds())
             alive = await self.completer.heartbeat(
                 context.ref,
+                attempt=context.attempt,
                 progress_done=context.progress_done,
                 progress_total=context.progress_total,
             )

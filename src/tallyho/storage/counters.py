@@ -62,6 +62,7 @@ __all__ = [
     "insert_delta",
     "read_counters",
     "reconcile",
+    "take_metric_slot",
     "upsert_metrics",
     "upsert_slots",
 ]
@@ -414,6 +415,42 @@ async def upsert_metrics(
             set_={"value": metric.c.value + stmt.excluded.value},
         )
         _ = await conn.execute(stmt)
+
+
+async def take_metric_slot(
+    conn: AsyncConnection,
+    tables: Tables,
+    batch_ids: Iterable[UUID],
+    *,
+    slot: int,
+) -> dict[tuple[UUID, str], int]:
+    """Удалить строки ``th_metric`` слота ``slot`` и вернуть их значения.
+
+    Путь B пишет метрики в собственный слот транзакции пользователя, чтобы не
+    ждать строку слота процесса (ARCHITECTURE UC-08); после commit Completer
+    забирает их и в той же транзакции прибавляет к своему слоту
+    (:func:`upsert_metrics`), поэтому сумма по слотам не меняется.
+
+    Args:
+        conn: Соединение в открытой транзакции.
+        tables: Таблицы установки.
+        batch_ids: Батчи, у которых есть строки слота.
+        slot: Слот транзакции пути B.
+
+    Returns:
+        Значения по ``(batch_id, name)``.
+    """
+    ids = sorted(set(batch_ids))
+    metric = tables.metric
+    taken = await conn.execute(
+        delete(metric)
+        .where(metric.c.batch_id == any_(literal(ids, ARRAY(Uuid()))), metric.c.slot == slot)
+        .returning(metric.c.batch_id, metric.c.name, metric.c.value)
+    )
+    values: defaultdict[tuple[UUID, str], int] = defaultdict(int)
+    for batch_id, name, value in taken:
+        values[batch_id, name] += value
+    return dict(values)
 
 
 async def fold_deltas(
