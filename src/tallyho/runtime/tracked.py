@@ -16,7 +16,13 @@ from sqlalchemy import select
 
 from tallyho.engine.completer import FinishResult, ItemRef
 from tallyho.model.calls import TaskCall
-from tallyho.model.errors import ClosedError, ConfigurationError, LeaseLostError
+from tallyho.model.errors import (
+    ClosedError,
+    CompleterError,
+    ConfigurationError,
+    LeaseLostError,
+    TallyhoError,
+)
 from tallyho.model.states import ResultClass
 from tallyho.protocols.broker import CancellationClassifier, Verdict
 from tallyho.runtime.context import (
@@ -31,7 +37,7 @@ if TYPE_CHECKING:
     from datetime import timedelta
 
     from tallyho.engine.completer import Completer
-    from tallyho.engine.spawn import TreeCache
+    from tallyho.engine.spawn import TreeCache, TreeSnapshot
     from tallyho.protocols.broker import Dispatcher, Runtime
 
 P = ParamSpec("P")
@@ -45,6 +51,7 @@ _runtime: ContextVar[TaskRuntime | None] = ContextVar("tallyho_runtime", default
 _installed: list[TaskRuntime] = []
 _NOT_INSTALLED = "tallyho runtime не установлен"
 _BAD_MARKER = "служебный аргумент _th имеет неверный формат"
+_TREE_FAILED = "не удалось прочитать дерево батча после claim"
 
 
 class _AsyncTask(Protocol):
@@ -147,8 +154,7 @@ class TaskRuntime:
             return None
         tree = self.tree_cache.get(ref.batch_id)
         if tree is None:
-            async with self.completer.engine.connect() as conn:
-                tree = await self.tree_cache.load(conn, self.completer.tables, ref.batch_id)
+            tree = await self._load_tree(ref, attempt=claim.attempt)
         context = ItemContext(
             ref=ref,
             attempt=claim.attempt,
@@ -169,6 +175,28 @@ class TaskRuntime:
             heartbeat.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await heartbeat
+
+    async def _load_tree(self, ref: ItemRef, *, attempt: int) -> TreeSnapshot:
+        """Прочитать дерево батча захваченного Item до вызова задачи.
+
+        Returns:
+            Снимок дерева для ``spawn``/``sub_batch`` задачи.
+
+        Raises:
+            CompleterError: чтение не прошло (PostgreSQL недоступен, ошибка
+                запроса); lease уже отпущен, как перед ретраем брокера (§10).
+        """
+        try:
+            async with self.completer.engine.connect() as conn:
+                return await self.tree_cache.load(conn, self.completer.tables, ref.batch_id)
+        except BaseException as exc:
+            # Задача не начиналась: lease отпускаем, чтобы повтор брокера не ждал lease_ttl.
+            with contextlib.suppress(CompleterError, ClosedError):
+                _ = await self.completer.release(ref, attempt=attempt)
+            if isinstance(exc, TallyhoError) or not isinstance(exc, Exception):
+                raise
+            # Ошибка драйвера — подкласс TallyhoError из retry_on адаптера, а не DLQ сразу.
+            raise CompleterError(_TREE_FAILED) from exc
 
     async def _invoke(
         self,
