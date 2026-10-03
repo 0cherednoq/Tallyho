@@ -23,6 +23,7 @@ from tallyho.engine.spawn import SpawnRoute
 from tallyho.model.calls import TaskCall
 from tallyho.model.errors import ConfigurationError
 from tallyho.model.states import ResultClass
+from tallyho.storage.metric_names import METRIC_PREFIX
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -94,7 +95,8 @@ def test_finish_result_freezes_dynamic_buffers() -> None:
     spawns.clear()
     expects.clear()
     subs.clear()
-    assert dict(value.metrics) == {"bytes": 1}
+    # Имена метрик уже переведены в имена строк th_metric.
+    assert dict(value.metrics) == {METRIC_PREFIX + "bytes": 1}
     assert value.spawns == (spawn,)
     assert value.expects == (expect,)
     assert value.sub_batches == (sub,)

@@ -73,6 +73,7 @@ try:
     labels = view.labels  # счётчики по меткам итога
     assert (labels["resized"], labels["already_resized"], labels["corrupt_file"]) == (7, 2, 1)
     assert view.metrics["bytes_saved"] == 7 * 1024  # сумма item.incr
+    assert "bytes_saved" not in labels  # метрики в разбивку по меткам не попадают
     # Корневой батч всегда можно найти по (kind, key).
     again = await th.find("thumbnails", "album:1")
     assert again.id == batch.handle.id

@@ -48,6 +48,7 @@ from tallyho.storage.counters import (
     upsert_metrics,
     upsert_slots,
 )
+from tallyho.storage.metric_names import LabelsAndMetrics, read_labels_and_metrics
 from tallyho.storage.now import sql_now
 from tallyho.storage.tx import (
     RetryPolicy,
@@ -278,9 +279,10 @@ class Finalizer:
         totals = (await read_counters(conn, self.tables, [batch.id]))[batch.id]
         if totals.pending != 0 or not self._closable(batch):
             return None
-        values = (await self._metrics(conn, [batch.id])).get(batch.id, {})
+        counted = await read_labels_and_metrics(conn, self.tables, [batch.id])
+        labels = counted.get(batch.id, LabelsAndMetrics()).labels
         child_errors = await self._child_errors(conn, batch.id)
-        state = self._final_state(batch, totals, values, child_errors=child_errors)
+        state = self._final_state(batch, totals, labels, child_errors=child_errors)
         return _Verdict(state=state, reason=batch.cancel_reason)
 
     async def _apply(
@@ -561,7 +563,7 @@ class Finalizer:
         totals = await read_counters(conn, self.tables, ids)
         feeds = await self._feeds(conn, ids)
         in_flight = await self._in_flight(conn, ids)
-        metrics = await self._metrics(conn, ids)
+        metrics = await read_labels_and_metrics(conn, self.tables, ids)
         nodes = [
             NodeCounters(
                 id=row.id,
@@ -591,15 +593,15 @@ class Finalizer:
         def build(row: _Batch) -> BatchSummary:
             finalizing = row.id == target.id
             row_state = state if finalizing else row.state
-            values = metrics.get(row.id, {})
+            counted = metrics.get(row.id, LabelsAndMetrics())
             return BatchSummary(
                 id=row.id,
                 kind=row.kind,
                 key=row.key,
                 state=row_state,
                 progress=progress[row.id],
-                labels=values,
-                metrics=values,
+                labels=counted.labels,
+                metrics=counted.metrics,
                 children={
                     child.key or str(child.id): build(child)
                     for child in sorted(children[row.id], key=lambda value: value.id)
@@ -703,18 +705,6 @@ class Finalizer:
             .group_by(lease.c.batch_id)
         )
         return {batch_id: int(n) for batch_id, n in result}
-
-    async def _metrics(self, conn: AsyncConnection, ids: list[UUID]) -> dict[UUID, dict[str, int]]:
-        metric = self.tables.metric
-        result = await conn.execute(
-            select(metric.c.batch_id, metric.c.name, func.sum(metric.c.value).label("value"))
-            .where(metric.c.batch_id.in_(ids))
-            .group_by(metric.c.batch_id, metric.c.name)
-        )
-        values: defaultdict[UUID, dict[str, int]] = defaultdict(dict)
-        for batch_id, name, value in result:
-            values[batch_id][name] = int(value)
-        return dict(values)
 
     async def _record_hook_failure(self, failure: _HookCallError) -> int:
         batch = self.tables.batch

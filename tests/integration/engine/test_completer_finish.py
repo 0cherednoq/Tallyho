@@ -15,6 +15,7 @@ from typing_extensions import override
 from tallyho.engine.completer import FinishResult, ItemRef
 from tallyho.model.states import ItemState, OutboxKind, ResultClass
 from tallyho.protocols.observer import NullObserver
+from tallyho.storage.metric_names import METRIC_PREFIX
 from tests.integration.engine.completer_env import (
     COMPLETER_SLOT,
     NOW,
@@ -94,7 +95,8 @@ async def test_finish_records_result_counters_metrics_and_finalizer(env: Env) ->
                 select(metric.c.name, metric.c.slot, metric.c.value).order_by(metric.c.name)
             )
         ).all()
-    assert rows == [("bytes", COMPLETER_SLOT, 42), ("ok", COMPLETER_SLOT, 1)]
+    # Метрика — строка с зарезервированным префиксом, метка итога — под своим именем.
+    assert rows == [(METRIC_PREFIX + "bytes", COMPLETER_SLOT, 42), ("ok", COMPLETER_SLOT, 1)]
     assert await env.count(env.tables.item_mark) == 0
     assert finalizer.calls == [seeded.batch_id]
 
@@ -203,7 +205,7 @@ async def test_batched_finish_preserves_fields_accumulates_metrics_and_cas_scope
             ).all()
         )
         expiry_ids = set(await conn.scalars(select(expiry.c.item_id)))
-    assert metrics == {"payloads": 5, "shared": 2}
+    assert metrics == {METRIC_PREFIX + "payloads": 5, "shared": 2}
     assert expiry_ids == {terminal_ref.id}
     assert sorted(observer.finished) == sorted(
         [
