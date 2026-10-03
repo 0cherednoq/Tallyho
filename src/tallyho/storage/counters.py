@@ -41,7 +41,7 @@ from sqlalchemy.dialects.postgresql import ARRAY, insert
 from tallyho.model.states import TERMINAL_THRESHOLD, ItemState
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Iterator, Mapping
+    from collections.abc import Iterable, Iterator, Mapping, Sequence
     from datetime import datetime
     from uuid import UUID
 
@@ -53,6 +53,7 @@ if TYPE_CHECKING:
 __all__ = [
     "COUNTER_FIELDS",
     "DELTA_FIELDS",
+    "USER_METRIC_SLOTS",
     "CounterDelta",
     "CounterTotals",
     "MetricKey",
@@ -62,9 +63,12 @@ __all__ = [
     "insert_delta",
     "read_counters",
     "reconcile",
+    "stale_metric_slots_statement",
     "take_metric_slot",
+    "take_stale_metric_slots",
     "upsert_metrics",
     "upsert_slots",
+    "user_metric_slot",
 ]
 
 COUNTER_FIELDS: Final = (
@@ -238,7 +242,7 @@ class CounterTotals:
 
 
 SlotKey = tuple["UUID", int]
-"""Ключ строки ``th_counter``: ``(batch_id, slot)``."""
+"""Ключ строки ``th_counter`` или слота ``th_metric`` батча: ``(batch_id, slot)``."""
 
 MetricKey = tuple["UUID", str, int]
 """Ключ строки ``th_metric``: ``(batch_id, name, slot)``."""
@@ -247,6 +251,9 @@ _CHUNK: Final = 1000
 """Строк в одном многострочном INSERT: до 13 параметров на строку при лимите 32 767."""
 
 _ZERO: Final = literal_column("0", BigInteger())
+
+USER_METRIC_SLOTS: Final = 32_767
+"""Сколько отрицательных слотов ``th_metric`` у транзакций пути B."""
 
 _DERIVED_FIELDS: Final = ("total", "ok", "skip", "error", "cancelled", "w_total", "w_done")
 """Счётчики, которые :func:`reconcile` выводит из строк ``th_item``."""
@@ -417,14 +424,48 @@ async def upsert_metrics(
         _ = await conn.execute(stmt)
 
 
+def user_metric_slot(delta_id: int) -> int:
+    """Отрицательный слот ``th_metric`` транзакции пути B для батча (UC-08).
+
+    Считается по id дельты этого батча, вставленной той же транзакцией: id
+    уникальны и растут, поэтому одновременные транзакции получают разные
+    слоты и не блокируют строки друг друга и групповой транзакции Completer
+    (слоты процессов неотрицательны). По дельте строку слота находит и
+    sweeper, если перенос после commit не состоялся.
+
+    Args:
+        delta_id: Id строки ``th_counter_delta`` батча.
+
+    Returns:
+        ``-1 - delta_id mod 32767``: от ``-32767`` до ``-1``.
+    """
+    return -1 - delta_id % USER_METRIC_SLOTS
+
+
+def _user_metric_slot_sql(delta_id: ColumnElement[int]) -> ColumnElement[int]:
+    # То же, что user_metric_slot, в SQL; константы — литералами (D-020).
+    modulo = literal_column(str(USER_METRIC_SLOTS), BigInteger())
+    return literal_column("-1", BigInteger()) - delta_id % modulo
+
+
+def _slot_arrays(
+    keys: Iterable[SlotKey],
+) -> tuple[ColumnElement[Sequence[UUID]], ColumnElement[Sequence[int]]]:
+    # Два параметра-массива для unnest: план не зависит от числа слотов. Явный
+    # CAST сохраняет типы колонок и в SQL с литералами (EXPLAIN-гард).
+    ordered = sorted(set(keys))
+    uuids: list[UUID] = [key[0] for key in ordered]
+    slots: list[int] = [key[1] for key in ordered]
+    return (
+        cast(literal(uuids, ARRAY(Uuid())), ARRAY(Uuid())),
+        cast(literal(slots, ARRAY(SmallInteger())), ARRAY(SmallInteger())),
+    )
+
+
 async def take_metric_slot(
-    conn: AsyncConnection,
-    tables: Tables,
-    batch_ids: Iterable[UUID],
-    *,
-    slot: int,
+    conn: AsyncConnection, tables: Tables, keys: Iterable[SlotKey]
 ) -> dict[tuple[UUID, str], int]:
-    """Удалить строки ``th_metric`` слота ``slot`` и вернуть их значения.
+    """Удалить строки ``th_metric`` слотов транзакции пути B и вернуть их значения.
 
     Путь B пишет метрики в собственный слот транзакции пользователя, чтобы не
     ждать строку слота процесса (ARCHITECTURE UC-08); после commit Completer
@@ -434,21 +475,96 @@ async def take_metric_slot(
     Args:
         conn: Соединение в открытой транзакции.
         tables: Таблицы установки.
-        batch_ids: Батчи, у которых есть строки слота.
-        slot: Слот транзакции пути B.
+        keys: Пары ``(batch_id, slot)`` — слоты транзакции по батчам.
 
     Returns:
         Значения по ``(batch_id, name)``.
     """
-    ids = sorted(set(batch_ids))
+    pairs = func.unnest(*_slot_arrays(keys)).table_valued("batch_id", "slot").render_derived("k")
     metric = tables.metric
     taken = await conn.execute(
         delete(metric)
-        .where(metric.c.batch_id == any_(literal(ids, ARRAY(Uuid()))), metric.c.slot == slot)
+        .where(metric.c.batch_id == pairs.c.batch_id, metric.c.slot == pairs.c.slot)
         .returning(metric.c.batch_id, metric.c.name, metric.c.value)
     )
+    return _sum_metric_rows(taken)
+
+
+def stale_metric_slots_statement(tables: Tables, keys: Iterable[SlotKey]) -> Select[UUID, str, int]:
+    """Строки отрицательных слотов, которые можно перенести без их транзакции.
+
+    Строка ``(batch_id, name, slot)`` берётся, если слот отрицательный, в
+    батче не осталось несвёрнутой дельты с тем же слотом (её свёртка сама
+    заберёт строку) и строку не держит другая транзакция (``SKIP LOCKED``:
+    живая транзакция пути B с совпавшим слотом или свёртка Completer).
+    Строки блокируются в порядке первичного ключа.
+
+    Args:
+        tables: Таблицы установки.
+        keys: Пары ``(batch_id, slot)`` свёрнутых дельт.
+
+    Returns:
+        ``SELECT … FOR UPDATE SKIP LOCKED`` ключей строк ``th_metric``.
+    """
+    pairs = func.unnest(*_slot_arrays(keys)).table_valued("batch_id", "slot").render_derived("k")
+    metric = tables.metric
+    delta = tables.counter_delta
+    pending = (
+        select(delta.c.id)
+        .where(
+            delta.c.batch_id == metric.c.batch_id,
+            _user_metric_slot_sql(delta.c.id) == metric.c.slot,
+        )
+        .exists()
+    )
+    return (
+        select(metric.c.batch_id, metric.c.name, metric.c.slot)
+        .join(pairs, (metric.c.batch_id == pairs.c.batch_id) & (metric.c.slot == pairs.c.slot))
+        .where(metric.c.slot < literal_column("0", SmallInteger()), ~pending)
+        .order_by(metric.c.batch_id, metric.c.name, metric.c.slot)
+        .with_for_update(of=metric, skip_locked=True)
+    )
+
+
+async def take_stale_metric_slots(
+    conn: AsyncConnection, tables: Tables, keys: Iterable[SlotKey]
+) -> dict[tuple[UUID, str], int]:
+    """Забрать строки слотов транзакций пути B, перенос которых не состоялся.
+
+    Sweeper вызывает функцию в транзакции, которая свернула устаревшие дельты
+    этих слотов (:func:`fold_delta_ids`), и прибавляет результат к своему
+    слоту (:func:`upsert_metrics`), поэтому сумма по слотам не меняется.
+    Какие строки берутся — :func:`stale_metric_slots_statement`; остальные
+    перенесёт свёртка их транзакции.
+
+    Args:
+        conn: Соединение в открытой транзакции.
+        tables: Таблицы установки.
+        keys: Пары ``(batch_id, slot)`` свёрнутых дельт.
+
+    Returns:
+        Значения по ``(batch_id, name)``.
+    """
+    ordered = sorted(set(keys))
+    if not ordered:
+        return {}
+    metric = tables.metric
+    locked = stale_metric_slots_statement(tables, ordered).cte("locked")
+    taken = await conn.execute(
+        delete(metric)
+        .where(
+            metric.c.batch_id == locked.c.batch_id,
+            metric.c.name == locked.c.name,
+            metric.c.slot == locked.c.slot,
+        )
+        .returning(metric.c.batch_id, metric.c.name, metric.c.value)
+    )
+    return _sum_metric_rows(taken)
+
+
+def _sum_metric_rows(rows: Iterable[tuple[UUID, str, int]]) -> dict[tuple[UUID, str], int]:
     values: defaultdict[tuple[UUID, str], int] = defaultdict(int)
-    for batch_id, name, value in taken:
+    for batch_id, name, value in rows:
         values[batch_id, name] += value
     return dict(values)
 

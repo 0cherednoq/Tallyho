@@ -38,7 +38,10 @@ pytestmark = [
 ITEM_COUNT = 1_000_000
 BATCH_COUNT = 10_000
 CHILD_COUNT = 30_000
-FORBIDDEN_SEQ_SCAN = frozenset({"th_item", "th_batch", "th_counter", "th_batch_attr"})
+DELTA_COUNT = 100_000
+FORBIDDEN_SEQ_SCAN = frozenset(
+    {"th_item", "th_batch", "th_counter", "th_batch_attr", "th_metric", "th_counter_delta"}
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -178,6 +181,39 @@ async def _populate(connection: AsyncConnection) -> None:
     await connection.execute(
         text(
             """
+            INSERT INTO th_metric (batch_id, name, slot, value)
+            SELECT
+                ('00000000-0000-0000-0000-' || lpad(g::text, 12, '0'))::uuid,
+                name,
+                slot,
+                1
+            FROM generate_series(1, :batches) AS g
+            CROSS JOIN generate_series(-2, 7) AS slot
+            CROSS JOIN unnest(ARRAY['ok', 'error', 'skip']) AS name
+            """
+        ),
+        {"batches": BATCH_COUNT},
+    )
+    # Несвёрнутые дельты пути B после долгой недоступности Completer.
+    await connection.execute(
+        text(
+            """
+            INSERT INTO th_counter_delta (batch_id, d_ok, created_at)
+            SELECT
+                concat(
+                    '00000000-0000-0000-0000-',
+                    lpad((((g - 1) % :batches) + 1)::text, 12, '0')
+                )::uuid,
+                1,
+                timestamptz '2030-01-01'
+            FROM generate_series(1, :deltas) AS g
+            """
+        ),
+        {"batches": BATCH_COUNT, "deltas": DELTA_COUNT},
+    )
+    await connection.execute(
+        text(
+            """
             INSERT INTO th_batch_attr (batch_id, attributes)
             SELECT
                 ('00000000-0000-0000-0000-' || lpad(g::text, 12, '0'))::uuid,
@@ -191,6 +227,8 @@ async def _populate(connection: AsyncConnection) -> None:
     await connection.execute(text("ANALYZE th_batch"))
     await connection.execute(text("ANALYZE th_item"))
     await connection.execute(text("ANALYZE th_counter"))
+    await connection.execute(text("ANALYZE th_metric"))
+    await connection.execute(text("ANALYZE th_counter_delta"))
     await connection.commit()
 
 
@@ -247,7 +285,7 @@ async def test_hot_path_plans_have_no_large_or_sequential_scans(
 ) -> None:
     database = populated_database
     queries = HOT_QUERIES.build(database.tables, database.probe)
-    assert len(queries) == 15
+    assert len(queries) == 16
     assert len({query.name for query in queries}) == len(queries)
     async with schema_connection(database.engine, database.schema) as connection:
         await _set_search_path(connection, database.schema)

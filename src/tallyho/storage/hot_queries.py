@@ -14,6 +14,7 @@ from sqlalchemy import any_, literal, select
 
 from tallyho.model.states import TERMINAL_THRESHOLD, BatchState, ItemState
 from tallyho.storage.batch_listing import DEFAULT_LIST_LIMIT, list_batches_statement
+from tallyho.storage.counters import stale_metric_slots_statement, user_metric_slot
 from tallyho.storage.item_scan import DEFAULT_ITEMS_SCAN_WINDOW, item_window_statement
 from tallyho.storage.tables import PROGRESS_HOOK
 
@@ -257,3 +258,9 @@ def _counter_by_batch(tables: Tables, probe: HotQueryProbe) -> Select[UUID, int]
         .where(counter.c.batch_id == probe.batch_id)
         .order_by(counter.c.slot)
     )
+
+
+@HOT_QUERIES.register("metric.stale_user_slots")
+def _stale_user_slots(tables: Tables, probe: HotQueryProbe) -> Select[UUID, str, int]:
+    # Sweeper после свёртки устаревших дельт: строки их отрицательных слотов.
+    return stale_metric_slots_statement(tables, [(probe.batch_id, user_metric_slot(1))])
