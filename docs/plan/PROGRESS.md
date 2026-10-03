@@ -6,8 +6,8 @@
 ## Текущее состояние
 
 * **Ветка:** `impl/v1`
-* **Текущая волна:** 11 — Fix-13, Fix-15, Fix-16, Fix-18; затем Fix-14, Fix-17, Fix-19, Fix-20, T11.3b, T11.4, T11.5
-* **Последний зелёный коммит:** 50623c2
+* **Текущая волна:** 12 — Fix-14, Fix-17, Fix-19, Fix-20; затем Fix-21, T11.3b, T11.4, T11.5
+* **Последний зелёный коммит:** 8600050
 
 ## Задачи
 
@@ -58,7 +58,7 @@
 | T11.1 | Эталонное приложение и генераторы | T8.2, T9.2 | done | c462b29 |
 | T11.2 | Оракул инвариантов | T11.1 | done | 1561d69 |
 | T11.3 | Хаос-контроллер, расписание, журнал, `poe acceptance` | T11.2 | done | f86ded7..26308bd (7), merge 14d2e82 |
-| T11.3b | Все A-CH зелёные без xfail; I-10 по D-056 | T11.3, Fix-16, Fix-18, Fix-19 | todo | |
+| T11.3b | Все A-CH зелёные без xfail; I-10 по D-056 | T11.3, Fix-19 | todo | |
 | T11.4 | Сценарии A-UC на стенде | T11.2, T13.6 | todo | |
 | T11.5 | Бенчмарк-харнесс A-PERF | T11.1 | todo | |
 | T12.1 | Пользовательская документация | T9.3, T13.6 | done | 16dd1f7..79840f1 (8), merge 79f235b |
@@ -82,14 +82,15 @@
 | Fix-10 | Быстрая отправка relay после commit в каждом процессе | — | done | 5de7d24..69d0d91 (5), merge d36a62f |
 | Fix-11 | Закрытие дожидается фоновых задач; SIGTERM возвращает удержанные Items | — | done | e51a204..420923c (13), merge 1fa43ac |
 | Fix-12 | Запросы на соединении пользователя видят схему установки | — | done | 180de5f..2b9ddc7 (3), merge ab23dcb |
-| Fix-13 | Публичный API ↔ ARCHITECTURE §11 | — | in_progress | |
-| Fix-14 | Мелкие расхождения движка: backoff хуков, labels/metrics, lock с prefix, `found` корня | — | todo | |
-| Fix-15 | Дедлайн после явного `cancel()` не меняет итог на `failed` | — | in_progress | |
-| Fix-16 | `after_commit` для `AsyncConnection` срабатывает после COMMIT | — | in_progress | |
-| Fix-17 | `watch()`/`wait()` не оставляет `LISTEN` на соединении пула | — | todo | |
-| Fix-18 | `finish` и `JOB_DEAD` проверяют владение lease и поколение; ключ идемпотентности с поколением | — | in_progress | |
-| Fix-19 | Зависание на S2: Item `active` без lease и outbox при живой джобе flexiq | — | todo | |
-| Fix-20 | `Completer._held` после `complete_in`; heartbeat против долгой транзакции пути B | — | todo | |
+| Fix-13 | Публичный API ↔ ARCHITECTURE §11 | — | done | 3e28811..dde79cf (9), merge 81fd649 |
+| Fix-14 | Мелкие расхождения движка: backoff хуков, labels/metrics, lock с prefix, `found` корня | — | in_progress | |
+| Fix-15 | Дедлайн после явного `cancel()` не меняет итог на `failed` | — | done | 591a1ae..5655749 (3), merge 8600050 |
+| Fix-16 | `after_commit` для `AsyncConnection` срабатывает после COMMIT | — | done | d03ea48..e68a4d2 (4), merge f622240 |
+| Fix-17 | `watch()`/`wait()` не оставляет `LISTEN` на соединении пула | — | in_progress | |
+| Fix-18 | `finish` и `JOB_DEAD` проверяют владение lease и поколение; ключ идемпотентности с поколением | — | done | 410cef7..28bcb4b (4), merge b76c20c |
+| Fix-19 | Зависание на S2: Item `active` без lease и outbox при живой джобе flexiq | — | in_progress | |
+| Fix-20 | `Completer._held` после `complete_in`; heartbeat против долгой транзакции пути B | — | in_progress | |
+| Fix-21 | Нестабильный `test_run_in_gives_up_on_unresponsive_foreign_loop` | — | todo | |
 
 ## Журнал
 
@@ -99,6 +100,21 @@
 - Отклонения от плана/доков: … (или «нет»)
 - Узнали / на что обратить внимание дальше: …
 -->
+### 2026-10-03 · волна 12 запущена · Fix-14, Fix-17, Fix-19, Fix-20
+- Четыре задачи в изолированных worktree от текущего HEAD: мелкие расхождения движка, подписка `LISTEN` после `watch()`, зависание на S2, `_held` и heartbeat пути B. Fix-21 и T11.3b — следующей волной (T11.3b ждёт Fix-19). G2 и мутационный gate выполняет оркестратор после вливания.
+
+### 2026-10-03 · волна 11 влита и прошла гейты · Fix-13, Fix-15, Fix-16, Fix-18 · merge 81fd649, 8600050, f622240, b76c20c
+- **Fix-13 · done.** Расхождения публичного API с ARCHITECTURE закрыты (D-058): (a) `item`/`tracked`/`callback` — модульные фасады, атрибутов `th.item`/`th.tracked` нет — исправлен документ; (b) `opts=` у `spawn` не вводится, опции — через `item.spawn_call(th.call(...).opts(...))`, переписан нетипизируемый пример §12.4; (c) `into=` принимает `str | UUID`; (d) `@fq.task(weight=)` → `UnsupportedOption` с подсказкой, вес только в `.opts(weight=)`; (e) колбэки `item.sub_batch` — `on_...=`, как у builder, `callbacks=` удалён; (f) `CallbackContext.summary` удалён, итог читается через `th.handle(batch_id).view()`; (g) потоковое добавление UC-02 — `th.batch(..., seal=False)` с повторным входом по ключу. Типовые кейсы на каждый пункт.
+- **Fix-15 · done.** Первая причина отмены выигрывает во всех четырёх местах записи (`Operations.cancel` — через него дедлайн и `on_feeder_failed` в sweeper; `PolicyEnforcer._fail_tree`; `Finalizer._seal_downstream`): флаг ставится только при `cancel_requested_at IS NULL`, каскад и отмена Items идемпотентны (D-059). Попутно: `deadline=` у `sub_batch` не срабатывал — sweeper проверял только корни; исправлено. `retry_failed()` запрос отмены не снимает. 9 тестов, 7 красных на старом коде.
+- **Fix-16 · done.** `after_commit` для `AsyncConnection` висел на событии `commit`, которое SQLAlchemy вызывает до `do_commit`: колбэки теперь выполняются после подтверждённого COMMIT и отбрасываются при его ошибке (`handle_error` диалекта); своя транзакция (`begin_transaction`/`own_transaction`) доставляет их сразу по выходе (D-057). 200 пустых батчей в своей транзакции: 193/28/22 финализированы на старом коде, 200/200 после. `test_cancel_right_after_seal_never_finalizes_succeeded`, нестабильный до волны, после вливания — 10/10. Изменение контракта: для `AsyncConnection` пользователя колбэк не вызывается внутри самого `await conn.commit()`.
+- **Fix-18 · done.** `finish` и `release` пути A применяются только попыткой-владельцем lease `(worker_id, attempt)`, отбор до CAS — `_Tx.finish`/`_Tx.claim` не менялись; `JOB_DEAD` идёт через `DeadLetterReconciler.settle` по правилу D-051; `idempotency_key=th:{item_id}:{generation}` (D-060). На каждый пункт тест, красный на старом коде (9/13, 4/5, контрактный A-FQ-06). A-CH-10 × S2 зелёный.
+- Вливание: все четыре ветки — без конфликтов; Fix-15 влит после быстрого интеграционного прогона трёх остальных (699 passed, 1 skipped).
+- Проверка после вливания: `poe check` — 1197 быстрых тестов, зелёный; `poe test-all` — **1990 passed, 1 документированный Windows skip, покрытие 97,77%, seed 341486197, 47:36**, падений нет; pre-commit all-files — зелёный.
+- Мутационный gate: `poe mutation-cas` в Linux-контейнере на `8600050` — код 0: 392 killed, 4 timeout (все в `_Tx.claim`), выживших, suspicious и no-tests нет.
+- Отклонения: Fix-13 закрыл часть пунктов правкой документа, а не кода (обоснования в D-058). Fix-15 вышел за карточку — дедлайн под-батча. Fix-16 поправил `runtime/context.py` (`complete_in` сначала доставляет отложенные колбэки), иначе повторный вызов после `commit()` давал `LeaseLostError`. Сигнатура внутреннего `WorkerServices.finish_dead` изменена (Fix-18).
+- Новые задачи: Fix-21 — `test_run_in_gives_up_on_unresponsive_foreign_loop` иногда падает с «coroutine never awaited» (дефект Fix-11). В Fix-20 добавлено: heartbeat сверяет только `worker_id` — устаревшая попытка того же процесса продлевает lease новой. В Fix-14 добавлено: адаптер кладёт в маркер колбэка лишний `"s": None`.
+- Узнали: новый код, который сам открывает транзакцию и регистрирует `after_commit`, должен использовать `begin_transaction`/`own_transaction`, а не голый `engine.begin()`. После ключа идемпотентности с поколением хаос-стенду, возможно, больше не нужен `lease_ttl=60` (D-045) — перепроверить в T11.3b. `retry_failed()` для батча, отменённого по дедлайну или политике, фактически ничего не повторяет (отмена необратима, D-059).
+
 ### 2026-10-03 · волна 11 запущена · Fix-13, Fix-15, Fix-16, Fix-18
 - Четыре задачи в изолированных worktree от текущего HEAD: публичный API ↔ ARCHITECTURE §11, первая причина отмены выигрывает, момент `after_commit` для собственной транзакции, владение lease и поколение в пути A и `JOB_DEAD`. Fix-14 (пересекается с Fix-16 в maintenance/reads), Fix-17, Fix-19, Fix-20 — следующей волной. G2 и мутационный gate (Fix-18 меняет `_Tx.finish`) выполняет оркестратор после вливания.
 
