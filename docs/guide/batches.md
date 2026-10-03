@@ -299,6 +299,8 @@ try:
 
     view = await root.handle.view()
     assert view.state is BatchState.SUCCEEDED
+    # У корня каждый этап — одна задача; работа этапов — в children.
+    assert (view.progress.found, view.progress.ok, view.progress.ratio) == (2, 2, 1.0)
     assert view.children["pages"].progress.found == 3
     cards = view.children["cards"].progress
     assert (cards.found, cards.ok, cards.duplicates) == (4, 4, 1)  # карточка "b" встретилась дважды
