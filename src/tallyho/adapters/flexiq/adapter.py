@@ -811,12 +811,9 @@ class FlexiqAdapter(
     @staticmethod
     def _marker(message: Message, maximum: int) -> dict[str, object]:
         if message.kind is OutboxKind.CALLBACK:
-            return {
-                "c": str(message.id),
-                "b": str(message.batch_id),
-                "r": maximum,
-                "s": None,
-            }
+            # Сводки в маркере нет (CallbackContext без summary, D-058). Джобы, поставленные
+            # раньше, несут ключ "s": None — обёртка tracked лишние ключи игнорирует.
+            return {"c": str(message.id), "b": str(message.batch_id), "r": maximum}
         marker: dict[str, object] = {"i": str(message.id), "b": str(message.batch_id), "r": maximum}
         if message.generation:
             # Первая отправка — поколение 0, ключа нет: payload горячего пути не растёт,
