@@ -205,6 +205,7 @@ class Settings:
             relay_claim_ttl=self.relay_claim_ttl,
             finalize_grace=self.finalize_grace,
             hook_timeout=self.hook_timeout,
+            hook_backoff_initial=self.hook_backoff_initial,
             hook_backoff_max=self.hook_backoff_max,
             snapshot_tick=self.snapshot_tick,
             estimate_min_basis=self.estimate_min_basis,

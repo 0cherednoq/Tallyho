@@ -424,7 +424,7 @@ class InlineBroker(Dispatcher, Runtime, PayloadCodec, RetryLimits):
     @staticmethod
     def _marker(message: Message) -> dict[str, object]:
         if message.kind is OutboxKind.CALLBACK:
-            return {"c": str(message.id), "b": str(message.batch_id), "s": None}
+            return {"c": str(message.id), "b": str(message.batch_id)}
         return {"i": str(message.id), "b": str(message.batch_id)}
 
     def _message_retries(self, message: Message) -> int:

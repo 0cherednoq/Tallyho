@@ -12,6 +12,7 @@ from tallyho.engine.producer import CallbackName, SubBatchSpec
 from tallyho.model.calls import TaskCall
 from tallyho.model.errors import ConfigurationError, LeaseLostError
 from tallyho.model.states import OnFeederFailed, ResultClass
+from tallyho.storage.metric_names import check_counter_name
 from tallyho.storage.tx import after_commit, after_commit_pending, resolve_connection
 
 if TYPE_CHECKING:
@@ -325,11 +326,13 @@ class ItemContext:
         """Прибавить пользовательскую метрику.
 
         Raises:
-            ConfigurationError: имя пусто или value не является целым.
+            ConfigurationError: имя пусто или начинается с зарезервированного
+                U+001F, value не является целым.
         """
         if not name or isinstance(value, bool):
             message = "имя метрики должно быть непустым, value — целым"
             raise ConfigurationError(message)
+        check_counter_name(name, what="метрики")
         self.metrics[name] = self.metrics.get(name, 0) + value
 
     def ok(
@@ -427,6 +430,8 @@ class ItemContext:
         error: object = None,
         mark: bool | None = None,
     ) -> None:
+        if label is not None:
+            check_counter_name(label, what="метки")
         self._result_class = result_class
         self._label = label
         self._result = result

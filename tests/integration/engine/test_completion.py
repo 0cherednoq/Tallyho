@@ -19,6 +19,7 @@ from tallyho.engine.sweeper import Sweeper, SweeperSettings
 from tallyho.model.calls import TaskCall
 from tallyho.model.states import ItemState, ResultClass
 from tallyho.protocols.observer import NullObserver
+from tallyho.storage.metric_names import METRIC_PREFIX
 from tallyho.storage.tx import resolve_connection
 from tests.helpers.probe import committed_ids, create_probe, insert_id
 from tests.integration.engine.completer_env import (
@@ -111,7 +112,7 @@ async def test_complete_in_commits_domain_item_delta_and_then_folds(env: Env) ->
             )
         ).all()
     assert delta_count == 0
-    assert metrics == [("bytes", COMPLETER_SLOT, 42), ("ok", COMPLETER_SLOT, 1)]
+    assert metrics == [(METRIC_PREFIX + "bytes", COMPLETER_SLOT, 42), ("ok", COMPLETER_SLOT, 1)]
     assert finalizer.calls == [seeded.batch_id]
     assert progress.calls == [([seeded.batch_id], False)]
 

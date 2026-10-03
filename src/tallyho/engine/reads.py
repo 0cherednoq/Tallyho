@@ -35,6 +35,7 @@ from tallyho.storage.item_scan import (
     item_window_statement,
     marked_window_statement,
 )
+from tallyho.storage.metric_names import split_metric_rows
 from tallyho.storage.now import sql_now
 
 if TYPE_CHECKING:
@@ -135,7 +136,8 @@ class _Node:
     hook_attempts: int
     hook_error: str | None
     counters: NodeCounters
-    values: Mapping[str, int]
+    labels: Mapping[str, int]
+    metrics: Mapping[str, int]
     attributes: Mapping[str, AttributeValue]
     memo: Mapping[str, object] | None
 
@@ -193,8 +195,8 @@ class Reads:
                 key=node.key,
                 state=node.state,
                 progress=progress[node.id],
-                labels=node.values,
-                metrics=node.values,
+                labels=node.labels,
+                metrics=node.metrics,
                 children={
                     child.key or str(child.id): build(child) for child in children.get(node.id, ())
                 },
@@ -262,8 +264,8 @@ class Reads:
                 key=node.key,
                 state=node.state,
                 progress=progress[node.id],
-                labels=node.values,
-                metrics=node.values,
+                labels=node.labels,
+                metrics=node.metrics,
                 children={
                     child.key or str(child.id): build(child, target_id=target_id)
                     for child in children.get(node.id, ())
@@ -599,11 +601,13 @@ def _node(row: RowMapping) -> _Node:
     raw_values = (
         cast("dict[object, object]", values_value) if isinstance(values_value, dict) else {}
     )
-    values = {
-        str(key): value
-        for key, value in raw_values.items()
-        if isinstance(value, int) and not isinstance(value, bool)
-    }
+    labels, metrics = split_metric_rows(
+        {
+            str(key): value
+            for key, value in raw_values.items()
+            if isinstance(value, int) and not isinstance(value, bool)
+        }
+    )
     return _Node(
         id=batch_id,
         root_id=cast("UUID", row["root_id"]),
@@ -639,7 +643,8 @@ def _node(row: RowMapping) -> _Node:
             expected_total=cast("int | None", row["expected_total"]),
             fed_by=fed_by,
         ),
-        values=values,
+        labels=labels,
+        metrics=metrics,
         attributes=attributes_from_json(cast("object", row["attributes"])),
         memo=memo_from_json(cast("object", row["memo"])),
     )

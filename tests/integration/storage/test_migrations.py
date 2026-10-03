@@ -315,6 +315,17 @@ async def test_concurrent_migrate(engine: AsyncEngine) -> None:
         assert await stored_version(engine, schema) == str(SCHEMA_VERSION)
 
 
+async def test_concurrent_migrate_of_prefixes_shares_schema_lock(engine: AsyncEngine) -> None:
+    # Блокировка миграции общая для схемы (ARCHITECTURE §3.2): иначе два
+    # CREATE SCHEMA IF NOT EXISTS разных префиксов столкнулись бы на каталоге.
+    async with dropped_after(engine, unique_schema_name()) as schema:
+        prefixes = ("th_", "acme_", "jobs_", "mail_")
+        results = await asyncio.gather(*(migrate(engine, schema, prefix) for prefix in prefixes))
+        assert results == [SCHEMA_VERSION] * len(prefixes)
+        for prefix in prefixes:
+            assert await stored_version(engine, schema, prefix) == str(SCHEMA_VERSION)
+
+
 async def test_newer_schema_rejected(engine: AsyncEngine, schema: str) -> None:
     await migrate(engine, schema)
     meta = build_metadata().meta

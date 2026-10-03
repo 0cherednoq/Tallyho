@@ -26,6 +26,7 @@ from tallyho.runtime import (
     tracked,
 )
 from tallyho.runtime.context import RuntimeSubBatch, activate_callback, activate_item
+from tallyho.storage.metric_names import METRIC_PREFIX
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Mapping
@@ -132,7 +133,7 @@ def test_item_context_buffers_all_finish_data() -> None:
     assert value.result_class is ResultClass.OK
     assert value.effective_label == "sent"
     assert value.result == {"id": 1}
-    assert value.metrics == {"rows": 1}
+    assert value.metrics == {METRIC_PREFIX + "rows": 1}
     assert value.effective_mark is True
     assert value.spawns[0].call.key == "child"
     assert value.expects[0].total == 7
@@ -150,11 +151,20 @@ def test_progress_rejects_invalid_values(done: int, total: int) -> None:
         context.progress(done, total)
 
 
-@pytest.mark.parametrize(("name", "value"), [("", 1), ("x", True)])
+@pytest.mark.parametrize(("name", "value"), [("", 1), ("x", True), (METRIC_PREFIX + "x", 1)])
 def test_metric_rejects_invalid_values(name: str, value: int) -> None:
     context, _ = _context()
     with pytest.raises(ConfigurationError, match="метрики"):
         context.incr(name, value)
+
+
+@pytest.mark.parametrize("outcome", ["ok", "skip", "error"])
+def test_label_with_reserved_first_character_is_rejected(outcome: str) -> None:
+    # Иначе чтение th_metric приняло бы метку за метрику item.incr.
+    context, _ = _context()
+    with pytest.raises(ConfigurationError, match="метки"):
+        getattr(context, outcome)(METRIC_PREFIX + "sent")
+    assert context.finish_result().effective_label == "ok"
 
 
 async def test_runtime_sub_batch_buffers_only_successful_context_manager() -> None:

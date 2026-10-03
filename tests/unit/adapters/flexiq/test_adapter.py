@@ -854,12 +854,8 @@ async def test_callback_marker_contains_stable_callback_identity() -> None:
     message = _message(adapter, name, kind=OutboxKind.CALLBACK)
     await adapter.dispatch([message])
     kwargs = cast("list[dict[str, object]]", queue.many[0]["kwargs_list"])[0]
-    assert kwargs["_th"] == {
-        "c": str(message.id),
-        "b": str(message.batch_id),
-        "r": 3,
-        "s": None,
-    }
+    # Без ключа "s": сводки в контексте колбэка нет (D-058).
+    assert kwargs["_th"] == {"c": str(message.id), "b": str(message.batch_id), "r": 3}
     await adapter.close()
 
 

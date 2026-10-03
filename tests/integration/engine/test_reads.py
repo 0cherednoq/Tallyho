@@ -17,6 +17,7 @@ from tallyho.model.errors import BatchPurged, ConfigurationError, NotFoundError
 from tallyho.model.states import CancelReason, ItemState
 from tallyho.protocols.clock import SystemClock
 from tallyho.storage.counters import CounterDelta, upsert_metrics, upsert_slots
+from tallyho.storage.metric_names import METRIC_PREFIX
 from tests.integration.engine.completer_env import schema_engine
 
 if TYPE_CHECKING:
@@ -123,7 +124,12 @@ async def test_view_aggregates_counters_metrics_feeds_and_leases(env: Env) -> No
             env.tables,
             {(target.id, 11): CounterDelta(ok=1, w_done=1, duplicates=2)},
         )
-        await upsert_metrics(conn, env.tables, {(target.id, "sent", 11): 4})
+        # Метка "sent" и метрика item.incr("sent") — разные строки th_metric.
+        await upsert_metrics(
+            conn,
+            env.tables,
+            {(target.id, "sent", 11): 4, (target.id, METRIC_PREFIX + "sent", 11): 7},
+        )
         _ = await conn.execute(
             update(env.tables.batch)
             .where(env.tables.batch.c.id == target.id)
@@ -140,12 +146,13 @@ async def test_view_aggregates_counters_metrics_feeds_and_leases(env: Env) -> No
     assert view.progress.queued == 0
     assert view.progress.duplicates == 2
     assert view.progress.expected == 10
-    assert view.metrics == {"sent": 4}
+    assert view.metrics == {"sent": 7}
     assert view.labels == {"sent": 4}
     assert view.cancel_requested
     assert view.reason is CancelReason.CANCEL
     assert summary.progress == view.progress
     assert summary.metrics == view.metrics
+    assert summary.labels == view.labels
 
 
 async def test_batch_purged_is_one_statement_and_stable(env: Env) -> None:

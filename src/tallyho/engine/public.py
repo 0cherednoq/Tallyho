@@ -109,6 +109,7 @@ class EngineSettings:
     relay_claim_ttl: timedelta
     finalize_grace: timedelta
     hook_timeout: timedelta
+    hook_backoff_initial: timedelta
     hook_backoff_max: timedelta
     snapshot_tick: timedelta
     estimate_min_basis: int

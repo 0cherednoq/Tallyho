@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 from tallyho.model.errors import ConfigurationError
 from tallyho.protocols.broker import DeadLetter
 from tallyho.storage.migrations import migrate, validate_prefix, validate_schema
-from tallyho.storage.tables import build_metadata
+from tallyho.storage.tables import DEFAULT_PREFIX, build_metadata
 
 if TYPE_CHECKING:
     from datetime import timedelta
@@ -42,12 +43,30 @@ class Installation:
     tables: Tables
 
     @property
-    def maintenance_identity(self) -> str | None:
-        """Имя advisory-блокировки лидера maintenance: одна схема — один лидер.
+    def maintenance_identity(self) -> str:
+        """Имя advisory-блокировки лидера maintenance: одна установка — один лидер (§3.2).
 
-        ``None`` для установки без схемы: имя выводится из опций движка.
+        Установку задают схема и префикс. Без ``schema`` схема берётся из
+        ``schema_translate_map`` движка, иначе ``public``. Для префикса по
+        умолчанию имя прежнее (``<схема>:maintenance``): процессы разных версий
+        при обновлении не становятся лидерами одновременно. Другой префикс
+        добавляется через NUL — в имени схемы его не бывает (``validate_schema``),
+        поэтому имена разных установок не совпадают.
         """
-        return None if self.schema is None else f"{self.schema}:maintenance"
+        schema = self.schema if self.schema is not None else _engine_schema(self.engine)
+        identity = f"{schema}:maintenance"
+        if self.prefix == DEFAULT_PREFIX:
+            return identity
+        return f"{identity}\x00{self.prefix}"
+
+
+def _engine_schema(engine: AsyncEngine) -> str:
+    mapping: object = engine.get_execution_options().get("schema_translate_map")
+    if isinstance(mapping, Mapping):
+        translated = cast("Mapping[object, object]", mapping).get(None)
+        if isinstance(translated, str):
+            return translated
+    return "public"
 
 
 @dataclass(frozen=True, slots=True)

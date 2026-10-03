@@ -73,7 +73,7 @@ try:
     labels = view.labels  # счётчики по меткам итога
     assert (labels["resized"], labels["already_resized"], labels["corrupt_file"]) == (7, 2, 1)
     assert view.metrics["bytes_saved"] == 7 * 1024  # сумма item.incr
-
+    assert "bytes_saved" not in labels  # метрики в разбивку по меткам не попадают
     # Корневой батч всегда можно найти по (kind, key).
     again = await th.find("thumbnails", "album:1")
     assert again.id == batch.handle.id
@@ -236,10 +236,11 @@ finally:
   параметр `mark=True/False` у `ok`, `skip` и `error`.
 * Вне отслеживаемой задачи вызовы `item.*` ничего не делают (кроме `item.sub_batch`, который
   бросает `ConfigurationError`), поэтому функцию можно вызывать напрямую в юнит-тестах.
-* **Метки и метрики делят одно пространство имён.** `view.labels` и `view.metrics` (и те же поля
-  сводки в хуках) возвращают один общий набор счётчиков: и число задач по меткам итога, и суммы
-  `item.incr`. Не называйте метрику так же, как метку, и читайте нужные ключи по имени, а не весь
-  словарь целиком.
+* **Метки и метрики — разные словари.** `view.labels` (и то же поле сводки в хуках) — число
+  задач по меткам итога, `view.metrics` — суммы `item.incr`. Метка и метрика с одним именем не
+  смешиваются, поэтому `labels` можно целиком сохранять как разбивку итогов. Имя метки или
+  метрики не может начинаться с символа U+001F — он зарезервирован, такой вызов бросает
+  `ConfigurationError`.
 
 ### Вызовы и опции
 
@@ -299,6 +300,8 @@ try:
 
     view = await root.handle.view()
     assert view.state is BatchState.SUCCEEDED
+    # У корня каждый этап — одна задача; работа этапов — в children.
+    assert (view.progress.found, view.progress.ok, view.progress.ratio) == (2, 2, 1.0)
     assert view.children["pages"].progress.found == 3
     cards = view.children["cards"].progress
     assert (cards.found, cards.ok, cards.duplicates) == (4, 4, 1)  # карточка "b" встретилась дважды
@@ -560,7 +563,8 @@ finally:
 |---|---|
 | `id`, `kind`, `key`, `state` | идентификация и состояние |
 | `progress` | счётчики и оценки — таблица ниже |
-| `labels`, `metrics` | счётчики батча по именам: число задач по меткам итога и суммы `item.incr` ([общее пространство имён](#задача-и-её-итог)) |
+| `labels` | число задач батча по меткам итога |
+| `metrics` | суммы `item.incr` по именам метрик ([метки и метрики](#задача-и-её-итог)) |
 | `children` | под-батчи по ключу: `view.children["send"]` |
 | `reason` | причина запроса отмены: `cancel`, `deadline`, `fail_fast`, `policy` |
 | `paused`, `paused_at`, `cancel_requested`, `cancel_requested_at` | флаги паузы и отмены |

@@ -336,5 +336,6 @@ def _fingerprint(summary: BatchSummary) -> Hashable:
         summary.reason,
         _progress_fingerprint(summary.progress),
         tuple(sorted(summary.labels.items())),
+        tuple(sorted(summary.metrics.items())),
         tuple((key, _fingerprint(child)) for key, child in sorted(summary.children.items())),
     )

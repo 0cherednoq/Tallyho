@@ -87,6 +87,7 @@ from tallyho.storage.counters import (
     upsert_metrics,
     upsert_slots,
 )
+from tallyho.storage.metric_names import metric_rows
 from tallyho.storage.now import sql_now
 from tallyho.storage.tx import (
     RetryPolicy,
@@ -334,7 +335,12 @@ class SubBatchRequest:
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class FinishResult:
-    """Итог, который путь A атомарно записывает в Item."""
+    """Итог, который путь A атомарно записывает в Item.
+
+    ``metrics`` хранит приращения уже под именами строк ``th_metric``
+    (:func:`~tallyho.storage.metric_names.metric_rows`): метрика не
+    смешивается с меткой итога того же имени.
+    """
 
     result_class: ResultClass
     label: str | None = None
@@ -348,7 +354,7 @@ class FinishResult:
 
     def __post_init__(self) -> None:
         """Заморозить накопленные во время задачи буферы."""
-        object.__setattr__(self, "metrics", MappingProxyType(dict(self.metrics)))
+        object.__setattr__(self, "metrics", MappingProxyType(metric_rows(self.metrics)))
         object.__setattr__(self, "spawns", tuple(self.spawns))
         object.__setattr__(self, "expects", tuple(self.expects))
         object.__setattr__(self, "sub_batches", tuple(self.sub_batches))

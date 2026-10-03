@@ -25,6 +25,7 @@ from tallyho.model.views import BatchSummary
 from tallyho.protocols.observer import NullObserver
 from tallyho.storage.attributes import read_batch_attributes
 from tallyho.storage.counters import CounterDelta, read_counters, upsert_metrics, upsert_slots
+from tallyho.storage.metric_names import LabelsAndMetrics, read_labels_and_metrics
 from tallyho.storage.now import sql_now
 from tallyho.storage.tx import (
     RetryPolicy,
@@ -162,7 +163,8 @@ class PolicyEnforcer:
             raise _NoBreachError
         policy = FailurePolicy.from_json(policy_data)
         totals = (await read_counters(conn, self.tables, [batch_id]))[batch_id]
-        labels = (await self._metrics(conn, [batch_id])).get(batch_id, {})
+        counted = await read_labels_and_metrics(conn, self.tables, [batch_id])
+        labels = counted.get(batch_id, LabelsAndMetrics()).labels
         verdict = policy.evaluate(totals, labels)
         if not verdict.breached:
             raise _NoBreachError
@@ -305,7 +307,7 @@ class PolicyEnforcer:
         ids = [row.id for row in rows]
         attributes = await read_batch_attributes(conn, self.tables, root.root_id)
         totals = await read_counters(conn, self.tables, ids)
-        metrics = await self._metrics(conn, ids)
+        metrics = await read_labels_and_metrics(conn, self.tables, ids)
         in_flight_result = await conn.execute(
             select(self.tables.lease.c.batch_id, func.count())
             .where(self.tables.lease.c.batch_id.in_(ids))
@@ -346,15 +348,15 @@ class PolicyEnforcer:
                 children[row.parent_id].append(row)
 
         def build(row: _Batch) -> BatchSummary:
-            values = metrics.get(row.id, {})
+            counted = metrics.get(row.id, LabelsAndMetrics())
             return BatchSummary(
                 id=row.id,
                 kind=row.kind,
                 key=row.key,
                 state=row.state,
                 progress=progress[row.id],
-                labels=values,
-                metrics=values,
+                labels=counted.labels,
+                metrics=counted.metrics,
                 children={
                     child.key or str(child.id): build(child)
                     for child in sorted(children[row.id], key=lambda value: value.id)
@@ -436,21 +438,6 @@ class PolicyEnforcer:
             snap_seq=cast("int", values[12]),
             finished_at=cast("datetime | None", values[13]),
         )
-
-    async def _metrics(self, conn: AsyncConnection, ids: list[UUID]) -> dict[UUID, dict[str, int]]:
-        result = await conn.execute(
-            select(
-                self.tables.metric.c.batch_id,
-                self.tables.metric.c.name,
-                func.sum(self.tables.metric.c.value),
-            )
-            .where(self.tables.metric.c.batch_id.in_(ids))
-            .group_by(self.tables.metric.c.batch_id, self.tables.metric.c.name)
-        )
-        values: defaultdict[UUID, dict[str, int]] = defaultdict(dict)
-        for batch_id, name, value in result:
-            values[batch_id][name] = int(value)
-        return dict(values)
 
     async def _record_hook_failure(self, failure: _HookCallError) -> int:
         batch = self.tables.batch
