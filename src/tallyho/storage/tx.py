@@ -10,8 +10,10 @@
   повторяет её целиком на ``40001`` (serialization failure), ``40P01``
   (deadlock) и ``55P03`` (lock not available) с экспоненциальным backoff и
   джиттером;
-* :func:`after_commit` вызывает колбэк только после commit внешней транзакции
-  пользователя (откат транзакции или savepoint'а его отбрасывает);
+* :func:`after_commit` вызывает колбэк только после подтверждённого COMMIT
+  внешней транзакции (откат транзакции или savepoint'а и ошибка COMMIT его
+  отбрасывают); своя транзакция — :func:`begin_transaction` /
+  :func:`own_transaction` — доставляет колбэки сразу по выходе;
 * tx-хук получает :class:`HookSession` (:func:`hook_session`): commit, rollback
   и close в ней бросают ``HookTransactionError``.
 """
@@ -26,7 +28,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import timedelta
 from typing import TYPE_CHECKING, Final, TypeVar, cast
-from weakref import WeakKeyDictionary
+from weakref import WeakKeyDictionary, WeakSet
 
 from sqlalchemy import event, text
 from sqlalchemy.exc import DBAPIError
@@ -38,7 +40,13 @@ from tallyho.model.errors import ConcurrentModification, HookTransactionError
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Awaitable
 
-    from sqlalchemy.engine import Connection
+    from sqlalchemy.engine import (
+        Connection,
+        Dialect,
+        Engine,
+        ExceptionContext,
+        RootTransaction,
+    )
     from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
     from sqlalchemy.orm import Session, SessionTransaction
 
@@ -50,6 +58,7 @@ __all__ = [
     "TxSettings",
     "after_commit",
     "after_commit_pending",
+    "begin_transaction",
     "hook_session",
     "is_retryable",
     "own_transaction",
@@ -171,10 +180,11 @@ async def set_local_timeouts(conn: AsyncConnection, settings: TxSettings) -> Non
 async def own_transaction(
     engine: AsyncEngine, settings: TxSettings | None = None
 ) -> AsyncGenerator[AsyncConnection]:
-    """Своя транзакция: ``engine.begin()`` + ``SET LOCAL`` таймаутов.
+    """Своя транзакция: :func:`begin_transaction` + ``SET LOCAL`` таймаутов.
 
-    Commit — при выходе без исключения, иначе rollback. Одна попытка, без
-    повтора: повторяет :func:`run_transaction`.
+    Commit — при выходе без исключения, иначе rollback; колбэки
+    :func:`after_commit` вызываются после подтверждённого COMMIT, до возврата
+    управления. Одна попытка, без повтора: повторяет :func:`run_transaction`.
 
     Args:
         engine: Движок БД.
@@ -183,7 +193,7 @@ async def own_transaction(
     Yields:
         Соединение в открытой транзакции.
     """
-    async with engine.begin() as conn:
+    async with begin_transaction(engine) as conn:
         await set_local_timeouts(conn, settings or TxSettings())
         yield conn
 
@@ -274,6 +284,27 @@ AfterCommit = Callable[[], object]
 """Колбэк после commit: синхронный, без аргументов; результат игнорируется."""
 
 _NOT_STARTED = "AsyncConnection ещё не открыт: after_commit нужен в транзакции"
+_SPIN_SECONDS: Final = 0.005
+_MAX_POLL_SECONDS: Final = 0.05
+
+
+@dataclass(eq=False)
+class _Commit:
+    """Колбэки транзакции соединения, чей COMMIT отправлен, но ещё не подтверждён.
+
+    Событие ``commit`` соединения SQLAlchemy срабатывает до отправки COMMIT.
+    Исход виден позже: корневая транзакция становится неактивной при любом
+    исходе, а ошибка COMMIT до этого проходит через ``handle_error`` движка
+    (``failed``).
+    """
+
+    transaction: RootTransaction
+    callbacks: list[AfterCommit]
+    failed: bool = False
+
+    @property
+    def in_flight(self) -> bool:
+        return self.transaction.is_active and not self.failed
 
 
 @dataclass(eq=False)
@@ -286,11 +317,15 @@ class _Pending:
     закрывается всегда вершина стека. Если стек пуст, закрывается savepoint,
     открытый до первой регистрации, — он старше всех колбэков, и его откат
     отбрасывает всё.
+
+    ``commits`` бывают только у соединения: транзакции, чей COMMIT отправлен, а
+    исход ещё не разобран (:func:`_settle`).
     """
 
     callbacks: list[AfterCommit] = field(default_factory=list)
     stack: list[int] = field(default_factory=list)
     released: set[object] = field(default_factory=set)
+    commits: list[_Commit] = field(default_factory=list)
 
     def savepoint_started(self) -> None:
         self.stack.append(len(self.callbacks))
@@ -300,16 +335,28 @@ class _Pending:
         if rolled_back:
             del self.callbacks[start:]
 
-    def committed(self) -> None:
+    def take(self) -> list[AfterCommit]:
         callbacks = self.callbacks
         self.reset()
-        for callback in callbacks:
-            _run_callback(callback)
+        return callbacks
+
+    def committed(self) -> None:
+        _run_callbacks(self.take())
 
     def reset(self) -> None:
         self.callbacks = []
         self.stack.clear()
         self.released.clear()
+
+    def waiting(self, callback: AfterCommit) -> bool:
+        if callback in self.callbacks:
+            return True
+        return any(commit.in_flight and callback in commit.callbacks for commit in self.commits)
+
+
+def _run_callbacks(callbacks: list[AfterCommit]) -> None:
+    for callback in callbacks:
+        _run_callback(callback)
 
 
 def _run_callback(callback: AfterCommit) -> None:
@@ -324,6 +371,8 @@ def _run_callback(callback: AfterCommit) -> None:
 
 _sessions: WeakKeyDictionary[Session, _Pending] = WeakKeyDictionary()
 _connections: WeakKeyDictionary[Connection, _Pending] = WeakKeyDictionary()
+_owned: WeakSet[Connection] = WeakSet()
+_watched: WeakSet[Dialect] = WeakSet()
 
 
 def _session_pending(session: Session) -> _Pending:
@@ -337,7 +386,8 @@ def _session_pending(session: Session) -> _Pending:
             pending.savepoint_started()
 
     def on_commit(sess: Session) -> None:
-        # after_commit срабатывает и на release savepoint'а, пока он ещё текущий.
+        # after_commit сессии срабатывает после COMMIT драйвера, а также на
+        # release savepoint'а, пока он ещё текущий.
         nested = sess.get_nested_transaction()
         if nested is None:
             pending.committed()
@@ -358,6 +408,67 @@ def _session_pending(session: Session) -> _Pending:
     return pending
 
 
+def _settle(pending: _Pending) -> None:
+    """Разобрать транзакции, чей COMMIT завершился: при успехе вызвать колбэки.
+
+    Порядок commit'ов сохраняется: пока самый старый COMMIT в пути, более
+    новые не разбираются.
+    """
+    while pending.commits and not pending.commits[0].in_flight:
+        commit = pending.commits.pop(0)
+        if not commit.failed:
+            _run_callbacks(commit.callbacks)
+
+
+def _on_engine_error(context: ExceptionContext) -> None:
+    # До этого события корневая транзакция с упавшим COMMIT ещё активна, после —
+    # неактивна при любом исходе: отличить ошибку COMMIT можно только здесь.
+    conn = context.connection
+    pending = None if conn is None else _connections.get(conn)
+    if pending is None:
+        return
+    for commit in pending.commits:
+        if commit.transaction.is_active:
+            commit.failed = True
+
+
+def _watch_errors(engine: Engine) -> None:
+    # handle_error слушается на диалекте движка; движки из execution_options()
+    # делят диалект с родителем, поэтому слушатель ставится один раз на диалект.
+    dialect = engine.dialect
+    if dialect in _watched:
+        return
+    event.listen(engine, "handle_error", _on_engine_error)
+    _watched.add(dialect)
+
+
+def _deliver_later(pending: _Pending) -> None:
+    """Опрашивать соединение пользователя, пока его COMMIT не завершится.
+
+    Первые миллисекунды — на каждом проходе event loop (COMMIT обычно короче),
+    затем с растущей паузой до :data:`_MAX_POLL_SECONDS`. Раньше опроса
+    колбэки доставят начало следующей транзакции соединения и вызовы
+    :func:`after_commit` / :func:`after_commit_pending`.
+    """
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return  # вне event loop колбэки доставят следующие обращения к соединению
+    started = loop.time()
+
+    def check() -> None:
+        _settle(pending)
+        if not pending.commits:
+            return
+        elapsed = loop.time() - started
+        if elapsed < _SPIN_SECONDS:
+            _ = loop.call_soon(check)
+        else:
+            _ = loop.call_later(min(elapsed / 2, _MAX_POLL_SECONDS), check)
+
+    _ = loop.call_soon(check)
+
+
 def _connection_pending(conn: Connection) -> _Pending:
     pending = _connections.get(conn)
     if pending is not None:
@@ -375,8 +486,20 @@ def _connection_pending(conn: Connection) -> _Pending:
     def on_rollback_savepoint(_conn: Connection, _name: str, _context: object) -> None:
         pending.savepoint_ended(rolled_back=True)
 
-    def on_commit(_conn: Connection) -> None:
-        pending.committed()
+    def on_begin(_conn: Connection) -> None:
+        # Новая транзакция: COMMIT предыдущей точно завершился.
+        _settle(pending)
+
+    def on_commit(sync: Connection) -> None:
+        # Событие срабатывает ДО отправки COMMIT: колбэки ждут его исхода.
+        callbacks = pending.take()
+        transaction = sync.get_transaction()
+        if not callbacks or transaction is None:
+            return
+        pending.commits.append(_Commit(transaction, callbacks))
+        _watch_errors(sync.engine)
+        if sync not in _owned:
+            _deliver_later(pending)
 
     def on_rollback(_conn: Connection) -> None:
         pending.reset()
@@ -384,9 +507,44 @@ def _connection_pending(conn: Connection) -> _Pending:
     event.listen(conn, "savepoint", on_savepoint)
     event.listen(conn, "release_savepoint", on_release)
     event.listen(conn, "rollback_savepoint", on_rollback_savepoint)
+    event.listen(conn, "begin", on_begin)
     event.listen(conn, "commit", on_commit)
     event.listen(conn, "rollback", on_rollback)
     return pending
+
+
+@contextlib.asynccontextmanager
+async def begin_transaction(engine: AsyncEngine) -> AsyncGenerator[AsyncConnection]:
+    """Своя транзакция ``engine.begin()`` с доставкой :func:`after_commit` по выходе.
+
+    Колбэки, зарегистрированные на соединении, вызываются сразу после
+    успешного выхода из ``engine.begin()``, когда COMMIT уже подтверждён, и до
+    возврата управления вызывающему. Исключение (в том числе ошибка COMMIT)
+    их отбрасывает.
+
+    Args:
+        engine: Движок БД.
+
+    Yields:
+        Соединение в открытой транзакции.
+    """
+    sync: Connection | None = None
+    try:
+        async with engine.begin() as conn:
+            sync = conn.sync_connection
+            if sync is not None:
+                _owned.add(sync)
+            yield conn
+    except BaseException:
+        if sync is not None:
+            _ = _connections.pop(sync, None)
+        raise
+    finally:
+        if sync is not None:
+            _owned.discard(sync)
+    pending = None if sync is None else _connections.pop(sync, None)
+    if pending is not None:
+        _settle(pending)
 
 
 async def after_commit(target: AsyncSession | AsyncConnection, callback: AfterCommit) -> None:
@@ -394,20 +552,23 @@ async def after_commit(target: AsyncSession | AsyncConnection, callback: AfterCo
 
     Колбэк привязан к текущему уровню транзакции: откат savepoint'а (или всей
     транзакции) отбрасывает его, release savepoint'а передаёт родителю, а
-    commit корневой транзакции вызывает — ровно один раз. Колбэки вызываются в
-    порядке регистрации; исключение колбэка логируется и не мешает остальным.
+    успешный COMMIT корневой транзакции вызывает — ровно один раз и только
+    после того, как COMMIT подтверждён (ARCHITECTURE §11.1). Ошибка COMMIT
+    колбэк отбрасывает. Колбэки вызываются в порядке регистрации; исключение
+    колбэка логируется и не мешает остальным.
 
-    * ``AsyncSession`` — события ``sync_session``; колбэк вызывается после
-      успешного COMMIT. Сессия начинает транзакцию, если её ещё нет.
-    * ``AsyncConnection`` — события ``Connection``. В SQLAlchemy нет события
-      после COMMIT соединения, поэтому колбэк вызывается событием ``commit``
-      непосредственно **перед** отправкой COMMIT. Если COMMIT упадёт, колбэк
-      уже вызван, а данные транзакции могут быть ещё не видны другим
-      соединениям. Колбэк должен только подталкивать фоновую работу, которая
-      перечитывает БД сама и страхуется опросом (relay scan, sweeper).
+    * ``AsyncSession`` — событие ``after_commit`` сессии, после COMMIT
+      драйвера. Сессия начинает транзакцию, если её ещё нет.
+    * Соединение своей транзакции (:func:`begin_transaction`,
+      :func:`own_transaction`) — сразу по выходе из неё.
+    * ``AsyncConnection`` пользователя — событие ``commit`` соединения
+      срабатывает до отправки COMMIT, поэтому колбэк ждёт его исхода и
+      вызывается в ближайшем проходе event loop после COMMIT или при
+      следующем обращении к соединению, но не внутри ``await conn.commit()``.
+      Ошибку COMMIT библиотека узнаёт событием ``handle_error`` движка.
 
     Args:
-        target: Сессия или соединение пользователя.
+        target: Сессия или соединение.
         callback: Синхронная функция без аргументов; должна быть быстрой.
 
     Raises:
@@ -423,7 +584,9 @@ async def after_commit(target: AsyncSession | AsyncConnection, callback: AfterCo
     sync = target.sync_connection
     if sync is None:
         raise TypeError(_NOT_STARTED)
-    _connection_pending(sync).callbacks.append(callback)
+    pending = _connection_pending(sync)
+    _settle(pending)
+    pending.callbacks.append(callback)
 
 
 async def after_commit_pending(
@@ -432,10 +595,13 @@ async def after_commit_pending(
     """Ждёт ли ``callback`` commit транзакции ``target``.
 
     ``True`` — колбэк зарегистрирован :func:`after_commit`, а записи его уровня
-    транзакции ещё в силе: commit не было, savepoint и транзакция не откатаны.
-    После commit (колбэк вызван) и после отката — ``False``. По ответу
-    вызывающий отличает «моя запись в этой транзакции ещё действует» от «её
-    откатили, пишем заново».
+    транзакции ещё в силе: commit не было (или COMMIT ещё в пути), savepoint и
+    транзакция не откатаны. После commit (колбэк вызван) и после отката —
+    ``False``. По ответу вызывающий отличает «моя запись в этой транзакции ещё
+    действует» от «её откатили, пишем заново».
+
+    Для ``AsyncConnection`` сначала доставляет колбэки завершившихся COMMIT:
+    после ``await conn.commit()`` колбэк вызван к моменту ответа.
 
     Args:
         target: Сессия или соединение, переданные в :func:`after_commit`.
@@ -451,7 +617,9 @@ async def after_commit_pending(
     else:
         sync = target.sync_connection
         pending = None if sync is None else _connections.get(sync)
-    return pending is not None and callback in pending.callbacks
+        if pending is not None:
+            _settle(pending)
+    return pending is not None and pending.waiting(callback)
 
 
 # --- HookSession ----------------------------------------------------------------------

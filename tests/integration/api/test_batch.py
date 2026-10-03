@@ -166,6 +166,23 @@ async def test_empty_batch_is_finalized_immediately_after_commit(th: Tallyho) ->
     assert view.progress.final
 
 
+async def test_empty_batches_in_own_transaction_are_finalized_without_maintenance(
+    th: Tallyho,
+) -> None:
+    """Fix-16: финализация после seal видит закоммиченный батч, а не ждёт sweeper."""
+    handles: list[BatchHandle] = []
+    for index in range(200):
+        async with th.batch(kind="empty", key=f"many:{index}") as root:
+            pass
+        handles.append(root.handle)
+
+    # aclose дожидается задач финализации после commit; maintenance не запускался.
+    await th.aclose()
+    states = [(await handle.view()).state for handle in handles]
+
+    assert states.count(BatchState.SUCCEEDED) == len(handles)
+
+
 async def test_cancel_right_after_seal_never_finalizes_succeeded(th: Tallyho) -> None:
     """Fix-9: отмена сразу после выхода из builder гонится с финализацией после seal."""
     # Старт отложен: relay после commit не отправляет Items, и отмена закрывает их сразу.

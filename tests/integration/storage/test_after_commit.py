@@ -64,20 +64,35 @@ async def _write(target: Target, probe: Probe, value: int) -> None:
     await insert_id(await resolve_connection(target), probe, value)
 
 
+def _nothing() -> None:
+    """Колбэк, который никто не регистрирует: только для опроса состояния."""
+
+
+async def _commit(target: Target) -> None:
+    """Commit и доставка колбэков, которые COMMIT уже подтвердил.
+
+    Колбэк ``AsyncConnection`` вызывается не внутри ``commit()``, а после
+    подтверждённого COMMIT (Fix-16): ``after_commit_pending`` доставляет его
+    сразу, не дожидаясь прохода event loop.
+    """
+    await target.commit()
+    assert not await after_commit_pending(target, _nothing)
+
+
 async def test_called_once_after_commit(engine: AsyncEngine, target: Target, probe: Probe) -> None:
     calls = Calls()
     await _write(target, probe, 1)
     await after_commit(target, calls.callback("a"))
 
     assert calls.names == []
-    await target.commit()
+    await _commit(target)
 
     assert calls.names == ["a"]
     assert await committed_ids(engine, probe) == [1]
 
     # Следующая транзакция той же сессии/соединения старые колбэки не вызывает.
     await _write(target, probe, 2)
-    await target.commit()
+    await _commit(target)
     assert calls.names == ["a"]
 
 
@@ -88,7 +103,7 @@ async def test_not_called_on_rollback(target: Target, probe: Probe) -> None:
 
     await target.rollback()
     await _write(target, probe, 2)
-    await target.commit()
+    await _commit(target)
 
     assert calls.names == []
 
@@ -99,7 +114,7 @@ async def test_callbacks_run_in_registration_order(target: Target, probe: Probe)
     for name in ("a", "b", "c"):
         await after_commit(target, calls.callback(name))
 
-    await target.commit()
+    await _commit(target)
 
     assert calls.names == ["a", "b", "c"]
 
@@ -115,7 +130,7 @@ async def test_savepoint_rollback_discards_its_callbacks(target: Target, probe: 
     await nested.rollback()
     assert calls.names == []
     await after_commit(target, calls.callback("after"))
-    await target.commit()
+    await _commit(target)
 
     assert calls.names == ["outer", "after"]
 
@@ -128,7 +143,7 @@ async def test_released_savepoint_passes_callbacks_to_parent(target: Target, pro
 
     await nested.commit()
     assert calls.names == []
-    await target.commit()
+    await _commit(target)
 
     assert calls.names == ["inner"]
 
@@ -145,7 +160,7 @@ async def test_outer_savepoint_rollback_discards_released_inner(
     await inner.commit()
 
     await outer.rollback()
-    await target.commit()
+    await _commit(target)
 
     assert calls.names == ["root"]
 
@@ -157,7 +172,7 @@ async def test_savepoint_opened_before_first_registration(target: Target, probe:
     await after_commit(target, calls.callback("inner"))
 
     await nested.rollback()
-    await target.commit()
+    await _commit(target)
 
     assert calls.names == []
 
@@ -168,7 +183,7 @@ async def test_root_commit_with_open_savepoint_fires(target: Target, probe: Prob
     _ = await target.begin_nested()
     await after_commit(target, calls.callback("inner"))
 
-    await target.commit()
+    await _commit(target)
 
     assert calls.names == ["inner"]
 
@@ -210,7 +225,7 @@ async def test_failing_callback_is_logged_and_others_run(
     await after_commit(target, calls.callback("next"))
 
     with caplog.at_level(logging.ERROR, logger="tallyho.storage.tx"):
-        await target.commit()
+        await _commit(target)
 
     assert calls.names == ["next"]
     assert await committed_ids(engine, probe) == [1]
@@ -241,7 +256,7 @@ async def test_pending_until_commit(target: Target, probe: Probe) -> None:
     assert await after_commit_pending(target, callback)
     assert not await after_commit_pending(target, calls.callback("other"))
 
-    await target.commit()
+    await _commit(target)
     assert calls.names == ["a"]
     assert not await after_commit_pending(target, callback)
 
@@ -270,7 +285,7 @@ async def test_pending_follows_savepoint_outcome(target: Target, probe: Probe) -
     # Release оставляет запись уровня в силе, откат savepoint'а — отменяет.
     assert await after_commit_pending(target, kept)
     assert not await after_commit_pending(target, dropped)
-    await target.commit()
+    await _commit(target)
     assert calls.names == ["kept"]
 
 

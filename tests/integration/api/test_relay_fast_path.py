@@ -152,6 +152,47 @@ async def test_commit_dispatches_noticeably_faster_than_relay_grace(
     assert (await env.counters(batch_id)).dispatched == 3
 
 
+def received(dispatcher: RecordingDispatcher, count: int) -> Callable[[], bool]:
+    """Условие «брокер принял ``count`` сообщений»."""
+    return lambda: len(dispatcher.messages) == count
+
+
+async def test_kick_after_own_commit_dispatches_without_scan(env: Env, clients: Clients) -> None:
+    """Fix-16: kick своей транзакции приходит после COMMIT, scan для отправки не нужен."""
+    dispatcher = RecordingDispatcher()
+    # Scan и grace — час: всё, что отправлено за секунды, отправил fast-path.
+    hour = timedelta(hours=1)
+    th = clients(dispatcher, relay_grace=hour, sweep_interval=hour)
+
+    for number in range(1, 21):
+        batch_id = await create_batch(th, f"kick:{number}", addresses=1)
+        await eventually(received(dispatcher, number), deadline=2.0)
+        assert dispatcher.messages[-1].batch_id == batch_id
+
+    await th.aclose()
+    assert await outbox_size(env) == 0
+
+
+async def test_kick_after_user_connection_commit_dispatches_without_scan(
+    env: Env, clients: Clients
+) -> None:
+    """Fix-16: то же для ``AsyncConnection`` пользователя: kick после его COMMIT."""
+    dispatcher = RecordingDispatcher()
+    hour = timedelta(hours=1)
+    th = clients(dispatcher, relay_grace=hour, sweep_interval=hour)
+
+    for number in range(1, 21):
+        async with env.engine.connect() as conn:
+            async with th.batch(kind="mailing", key=f"conn:{number}", session=conn) as batch:
+                await batch.add(send_email, "user@example.test")
+            await conn.commit()
+        await eventually(received(dispatcher, number), deadline=2.0)
+        assert dispatcher.messages[-1].batch_id == batch.handle.id
+
+    await th.aclose()
+    assert await outbox_size(env) == 0
+
+
 async def test_commit_of_user_session_dispatches_after_commit_only(
     env: Env, clients: Clients
 ) -> None:

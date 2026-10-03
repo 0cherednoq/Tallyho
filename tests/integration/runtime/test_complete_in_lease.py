@@ -363,6 +363,38 @@ async def test_repeated_call_in_same_transaction_is_noop(
     assert (counters.ok, counters.error, counters.pending) == (1, 0, 0)
 
 
+async def test_repeated_call_right_after_connection_commit_is_noop(
+    env: Env, probe: Table[ProbeColumns]
+) -> None:
+    """Fix-16: колбэк AsyncConnection вызывается после COMMIT, а не внутри commit()."""
+    seeded = await seed(env, 1)
+    ref = seeded.refs[0]
+    outcomes: list[str] = []
+    async with open_completer(env) as completer:
+
+        async def task(**_kwargs: object) -> None:
+            async with env.connection() as conn:
+                await insert_id(conn, probe, 1)
+                item.ok("first")
+                await item.complete_in(conn)
+                await conn.commit()
+                # Без прохода event loop: колбэк COMMIT ещё не доставлен опросом.
+                item.error("second")
+                try:
+                    await item.complete_in(conn)
+                except LeaseLostError:
+                    outcomes.append("lease lost")
+                else:
+                    outcomes.append("noop")
+                await conn.rollback()
+
+        await _runtime(completer).wrap(task)(_th=_marker(ref))
+
+    assert outcomes == ["noop"]
+    assert await committed_ids(env.engine, probe) == [1]
+    assert await _item(env, ref.id) == (ItemState.OK, "first", 0)
+
+
 async def test_repeated_call_in_another_open_transaction_is_rejected(
     env: Env, probe: Table[ProbeColumns]
 ) -> None:
