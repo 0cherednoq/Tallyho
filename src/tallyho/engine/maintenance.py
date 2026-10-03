@@ -18,7 +18,14 @@ from tallyho.model.errors import ConfigurationError
 from tallyho.protocols.clock import SystemClock
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Callable, Iterable
+    from collections.abc import (
+        AsyncGenerator,
+        AsyncIterator,
+        Awaitable,
+        Callable,
+        Coroutine,
+        Iterable,
+    )
     from uuid import UUID
 
     from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
@@ -378,24 +385,28 @@ class ProgressWatcher:
         if self.throttle <= timedelta(0):
             raise ConfigurationError(_POSITIVE_INTERVALS)
 
-    async def watch(self, batch_id: UUID) -> AsyncIterator[BatchView]:
+    async def watch(self, batch_id: UUID) -> AsyncGenerator[BatchView]:
         """Yield the initial view, changed updates, and exactly one terminal view.
 
         LISTEN is installed before the initial read. A timeout read also closes
         the delivery gap caused by a listener connection loss or an emitter that
         died immediately before publishing its notification.
+
+        Closing the stream (``aclose``, cancellation of the consumer) waits until
+        the listener connection is back in the pool without a subscription: the
+        LISTEN/UNLISTEN steps are never interrupted, and a step that fails
+        invalidates the connection instead of returning it (Fix-17).
         """
         output: asyncio.Queue[BatchView | None] = asyncio.Queue()
         task = asyncio.create_task(self._produce(batch_id, output))
         try:
             while (view := await output.get()) is not None:
                 yield view
-            await task
         finally:
-            if not task.done():
-                task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await task
+            _ = task.cancel()
+            await _settle(task)
+            if not task.cancelled() and (error := task.exception()) is not None:
+                raise error
 
     async def _produce(
         self,
@@ -403,79 +414,19 @@ class ProgressWatcher:
         output: asyncio.Queue[BatchView | None],
     ) -> None:
         queue = asyncio.Event()
-
-        def received(_connection: object, _pid: int, _channel: str, payload: str) -> None:
-            if payload == str(batch_id):
-                queue.set()
-
         try:
             async with self.engine.connect() as conn:
                 raw = await conn.get_raw_connection()
                 driver = cast("object", raw.driver_connection)
-                if isinstance(driver, _AsyncpgListener):
-                    await self._with_asyncpg(
-                        driver,
-                        received=received,
-                        batch_id=batch_id,
-                        queue=queue,
-                        output=output,
-                    )
-                elif isinstance(driver, _PsycopgListener):
-                    await self._with_psycopg(
-                        driver,
-                        conn=conn,
-                        batch_id=batch_id,
-                        queue=queue,
-                        output=output,
-                    )
-                else:
-                    raise ConfigurationError(_LISTENER_UNSUPPORTED)
+                subscription = _subscription(driver, conn=conn, batch_id=batch_id, queue=queue)
+                try:
+                    await _uninterrupted(_guarded(conn, subscription.subscribe()))
+                    await self._poll(batch_id, queue, output)
+                finally:
+                    if not conn.invalidated:
+                        await _uninterrupted(_guarded(conn, subscription.unsubscribe()))
         finally:
             await output.put(None)
-
-    async def _with_asyncpg(
-        self,
-        driver: _AsyncpgListener,
-        *,
-        received: Callable[[object, int, str, str], None],
-        batch_id: UUID,
-        queue: asyncio.Event,
-        output: asyncio.Queue[BatchView | None],
-    ) -> None:
-        await driver.add_listener(_CHANNEL, received)
-        try:
-            await self._poll(batch_id, queue, output)
-        finally:
-            await driver.remove_listener(_CHANNEL, received)
-
-    async def _with_psycopg(
-        self,
-        driver: _PsycopgListener,
-        *,
-        conn: AsyncConnection,
-        batch_id: UUID,
-        queue: asyncio.Event,
-        output: asyncio.Queue[BatchView | None],
-    ) -> None:
-        _ = await conn.exec_driver_sql(f"LISTEN {_CHANNEL}")
-        await conn.commit()
-        task = asyncio.create_task(self._pump_psycopg(driver, batch_id, queue))
-        try:
-            await self._poll(batch_id, queue, output)
-        finally:
-            task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await task
-
-    @staticmethod
-    async def _pump_psycopg(
-        driver: _PsycopgListener,
-        batch_id: UUID,
-        queue: asyncio.Event,
-    ) -> None:
-        async for notification in driver.notifies():
-            if notification.payload == str(batch_id):
-                queue.set()
 
     async def _poll(
         self,
@@ -505,3 +456,115 @@ class ProgressWatcher:
                 last_yield = loop.time()
             if current.state.is_terminal:
                 return
+
+
+class _Subscription(Protocol):
+    async def subscribe(self) -> None: ...
+
+    async def unsubscribe(self) -> None: ...
+
+
+@dataclass(eq=False, slots=True)
+class _AsyncpgSubscription:
+    """asyncpg calls ``callback``; ``remove_listener`` of the last callback sends UNLISTEN."""
+
+    driver: _AsyncpgListener
+    callback: Callable[[object, int, str, str], None]
+
+    async def subscribe(self) -> None:
+        await self.driver.add_listener(_CHANNEL, self.callback)
+
+    async def unsubscribe(self) -> None:
+        await self.driver.remove_listener(_CHANNEL, self.callback)
+
+
+@dataclass(eq=False, slots=True)
+class _PsycopgSubscription:
+    """LISTEN through the SQLAlchemy connection and a pump over ``notifies()``."""
+
+    driver: _PsycopgListener
+    conn: AsyncConnection
+    batch_id: UUID
+    queue: asyncio.Event
+    pumps: list[asyncio.Task[None]] = field(default_factory=list[asyncio.Task[None]])
+
+    async def subscribe(self) -> None:
+        _ = await self.conn.exec_driver_sql(f"LISTEN {_CHANNEL}")
+        await self.conn.commit()
+        self.pumps.append(asyncio.create_task(self._pump()))
+
+    async def unsubscribe(self) -> None:
+        while self.pumps:
+            pump = self.pumps.pop()
+            _ = pump.cancel()
+            await _settle(pump)
+            if not pump.cancelled() and (error := pump.exception()) is not None:
+                raise error
+        # psycopg и пул SQLAlchemy подписку при возврате соединения не снимают.
+        _ = await self.conn.exec_driver_sql(f"UNLISTEN {_CHANNEL}")
+        await self.conn.commit()
+
+    async def _pump(self) -> None:
+        async for notification in self.driver.notifies():
+            if notification.payload == str(self.batch_id):
+                self.queue.set()
+
+
+def _subscription(
+    driver: object,
+    *,
+    conn: AsyncConnection,
+    batch_id: UUID,
+    queue: asyncio.Event,
+) -> _Subscription:
+    if isinstance(driver, _AsyncpgListener):
+
+        def received(_connection: object, _pid: int, _channel: str, payload: str) -> None:
+            if payload == str(batch_id):
+                queue.set()
+
+        return _AsyncpgSubscription(driver, received)
+    if isinstance(driver, _PsycopgListener):
+        return _PsycopgSubscription(driver, conn, batch_id, queue)
+    raise ConfigurationError(_LISTENER_UNSUPPORTED)
+
+
+async def _settle(task: asyncio.Task[None]) -> None:
+    """Wait until ``task`` is done; a cancellation of the caller is re-raised only then.
+
+    ``asyncio.wait`` neither cancels ``task`` with the caller nor raises its
+    outcome, so the caller still decides what to do with the result.
+    """
+    interrupted: asyncio.CancelledError | None = None
+    while not task.done():
+        try:
+            _ = await asyncio.wait((task,))
+        except asyncio.CancelledError as exc:
+            interrupted = exc
+    if interrupted is not None:
+        raise interrupted
+
+
+async def _uninterrupted(step: Coroutine[object, object, None]) -> None:
+    """Run ``step`` to completion even if the caller is cancelled meanwhile.
+
+    A cancelled asyncpg query may leave UNLISTEN unsent, or an unsynced Parse
+    that opens an implicit transaction on a pooled connection (Fix-17). The
+    failure of ``step`` is re-raised; so is a deferred cancellation.
+    """
+    task = asyncio.create_task(step)
+    try:
+        await _settle(task)
+    finally:
+        error = None if task.cancelled() else task.exception()
+    if error is not None:
+        raise error
+
+
+async def _guarded(conn: AsyncConnection, step: Awaitable[None]) -> None:
+    """Invalidate ``conn`` if a LISTEN/UNLISTEN step fails: its state is unknown."""
+    try:
+        await step
+    except BaseException:
+        await conn.invalidate()
+        raise
