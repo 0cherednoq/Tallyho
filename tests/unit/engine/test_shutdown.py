@@ -25,6 +25,7 @@ __all__: list[str] = []
 
 START = datetime(2026, 10, 2, 12, tzinfo=UTC)
 PATIENCE = 5.0
+MESSAGE = "закрытие сорвалось"
 
 
 def budget(seconds: float = 5.0) -> Budget:
@@ -145,16 +146,84 @@ async def test_run_in_gives_up_on_unresponsive_foreign_loop(
     release = threading.Event()
     # Loop «работает», но занят синхронным кодом и до нашей корутины не дойдёт.
     _ = foreign.loop.call_soon_threadsafe(release.wait)
-    probe = Probe()
+    made: list[str] = []
+
+    def make() -> Coroutine[object, object, None]:
+        made.append("made")
+        return asyncio.sleep(0)
 
     try:
         with caplog.at_level(logging.WARNING, logger="tallyho.engine.shutdown"):
-            await run_in(foreign.loop, probe.run, patience=0.05)
+            await run_in(foreign.loop, make, patience=0.05)
     finally:
         release.set()
+    # Loop освободился и разобрал очередь: опоздавшую корутину он так и не создал.
+    await foreign.run(asyncio.sleep(0))
 
-    assert probe.loops == []
+    assert made == []
     assert "не ответил" in caplog.text
+
+
+async def test_run_in_cancels_started_coroutine_it_gave_up_on(
+    foreign: LoopThread, caplog: pytest.LogCaptureFixture
+) -> None:
+    cancelled = threading.Event()
+
+    async def stuck() -> None:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    # Срок с запасом: свободный loop успевает начать корутину, она не завершается.
+    with caplog.at_level(logging.WARNING, logger="tallyho.engine.shutdown"):
+        await run_in(foreign.loop, stuck, patience=0.5)
+
+    assert await asyncio.to_thread(cancelled.wait, PATIENCE)
+    assert "не ответил" in caplog.text
+
+
+async def test_run_in_raises_what_foreign_coroutine_raised(foreign: LoopThread) -> None:
+    async def failing() -> None:
+        await asyncio.sleep(0)
+        raise CompleterError(MESSAGE)
+
+    with pytest.raises(CompleterError, match=MESSAGE):
+        await run_in(foreign.loop, failing, patience=PATIENCE)
+
+
+async def test_run_in_raises_when_factory_fails_in_foreign_loop(foreign: LoopThread) -> None:
+    def make() -> Coroutine[object, object, None]:
+        raise CompleterError(MESSAGE)
+
+    foreign.loop.set_exception_handler(lambda _loop, _context: None)
+
+    with pytest.raises(CompleterError, match=MESSAGE):
+        await run_in(foreign.loop, make, patience=PATIENCE)
+
+
+async def test_run_in_tolerates_foreign_loop_closed_while_waiting(
+    foreign: LoopThread, caplog: pytest.LogCaptureFixture
+) -> None:
+    started = threading.Event()
+
+    async def stuck() -> None:
+        started.set()
+        await asyncio.Event().wait()
+
+    async def close_when_started() -> None:
+        assert await asyncio.to_thread(started.wait, PATIENCE)
+        foreign.close()
+
+    # Брошенная задача закрытого loop пишет «Task was destroyed»: здесь это ожидаемо.
+    foreign.loop.set_exception_handler(lambda _loop, _context: None)
+    closer = asyncio.create_task(close_when_started())
+    with caplog.at_level(logging.WARNING, logger="tallyho.engine.shutdown"):
+        await run_in(foreign.loop, stuck, patience=0.5)
+    await closer
+
+    assert "задачу не отменить" in caplog.text
 
 
 class BusyLoop(asyncio.SelectorEventLoop):
