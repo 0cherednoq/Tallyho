@@ -11,9 +11,10 @@ relay воркера — к loop исполнителя брокера), а ``Ta
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import logging
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Final, Protocol
+from typing import TYPE_CHECKING, Final, Protocol, final
 
 from tallyho.model.errors import CompleterError
 
@@ -82,9 +83,11 @@ async def run_in(
 ) -> None:
     """Выполнить корутину в event loop владельца и дождаться её.
 
-    Свой loop — напрямую. Чужой работающий — через
-    ``run_coroutine_threadsafe``. Чужой остановленный, но не закрытый (flexiq
-    останавливает loop исполнителя при выходе из ``run_worker``) — этот loop
+    Свой loop — напрямую. Чужой работающий — передачей фабрики в этот loop
+    (:class:`_Handover`): корутина создаётся там, а если loop не ответил за
+    ``patience``, не создаётся вовсе или отменяется. Чужой остановленный, но
+    не закрытый (flexiq останавливает loop исполнителя при выходе из
+    ``run_worker``) — этот loop
     докручивается в служебном потоке, пока корутина не завершится. Закрытый
     loop пропускается: его задачи уже не выполнятся.
 
@@ -95,8 +98,8 @@ async def run_in(
 
     Args:
         owner: Loop владельца; ``None`` — компонент ни к чему не привязан.
-        make: Фабрика корутины: вызывается ровно один раз, если корутину есть
-            где выполнить.
+        make: Фабрика корутины: вызывается не больше одного раза. Корутину,
+            которую негде выполнить, не создают или закрывают.
         patience: Сколько секунд ждать ответа чужого работающего loop. Свой
             срок корутина соблюдает сама; это страховка от loop, который
             остановили, пока закрытие ждало.
@@ -111,12 +114,70 @@ async def run_in(
     if not owner.is_running():
         await asyncio.to_thread(_drive, owner, make)
         return
-    future = asyncio.run_coroutine_threadsafe(make(), owner)
+    handover = _Handover(owner, make)
     try:
         async with asyncio.timeout(patience):
-            await asyncio.wrap_future(future)
+            await asyncio.wrap_future(handover.result)
     except TimeoutError:
         _log.warning("закрытие: чужой event loop не ответил за %.1f с", patience)
+    finally:
+        handover.abandon()
+
+
+@final
+class _Handover:
+    """Корутина закрытия, переданная в чужой работающий event loop.
+
+    В отличие от ``run_coroutine_threadsafe``, корутина создаётся уже в loop
+    владельца, когда тот дошёл до передачи. Если закрытие к этому моменту
+    перестало ждать, её не создают вовсе: иначе loop, остановленный раньше, чем
+    задача сделала первый шаг, оставил бы невыполненную корутину («coroutine
+    was never awaited»).
+    """
+
+    def __init__(
+        self, owner: asyncio.AbstractEventLoop, make: Callable[[], Coroutine[object, object, None]]
+    ) -> None:
+        self.result: concurrent.futures.Future[None] = concurrent.futures.Future()
+        self._owner = owner
+        self._make = make
+        self._started: list[asyncio.Task[None]] = []
+        _ = owner.call_soon_threadsafe(self._start)
+
+    def _start(self) -> None:
+        # Loop владельца. Отменённый результат — закрытие уже не ждёт.
+        if not self.result.set_running_or_notify_cancel():
+            return
+        try:
+            coroutine = self._make()
+        except BaseException as exc:
+            self.result.set_exception(exc)
+            raise
+        task = self._owner.create_task(coroutine)
+        task.add_done_callback(self._settle)
+        self._started.append(task)
+
+    def _settle(self, task: asyncio.Task[None]) -> None:
+        if task.cancelled():
+            self.result.set_exception(asyncio.CancelledError())
+        elif (error := task.exception()) is not None:
+            self.result.set_exception(error)
+        else:
+            self.result.set_result(None)
+
+    def abandon(self) -> None:
+        """Перестать ждать: не начатую корутину не создавать, начатую — отменить."""
+        if self.result.cancel() or self.result.done():
+            return
+        try:
+            _ = self._owner.call_soon_threadsafe(self._cancel)
+        except RuntimeError:
+            _log.warning("закрытие: event loop владельца закрыт, его задачу не отменить")
+
+    def _cancel(self) -> None:
+        # Loop владельца; результат «выполняется», значит, задача уже создана.
+        for task in self._started:
+            _ = task.cancel()
 
 
 def _drive(
