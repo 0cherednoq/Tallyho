@@ -32,8 +32,10 @@ from tallyho.storage.tx import (
     after_commit,
     after_commit_pending,
     begin_transaction,
+    deliver_committed,
     own_transaction,
 )
+from tests.helpers.after_commit import pause_commit_polling
 from tests.helpers.probe import ProbeColumns, committed_ids, create_probe, insert_id
 
 if TYPE_CHECKING:
@@ -241,3 +243,25 @@ async def test_commit_in_flight_is_still_pending(engine: AsyncEngine, probe: Pro
         await commit
 
     assert states == [True]
+
+
+async def test_deliver_committed_runs_callbacks_of_paused_poll(
+    engine: AsyncEngine, probe: Probe, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pause_commit_polling(monkeypatch)
+    called: list[str] = []
+    async with engine.connect() as conn:
+        await insert_id(conn, probe, 1)
+        await after_commit(conn, lambda: called.append("a"))
+        await conn.commit()
+        for _ in range(3):
+            await asyncio.sleep(0)
+        assert called == []  # опрос стоит, колбэк ещё не доставлен
+        deliver_committed()
+        assert called == ["a"]
+        deliver_committed()
+        assert called == ["a"]
+
+
+def test_deliver_committed_outside_loop_is_noop() -> None:
+    deliver_committed()

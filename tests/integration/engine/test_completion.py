@@ -21,6 +21,7 @@ from tallyho.model.states import ItemState, ResultClass
 from tallyho.protocols.observer import NullObserver
 from tallyho.storage.metric_names import METRIC_PREFIX
 from tallyho.storage.tx import resolve_connection
+from tests.helpers.after_commit import pause_commit_polling
 from tests.helpers.probe import committed_ids, create_probe, insert_id
 from tests.integration.engine.completer_env import (
     COMPLETER_SLOT,
@@ -407,6 +408,28 @@ async def test_complete_in_owner_attempt_finishes_item(env: Env) -> None:
     assert await _state(env, ref.id) is ItemState.OK
     assert await lease_row(env, ref.id) is None
     assert (await env.counters(seeded.batch_id)).ok == 1
+
+
+async def test_close_right_after_commit_still_settles_complete_in(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Опрос COMMIT ушёл в паузу, Completer закрывают сразу после commit пользователя.
+
+    close() доставляет колбэки уже закоммиченных транзакций до флага закрытия:
+    lease снят, дельты свёрнуты сразу, а не sweeper-ом позже.
+    """
+
+    pause_commit_polling(monkeypatch)
+    seeded = await seed(env, 1)
+    ref = seeded.refs[0]
+    async with open_completer(env) as completer:
+        assert (await completer.claim(ref)).run
+        async with env.transaction() as conn:
+            assert await complete_in(conn, ref, OK, completer=completer, attempt=0)
+
+    assert await _state(env, ref.id) is ItemState.OK
+    assert await lease_row(env, ref.id) is None
+    assert await env.count(env.tables.counter_delta) == 0
 
 
 async def test_complete_in_expired_but_unclaimed_lease_still_owns_item(env: Env) -> None:

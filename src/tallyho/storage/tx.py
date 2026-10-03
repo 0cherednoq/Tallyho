@@ -59,6 +59,7 @@ __all__ = [
     "after_commit",
     "after_commit_pending",
     "begin_transaction",
+    "deliver_committed",
     "hook_session",
     "is_retryable",
     "own_transaction",
@@ -373,6 +374,8 @@ _sessions: WeakKeyDictionary[Session, _Pending] = WeakKeyDictionary()
 _connections: WeakKeyDictionary[Connection, _Pending] = WeakKeyDictionary()
 _owned: WeakSet[Connection] = WeakSet()
 _watched: WeakSet[Dialect] = WeakSet()
+# Соединения пользователя, чьи колбэки ждут опроса в этом event loop (_deliver_later).
+_polling: WeakKeyDictionary[asyncio.AbstractEventLoop, set[_Pending]] = WeakKeyDictionary()
 
 
 def _session_pending(session: Session) -> _Pending:
@@ -455,10 +458,13 @@ def _deliver_later(pending: _Pending) -> None:
     except RuntimeError:
         return  # вне event loop колбэки доставят следующие обращения к соединению
     started = loop.time()
+    polled = _polling.setdefault(loop, set())
+    polled.add(pending)
 
     def check() -> None:
         _settle(pending)
         if not pending.commits:
+            polled.discard(pending)
             return
         elapsed = loop.time() - started
         if elapsed < _SPIN_SECONDS:
@@ -467,6 +473,27 @@ def _deliver_later(pending: _Pending) -> None:
             _ = loop.call_later(min(elapsed / 2, _MAX_POLL_SECONDS), check)
 
     _ = loop.call_soon(check)
+
+
+def deliver_committed() -> None:
+    """Сразу доставить колбэки соединений этого event loop, чей COMMIT завершился.
+
+    Опрос :func:`_deliver_later` после первых миллисекунд идёт с паузами; тот,
+    кто закрывается (Completer), вызывает функцию, чтобы после-коммитная работа
+    уже закоммиченных транзакций была запланирована до флага закрытия. Колбэки
+    COMMIT, ещё находящихся в пути, остаются опросу. Вне event loop — no-op.
+    """
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    polled = _polling.get(loop)
+    if not polled:
+        return
+    for pending in list(polled):
+        _settle(pending)
+        if not pending.commits:
+            polled.discard(pending)
 
 
 def _connection_pending(conn: Connection) -> _Pending:

@@ -95,6 +95,7 @@ from tallyho.storage.tx import (
     RetryPolicy,
     TxSettings,
     after_commit,
+    deliver_committed,
     resolve_connection,
     run_transaction,
 )
@@ -1779,11 +1780,11 @@ class Completer:
             CompleterError: транзакция возврата lease не прошла; их вернёт
                 sweeper по истечении.
         """
-        # Транзакция пользователя могла закоммититься прямо перед close: её
-        # после-коммитные колбэки уже стоят в очереди loop (after_commit для
-        # AsyncConnection доставляется проходом loop). Один проход до флага
-        # закрытия даёт им запланировать свёртку, и close её дождётся.
-        await asyncio.sleep(0)
+        # Транзакция пользователя могла закоммититься прямо перед close, а её
+        # after_commit для AsyncConnection доставляет опрос loop, который к этому
+        # моменту мог уйти в паузу. Доставка до флага закрытия даёт колбэкам
+        # запланировать свёртку и финализацию, и close их дождётся.
+        deliver_committed()
         self._closing = True
         self._wakeup.set()
         self._full.set()
