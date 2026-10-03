@@ -39,7 +39,7 @@ from tallyho.protocols.broker import (
     RuntimeInstaller,
 )
 from tallyho.protocols.serialization import PayloadCodec, SerializerCodec
-from tallyho.storage.tx import RetryPolicy, after_commit, resolve_connection
+from tallyho.storage.tx import RetryPolicy, after_commit, begin_transaction, resolve_connection
 
 if TYPE_CHECKING:
     from collections.abc import (
@@ -471,7 +471,7 @@ class _Facade:
                 self.observer,
             )
             return
-        async with self.installation.engine.begin() as conn:
+        async with begin_transaction(self.installation.engine) as conn:
             yield _Writer(
                 producer,
                 conn,
@@ -560,7 +560,7 @@ class _Facade:
         if target is not None:
             await operations.pause(target, batch_id)
             return
-        async with self.installation.engine.begin() as conn:
+        async with begin_transaction(self.installation.engine) as conn:
             await operations.pause(conn, batch_id)
 
     async def resume(self, target: AsyncSession | AsyncConnection | None, batch_id: UUID) -> None:
@@ -568,7 +568,7 @@ class _Facade:
         if target is not None:
             await operations.resume(target, batch_id)
             return
-        async with self.installation.engine.begin() as conn:
+        async with begin_transaction(self.installation.engine) as conn:
             await operations.resume(conn, batch_id)
 
     async def cancel(self, target: AsyncSession | AsyncConnection | None, batch_id: UUID) -> None:
@@ -576,7 +576,7 @@ class _Facade:
         if target is not None:
             _ = await operations.cancel(target, batch_id)
             return
-        async with self.installation.engine.begin() as conn:
+        async with begin_transaction(self.installation.engine) as conn:
             _ = await operations.cancel(conn, batch_id)
 
     async def reschedule(
@@ -588,7 +588,7 @@ class _Facade:
         operations = self._live(self._operations)
         if target is not None:
             return await operations.reschedule(target, batch_id, start_at)
-        async with self.installation.engine.begin() as conn:
+        async with begin_transaction(self.installation.engine) as conn:
             return await operations.reschedule(conn, batch_id, start_at)
 
     async def retry_failed(
@@ -600,7 +600,7 @@ class _Facade:
         operations = self._live(self._operations)
         if target is not None:
             return await operations.retry_failed(target, batch_id, labels=labels)
-        async with self.installation.engine.begin() as conn:
+        async with begin_transaction(self.installation.engine) as conn:
             return await operations.retry_failed(conn, batch_id, labels=labels)
 
     async def retry_finalize(
@@ -610,7 +610,7 @@ class _Facade:
         if target is not None:
             await operations.retry_finalize(target, batch_id)
             return
-        async with self.installation.engine.begin() as conn:
+        async with begin_transaction(self.installation.engine) as conn:
             await operations.retry_finalize(conn, batch_id)
 
     async def release(self, target: AsyncSession | AsyncConnection | None, batch_id: UUID) -> None:
@@ -618,7 +618,7 @@ class _Facade:
         if target is not None:
             await operations.release(target, batch_id)
             return
-        async with self.installation.engine.begin() as conn:
+        async with begin_transaction(self.installation.engine) as conn:
             await operations.release(conn, batch_id)
 
     def _live(self, value: _Service | None) -> _Service:

@@ -350,11 +350,16 @@ class ItemContext:
             ConfigurationError: Item уже завершается в другой, ещё открытой
                 транзакции этой же попытки.
         """
+        pending = self.completion
+        # Сначала опрос: для AsyncConnection он доставляет колбэк уже
+        # подтверждённого COMMIT, и флаг ниже становится верным (Fix-16).
+        waiting = pending is not None and await after_commit_pending(
+            pending.target, pending.committed
+        )
         if self.completed_in_user_tx:
             return
         connection = (await resolve_connection(session)).sync_connection
-        pending = self.completion
-        if pending is not None and await after_commit_pending(pending.target, pending.committed):
+        if pending is not None and waiting:
             if pending.connection is not connection:
                 raise ConfigurationError(_OTHER_TRANSACTION)
             return
