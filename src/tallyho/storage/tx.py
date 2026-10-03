@@ -40,7 +40,13 @@ from tallyho.model.errors import ConcurrentModification, HookTransactionError
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Awaitable
 
-    from sqlalchemy.engine import Connection, Engine, ExceptionContext, RootTransaction
+    from sqlalchemy.engine import (
+        Connection,
+        Dialect,
+        Engine,
+        ExceptionContext,
+        RootTransaction,
+    )
     from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
     from sqlalchemy.orm import Session, SessionTransaction
 
@@ -366,7 +372,7 @@ def _run_callback(callback: AfterCommit) -> None:
 _sessions: WeakKeyDictionary[Session, _Pending] = WeakKeyDictionary()
 _connections: WeakKeyDictionary[Connection, _Pending] = WeakKeyDictionary()
 _owned: WeakSet[Connection] = WeakSet()
-_watched: WeakSet[Engine] = WeakSet()
+_watched: WeakSet[Dialect] = WeakSet()
 
 
 def _session_pending(session: Session) -> _Pending:
@@ -427,10 +433,13 @@ def _on_engine_error(context: ExceptionContext) -> None:
 
 
 def _watch_errors(engine: Engine) -> None:
-    if engine in _watched:
+    # handle_error слушается на диалекте движка; движки из execution_options()
+    # делят диалект с родителем, поэтому слушатель ставится один раз на диалект.
+    dialect = engine.dialect
+    if dialect in _watched:
         return
     event.listen(engine, "handle_error", _on_engine_error)
-    _watched.add(engine)
+    _watched.add(dialect)
 
 
 def _deliver_later(pending: _Pending) -> None:
