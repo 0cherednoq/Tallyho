@@ -102,7 +102,9 @@ async def test_oracle_is_green_then_each_invariant_detects_corruption(  # ruff: 
             ),
             await check_i08_monotonic_snapshots(connection, harness.app.domain),
             await check_i09_tree_order(connection, tables, harness.app.domain),
-            await check_i10_broker_alignment(connection, tables, ()),
+            await check_i10_broker_alignment(
+                connection, tables, harness.app.domain, dead_item_ids=()
+            ),
             await check_i11_external_effects(
                 connection,
                 tables,
@@ -223,13 +225,44 @@ async def test_oracle_is_green_then_each_invariant_detects_corruption(  # ruff: 
         _assert_detects(await check_i09_tree_order(connection, tables, harness.app.domain))
         await savepoint.rollback()
 
+        # D-056: Item ok с джобой в DLQ и доменной строкой допустим; без строки, active или
+        # отсутствующий Item - нарушение.
+        domain = harness.app.domain
         ok_item = cast(
             "UUID",
             await connection.scalar(
-                select(tables.item.c.id).where(tables.item.c.state == int(ItemState.OK)).limit(1)
+                select(tables.item.c.id)
+                .where(
+                    tables.item.c.state == int(ItemState.OK),
+                    tables.item.c.task_name.endswith("render_invoice"),
+                )
+                .limit(1)
             ),
         )
-        _assert_detects(await check_i10_broker_alignment(connection, tables, (ok_item,)))
+        assert (
+            await check_i10_broker_alignment(connection, tables, domain, dead_item_ids=(ok_item,))
+        ).ok
+        savepoint = await connection.begin_nested()
+        _ = await connection.execute(
+            delete(domain.invoice_files).where(domain.invoice_files.c.item_id == ok_item)
+        )
+        _assert_detects(
+            await check_i10_broker_alignment(connection, tables, domain, dead_item_ids=(ok_item,))
+        )
+        await savepoint.rollback()
+        savepoint = await connection.begin_nested()
+        _ = await connection.execute(
+            update(tables.item)
+            .where(tables.item.c.id == ok_item)
+            .values(state=int(ItemState.ACTIVE))
+        )
+        _assert_detects(
+            await check_i10_broker_alignment(connection, tables, domain, dead_item_ids=(ok_item,))
+        )
+        await savepoint.rollback()
+        _assert_detects(
+            await check_i10_broker_alignment(connection, tables, domain, dead_item_ids=(uuid4(),))
+        )
         _assert_detects(
             await check_i11_external_effects(connection, tables, observed_calls=1_000_000)
         )

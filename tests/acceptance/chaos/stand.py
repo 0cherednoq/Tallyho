@@ -108,9 +108,11 @@ class StandSettings:
     """Параметры стенда, одинаковые для всех процессов прогона.
 
     ``lease_ttl``, ``heartbeat_every`` и ``sweep_interval`` - умолчания библиотеки
-    (ARCHITECTURE §15), поэтому ``T_rec`` = 100 с, как в ACCEPTANCE §4. Укорачивать
-    ``lease_ttl`` ниже ~45 с нельзя: flexiq замечает убитый воркер только через ~43 с, и до
-    этого повторная отправка Item упирается в ``idempotency_key`` ещё «выполняющейся» джобы.
+    (ARCHITECTURE §15), поэтому ``T_rec`` = 100 с, как в ACCEPTANCE §4. Короткий
+    ``lease_ttl`` стенду больше не мешает: ключ идемпотентности несёт поколение отправки
+    (D-060), и повторная отправка Item не сливается с ещё «выполняющейся» джобой убитого
+    воркера. ``LEASE_TTL=15 SWEEP_INTERVAL=1`` (A-CH-02 и A-CH-05 на S1, seed 1) проходят
+    оракул; задачи flexiq при этом получают ``timeout`` 15 с (``StandTuning.job_timeout``).
     """
 
     seed: int
@@ -257,15 +259,7 @@ class Stand:
         pending = list(WORKERS)
         leader = 0
         while time.monotonic() < deadline:
-            pending = [
-                worker
-                for worker in pending
-                if not (
-                    await run_command(
-                        "docker", "exec", self.container(worker), "test", "-f", _WORKER_READY
-                    )
-                ).ok
-            ]
+            pending = [worker for worker in pending if not await self._worker_ready(worker)]
             try:
                 async with self.connect() as connection:
                     leader = int(await connection.scalar(_LEADER_SQL) or 0)
@@ -290,6 +284,22 @@ class Stand:
     async def start(self, service: str) -> CommandResult:
         """Запустить остановленный контейнер; для работающего — ничего не делает."""
         return await run_command("docker", "start", self.container(service))
+
+    async def _worker_ready(self, worker: str) -> bool:
+        """Воркер зарегистрировал задачи и поставил обработчики SIGTERM/SIGINT."""
+        result = await run_command(
+            "docker", "exec", self.container(worker), "test", "-f", _WORKER_READY
+        )
+        return result.ok
+
+    async def wait_worker_ready(self, worker: str, timeout_seconds: float) -> float | None:
+        """Дождаться ready-файла воркера; секунды ожидания или ``None`` - не дождались."""
+        started = time.monotonic()
+        while time.monotonic() - started < timeout_seconds:
+            if await self._worker_ready(worker):
+                return round(time.monotonic() - started, 3)
+            await asyncio.sleep(0.2)
+        return None
 
     async def wait_exit(self, service: str, timeout_seconds: float) -> bool:
         """Дождаться остановки контейнера; ``False`` — не остановился за отведённое время."""

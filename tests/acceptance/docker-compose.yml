@@ -29,9 +29,11 @@ x-worker: &worker
     migrate:
       condition: service_completed_successfully
   # exec: python остаётся PID 1 и получает SIGKILL/SIGTERM от `docker kill` напрямую.
+  # Ready-файл прошлого запуска удаляется: `docker start` сохраняет файловую систему.
   entrypoint: ["/bin/sh", "-c"]
   command:
     - >-
+      rm -f /tmp/worker.ready &&
       exec python -m tests.acceptance.app.worker
       --dsn "postgresql+asyncpg://tallyho:tallyho@toxiproxy:$${PG_PORT}/tallyho"
       --tallyho-schema th --flexiq-schema flexiq --domain-schema app

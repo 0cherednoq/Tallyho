@@ -70,57 +70,29 @@ class _Defect:
         )
 
 
-# Джоба упала на claim, пока PostgreSQL недоступен, и ушла в DLQ; обработчик JOB_DEAD тоже
-# не смог записать итог, а `reconcile_dead` движок не вызывает. Item остаётся active без
-# lease и outbox, батч не финализируется.
-_DEAD_JOB_ORPHAN = _Defect(
-    "Fix-6", "Item с джобой в DLQ остаётся active: сверка DLQ не вызывается", strict=False
+# Нарушения инвариантов, ждущие своей задачи Fix-N. Прежние метки сняты в T11.3b: Fix-5,
+# Fix-6, Fix-7, Fix-18, Fix-19 исправили осиротевшие Items, а I-10 приведён к D-056 (Item
+# ok/skip с джобой текущего поколения в DLQ допустим, если I-04 для него выполнен).
+_INVARIANT_DEFECTS: Mapping[tuple[str, str], _Defect] = {}
+# Невыполненные ожидания A-CH.
+#
+# A-CH-08 на S1, seed 2: после третьего SIGTERM остался 1 lease. Путь B (complete_in)
+# закоммитил Item перед самой остановкой; после-коммитная транзакция Completer
+# (`_after_external_commit`: удалить lease, свернуть дельты и временный слот метрик) начата
+# в loop потока flexiq, а после остановки flexiq `aclose` докручивает её в служебном потоке
+# (D-054). SQLAlchemy падает посреди транзакции: «greenlet.error: cannot switch to a
+# different thread (which happens to have exited)», транзакция откатывается, lease остаётся
+# до sweeper. Инварианты зелёные (хвосты убирает sweeper), но SIGTERM не освободил lease
+# сразу. Проявляется, только если commit пути B попал в последние доли секунды перед
+# остановкой: seed 1 зелёный во всех трёх сценариях.
+_SHUTDOWN_SETTLE_LOST = _Defect(
+    "Fix-NEW-close-path-b-thread",
+    "после-коммитная транзакция пути B, докрученная aclose в чужом потоке, падает на greenlet",
+    strict=False,
 )
-# Повторная доставка получает DUPLICATE и закрывает джобу брокера как успешную, а исходное
-# выполнение потом уходит в release по вердикту RETRY. Повторять уже нечего: Item остаётся
-# active без lease, outbox и живой джобы.
-_DUPLICATE_ORPHAN = _Defect(
-    "Fix-7", "release после no-op дубля оставляет Item active без джобы", strict=False
-)
-
-# Нарушения инвариантов. Оба дефекта оставляют «осиротевшие» Items; Fix-6 - после отказов
-# PostgreSQL, Fix-7 - после повторной доставки (requeue_job, реап «мёртвого» воркера flexiq
-# при сдвиге часов или разрыве сети). A-CH-12 включает оба пути.
-#
-# В тех же прогонах бывает красным I-10 без зависших Items: Item завершён ok, а его
-# последняя джоба лежит в DLQ. Так выходит, когда flexiq отбирает джобу у живого выполнения
-# (сдвиг часов, разрыв сети, отказ БД после commit) и исчерпывает попытки дублями-no-op.
-# Эффект один, данные согласованы, но DLQ брокера расходится с tallyho; что с этим делать
-# (уточнить I-10 или чистить DLQ), решает владелец вместе с Fix-6/Fix-7.
-#
-# Fix-7 исправлен: release после подтверждённого дубля возвращает Item в outbox. С A-CH-10
-# метка снята (S1/S2/S3 зелёные); A-CH-05 и A-CH-09 перепроверяет и снимает T11.3b.
-#
-# Fix-6 исправлен: сверка с DLQ завершает Items, чья джоба умерла без записанного итога
-# (A-CH-04 на S1 и S3, seed 1: зависших Items нет, красный только I-10). Метки
-# A-CH-02/03/12 остаются: I-10 без зависших Items, описанный выше, ждёт решения владельца;
-# перепроверяет T11.3b.
-#
-# Fix-19: Items A-CH-04 на S2, остававшиеся active с джобой running во flexiq, - результат
-# попытки, который flexiq не смог записать при отказе PostgreSQL; джобу возвращает только
-# реапер таймаута flexiq (ARCHITECTURE §11.3), поэтому стенд регистрирует задачи с timeout =
-# lease_ttl. Второй источник зависания - круг «дубль доставки → RETRY → outbox» без лимита
-# попыток (UC-04) - исправлен в release. S2: шесть прогонов подряд (seed 1-5, 7) без зависших
-# Items; S1 и S3 (seed 1, 4) тоже. Метка A-CH-04 осталась только за I-10: оракул ещё не
-# приведён к D-056 (Item ok/skip с джобой в DLQ допустим) - T11.3b.
-_DLQ_AFTER_OK = _Defect(
-    "T11.3b", "I-10: Item ok/skip с джобой в DLQ — оракул не приведён к D-056", strict=False
-)
-_INVARIANT_DEFECTS: Mapping[str, _Defect] = {
-    "A-CH-02": _DEAD_JOB_ORPHAN,
-    "A-CH-03": _DEAD_JOB_ORPHAN,
-    "A-CH-04": _DLQ_AFTER_OK,
-    "A-CH-05": _DUPLICATE_ORPHAN,
-    "A-CH-09": _DUPLICATE_ORPHAN,
-    "A-CH-12": _DEAD_JOB_ORPHAN,
+_EXPECTATION_DEFECTS: Mapping[tuple[str, str], _Defect] = {
+    ("A-CH-08", scenario): _SHUTDOWN_SETTLE_LOST for scenario in SCENARIOS
 }
-# Невыполненные ожидания A-CH: известных дефектов нет.
-_EXPECTATION_DEFECTS: Mapping[tuple[str, str], _Defect] = {}
 
 
 def _cases(defect_of: Mapping[tuple[str, str], _Defect]) -> list[ParameterSet]:
@@ -135,13 +107,7 @@ def _cases(defect_of: Mapping[tuple[str, str], _Defect]) -> list[ParameterSet]:
     return cases
 
 
-INVARIANT_CASES = _cases(
-    {
-        (chaos, scenario): defect
-        for chaos, defect in _INVARIANT_DEFECTS.items()
-        for scenario in SCENARIOS
-    }
-)
+INVARIANT_CASES = _cases(_INVARIANT_DEFECTS)
 EXPECTATION_CASES = _cases(_EXPECTATION_DEFECTS)
 
 pytestmark = [pytest.mark.chaos, pytest.mark.timeout(TIMEOUT)]
