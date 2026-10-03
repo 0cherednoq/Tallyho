@@ -142,10 +142,10 @@ async def check_i03_single_finalization(
     return _report("I-03", len(rows), evidence)
 
 
-async def check_i04_exact_domain_effects(
-    connection: AsyncConnection, tables: Tables, domain: DomainTables
-) -> InvariantReport:
-    """I-04: leaf-task effects exist exactly once for OK Items and never otherwise."""
+async def _domain_effects(
+    connection: AsyncConnection, domain: DomainTables
+) -> dict[str, set[UUID]]:
+    """Item ids with a domain row, by the short name of the leaf task that writes it."""
     effects: dict[str, set[UUID]] = {}
     for task_name, table in (
         ("render_invoice", domain.invoice_files),
@@ -155,6 +155,25 @@ async def check_i04_exact_domain_effects(
     ):
         values = list(await connection.scalars(select(table.c.item_id)))
         effects[task_name] = {cast("UUID", value) for value in values}
+    return effects
+
+
+def _effect_mismatch(
+    effects: Mapping[str, set[UUID]], item_id: UUID, *, task_name: str, state: int
+) -> bool | None:
+    """Whether one Item breaks I-04; ``None`` when its task writes no domain row."""
+    short_name = task_name.rsplit(".", 1)[-1]
+    if short_name not in effects:
+        return None
+    present = item_id in effects[short_name]
+    return present != (state == int(ItemState.OK))
+
+
+async def check_i04_exact_domain_effects(
+    connection: AsyncConnection, tables: Tables, domain: DomainTables
+) -> InvariantReport:
+    """I-04: leaf-task effects exist exactly once for OK Items and never otherwise."""
+    effects = await _domain_effects(connection, domain)
     rows = (
         await connection.execute(
             select(tables.item.c.id, tables.item.c.task_name, tables.item.c.state)
@@ -163,13 +182,12 @@ async def check_i04_exact_domain_effects(
     evidence: list[str] = []
     checked = 0
     for item_id, task_name, state in rows:
-        short_name = str(task_name).rsplit(".", 1)[-1]
-        if short_name not in effects:
+        mismatch = _effect_mismatch(effects, item_id, task_name=str(task_name), state=int(state))
+        if mismatch is None:
             continue
         checked += 1
-        present = item_id in effects[short_name]
-        expected = int(state) == int(ItemState.OK)
-        if present != expected:
+        if mismatch:
+            present = item_id in effects[str(task_name).rsplit(".", 1)[-1]]
             evidence.append(f"{item_id}:{task_name}:state={state}:effect={present}")
     return _report("I-04", checked, evidence)
 
@@ -377,25 +395,46 @@ async def check_i09_tree_order(
 
 
 async def check_i10_broker_alignment(
-    connection: AsyncConnection, tables: Tables, dead_item_ids: Sequence[UUID]
+    connection: AsyncConnection,
+    tables: Tables,
+    domain: DomainTables,
+    *,
+    dead_item_ids: Sequence[UUID],
 ) -> InvariantReport:
-    """I-10: every FlexIQ DLQ item is an error in Tallyho."""
+    """I-10: an Item whose current-generation job is in the FlexIQ DLQ is settled (D-056).
+
+    ``dead_item_ids`` are Items with a dead job of their current dispatch generation.
+    Such an Item is an ``error`` (or ``cancelled``: the DLQ reconciler settles it so when
+    its batch is being cancelled, D-051), or it is terminal ``ok``/``skip`` and its domain
+    effect obeys I-04: the attempt committed, the broker lost the answer and its
+    redeliveries exhausted the retries on claim. The truth about the Item is in Tallyho,
+    not in the broker DLQ. An Item still ``active`` (the oracle runs after ``T_rec``), a
+    missing Item and an Item whose effect breaks I-04 are violations.
+    """
     if not dead_item_ids:
         return _report("I-10", 0, ())
-    rows = dict(
-        (
+    rows = {
+        item_id: (str(task_name), int(state))
+        for item_id, task_name, state in (
             await connection.execute(
-                select(tables.item.c.id, tables.item.c.state).where(
+                select(tables.item.c.id, tables.item.c.task_name, tables.item.c.state).where(
                     tables.item.c.id.in_(tuple(dead_item_ids))
                 )
             )
         ).all()
-    )
-    evidence = [
-        f"{item_id}:state={rows.get(item_id)}"
-        for item_id in dead_item_ids
-        if rows.get(item_id) != int(ItemState.ERROR)
-    ]
+    }
+    effects = await _domain_effects(connection, domain)
+    evidence: list[str] = []
+    for item_id in dead_item_ids:
+        row = rows.get(item_id)
+        if row is None:
+            evidence.append(f"{item_id}:missing")
+            continue
+        task_name, state = row
+        if state < TERMINAL_THRESHOLD:
+            evidence.append(f"{item_id}:{task_name}:state={state}:active-with-dead-job")
+        elif _effect_mismatch(effects, item_id, task_name=task_name, state=state):
+            evidence.append(f"{item_id}:{task_name}:state={state}:effect-breaks-I-04")
     return _report("I-10", len(dead_item_ids), evidence)
 
 

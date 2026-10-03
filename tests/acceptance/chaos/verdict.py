@@ -7,6 +7,7 @@ import time
 from collections import Counter
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, cast
+from uuid import UUID
 
 from sqlalchemy import select, text
 
@@ -20,7 +21,6 @@ from tests.acceptance.oracle import InvariantReport
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
-    from uuid import UUID
 
     from sqlalchemy.ext.asyncio import AsyncConnection
 
@@ -86,37 +86,11 @@ _STUCK_SQL = text("""
       LEFT JOIN th.th_outbox o ON o.item_id = i.id
      WHERE i.state = 0 AND i.child_batch_id IS NULL
 """)
-# I-10 под отказами. Item с джобой в DLQ обязан быть error, если эта джоба у него последняя.
-# Если после неё tallyho переотправил Item (lease истёк, пока брокер уже сдался) и новая
-# джоба выполнилась, Item законно завершён по её итогу: запись DLQ осталась от прошлой попытки.
-# Item ищется в payload джобы по тексту id из служебного `_th`.
-_DEAD_ITEMS_SQL = text("""
-    WITH job AS (
-        SELECT id, payload, created_at FROM flexiq.jobs
-        UNION ALL
-        SELECT id, payload, created_at FROM flexiq.archived_jobs
-    ),
-    dead AS (
-        SELECT DISTINCT i.id AS item_id
-          FROM th.th_item i
-          JOIN flexiq.dead_letter d ON position(i.id::text::bytea IN d.payload) > 0
-         WHERE i.child_batch_id IS NULL
-    ),
-    latest AS (
-        SELECT DISTINCT ON (dead.item_id) dead.item_id, job.id AS job_id
-          FROM dead
-          JOIN job ON position(dead.item_id::text::bytea IN job.payload) > 0
-         ORDER BY dead.item_id, job.created_at DESC, job.id DESC
-    )
-    SELECT dead.item_id,
-           EXISTS (
-               SELECT 1
-                 FROM latest
-                 JOIN flexiq.dead_letter d ON d.original_job_id = latest.job_id
-                WHERE latest.item_id = dead.item_id
-           )
-      FROM dead
-""")
+# I-10 под отказами (D-056). Запись DLQ относится к Item, если в маркере `_th` её джобы то же
+# поколение отправки, что у Item сейчас (D-051): после возврата Item в outbox (истёкший lease,
+# release после дубля) поколение растёт, и мёртвая джоба прошлого поколения уже ничего не
+# говорит о его итоге. Маркер читается штатным кодеком адаптера из payload записи DLQ.
+_DEAD_LETTERS_SQL = text("SELECT task_name, payload FROM flexiq.dead_letter")
 _REDELIVERY_CHAOS = frozenset({"A-CH-01", "A-CH-05", "A-CH-12"})
 
 
@@ -403,11 +377,44 @@ async def _check_i11(
     return InvariantReport("I-11", report.checked, len(evidence), tuple(evidence)), stats
 
 
-async def _dead_items(connection: AsyncConnection) -> tuple[list[UUID], int]:
-    """Items, чья последняя джоба в DLQ, и число Items с более ранней мёртвой джобой."""
-    rows = (await connection.execute(_DEAD_ITEMS_SQL)).all()
-    last_dead = [cast("UUID", item_id) for item_id, is_last in rows if is_last]
-    return last_dead, len(rows) - len(last_dead)
+def _dead_marker(app: AcceptanceApp, task_name: str, payload: bytes) -> tuple[UUID, int] | None:
+    """Item и поколение отправки из маркера ``_th`` записи DLQ; ``None`` - не джоба Item."""
+    _args, kwargs = app.adapter.decode(task_name, payload)
+    marker = kwargs.get("_th")
+    if not isinstance(marker, dict):
+        return None
+    fields = cast("dict[str, object]", marker)
+    item_id = fields.get("i")
+    generation = fields.get("g", 0)
+    if not isinstance(item_id, str) or not isinstance(generation, int):
+        return None
+    return UUID(item_id), generation
+
+
+async def _dead_items(
+    connection: AsyncConnection, tables: Tables, app: AcceptanceApp
+) -> tuple[list[UUID], int]:
+    """Items с мёртвой джобой текущего поколения и число Items, у которых она из прошлого."""
+    rows = (await connection.execute(_DEAD_LETTERS_SQL)).all()
+    dead: dict[UUID, set[int]] = {}
+    for task_name, payload in rows:
+        marker = _dead_marker(app, str(task_name), bytes(cast("bytes", payload)))
+        if marker is not None:
+            dead.setdefault(marker[0], set()).add(marker[1])
+    if not dead:
+        return [], 0
+    item = tables.item
+    current = dict(
+        (
+            await connection.execute(
+                select(item.c.id, item.c.generation).where(item.c.id.in_(tuple(dead)))
+            )
+        ).all()
+    )
+    last_dead = [
+        item_id for item_id, generations in dead.items() if current.get(item_id) in generations
+    ]
+    return last_dead, len(dead) - len(last_dead)
 
 
 async def _item_stats(probe: _Probe) -> dict[str, int]:
@@ -456,7 +463,7 @@ async def run_oracle(run: OracleInput) -> tuple[list[InvariantReport], dict[str,
     flat = [node for view in views.values() for node in _flatten(view)]
     budget = disruption_budget(run.journal, stand.settings.threads, len(WORKERS))
     async with stand.connect() as connection:
-        dead, revived = await _dead_items(connection)
+        dead, revived = await _dead_items(connection, tables, app)
         probe = _Probe(connection, tables, run.generated)
         i11, stats = await _check_i11(probe, stand, budget)
         reports = [
@@ -469,7 +476,9 @@ async def run_oracle(run: OracleInput) -> tuple[list[InvariantReport], dict[str,
             await _check_i07(probe, by_root, run.driver.profile.size),
             await oracle.check_i08_monotonic_snapshots(connection, app.domain),
             await oracle.check_i09_tree_order(connection, tables, app.domain),
-            await oracle.check_i10_broker_alignment(connection, tables, dead),
+            await oracle.check_i10_broker_alignment(
+                connection, tables, app.domain, dead_item_ids=dead
+            ),
             i11,
             oracle.check_i12_exact_after_seal(flat),
             await oracle.check_i13_tree_consistency(connection, tables),
@@ -477,8 +486,8 @@ async def run_oracle(run: OracleInput) -> tuple[list[InvariantReport], dict[str,
         ]
         stats.update(await _item_stats(probe))
     stats["batches"] = len(flat)
-    stats["items_with_last_job_in_dlq"] = len(dead)
-    stats["items_redispatched_after_dead_job"] = revived
+    stats["items_with_current_job_in_dlq"] = len(dead)
+    stats["items_with_older_generation_in_dlq"] = revived
     return reports, stats
 
 
