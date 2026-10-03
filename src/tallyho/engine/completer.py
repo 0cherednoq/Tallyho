@@ -1779,6 +1779,11 @@ class Completer:
             CompleterError: транзакция возврата lease не прошла; их вернёт
                 sweeper по истечении.
         """
+        # Транзакция пользователя могла закоммититься прямо перед close: её
+        # после-коммитные колбэки уже стоят в очереди loop (after_commit для
+        # AsyncConnection доставляется проходом loop). Один проход до флага
+        # закрытия даёт им запланировать свёртку, и close её дождётся.
+        await asyncio.sleep(0)
         self._closing = True
         self._wakeup.set()
         self._full.set()
