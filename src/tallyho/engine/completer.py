@@ -693,7 +693,8 @@ class _Tx:
             self.items[item_id].attempt += 1
 
     async def _cancel(self, item_ids: list[UUID]) -> None:
-        # Ленивая отмена (§6.1, UC-12): CAS active → cancelled, счётчики по вернувшимся.
+        # Ленивая отмена (§6.1, UC-12): CAS active → cancelled, счётчики и метка
+        # итога по вернувшимся — как у немедленной отмены и у Sweeper (Fix-22).
         if not item_ids:
             return
         item = self.tables.item
@@ -706,6 +707,7 @@ class _Tx:
         )
         for item_id, batch_id, weight, attempt in result:
             self.deltas[batch_id] += CounterDelta(cancelled=1, w_done=weight)
+            self.metrics[batch_id, CANCELLED_LABEL, self.c.settings.slot] += 1
             self.applied.finalize.add(batch_id)
             self.applied.cancelled.append((batch_id, item_id, attempt))
         # Запись outbox Item (id = item_id, D-031), если дубль пришёл раньше relay DELETE.
