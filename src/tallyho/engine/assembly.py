@@ -301,6 +301,7 @@ class _Facade:
             settings=SweeperSettings(
                 slot=slot,
                 finalize_grace=settings.finalize_grace,
+                hook_backoff_initial=settings.hook_backoff_initial,
                 hook_backoff_max=settings.hook_backoff_max,
                 lease_ttl=settings.lease_ttl,
                 retry=retry,

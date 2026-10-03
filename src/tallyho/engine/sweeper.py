@@ -68,6 +68,8 @@ _ITEM = literal_column(str(int(OutboxKind.ITEM)), SmallInteger())
 _INFINITY = literal_column("'infinity'::timestamptz", DateTime(timezone=True))
 _POSITIVE_BATCH = "sweeper batch_size должен быть положительным"
 _POSITIVE_GRACE = "finalize_grace должен быть неотрицательным"
+_BACKOFF_ORDER = "hook_backoff_initial должен быть <= hook_backoff_max"
+_BACKOFF_MAX_EXPONENT = 60
 _NO_DATABASE_TIME = "БД не вернула текущее время"
 _PARENT_CYCLE = "цикл parent_id в дереве батчей"
 
@@ -133,6 +135,7 @@ class SweeperSettings:
     batch_size: int = 1000
     slot: int = 0
     finalize_grace: timedelta = timedelta(seconds=30)
+    hook_backoff_initial: timedelta = timedelta(seconds=1)
     hook_backoff_max: timedelta = timedelta(minutes=5)
     lease_ttl: timedelta = timedelta(seconds=60)
     tx: TxSettings = field(default_factory=TxSettings)
@@ -151,10 +154,27 @@ class SweeperSettings:
             raise ConfigurationError(message)
         if (
             self.finalize_grace < timedelta(0)
+            or self.hook_backoff_initial <= timedelta(0)
             or self.hook_backoff_max <= timedelta(0)
             or self.lease_ttl <= timedelta(0)
         ):
             raise ConfigurationError(_POSITIVE_GRACE)
+        if self.hook_backoff_initial > self.hook_backoff_max:
+            raise ConfigurationError(_BACKOFF_ORDER)
+
+    def hook_backoff(self, attempts: int) -> timedelta:
+        """Пауза перед повтором упавшего ``on_finalized`` (ARCHITECTURE §7.3).
+
+        Args:
+            attempts: ``hook_attempts`` батча — число неудачных попыток.
+
+        Returns:
+            ``min(hook_backoff_max, hook_backoff_initial * 2 ** (attempts - 1))``.
+        """
+        # Показатель ограничен: через несколько суток неудач 2.0 ** n переполнил бы float.
+        exponent = min(max(attempts - 1, 0), _BACKOFF_MAX_EXPONENT)
+        seconds = self.hook_backoff_initial.total_seconds() * 2.0**exponent
+        return timedelta(seconds=min(seconds, self.hook_backoff_max.total_seconds()))
 
 
 @dataclass(frozen=True, slots=True)
@@ -606,10 +626,7 @@ class Sweeper:
             hook_error = cast("str | None", values[3])
             delay = self.settings.finalize_grace
             if hook_error is not None:
-                seconds = min(
-                    self.settings.hook_backoff_max.total_seconds(), 2.0 ** max(0, attempts - 1)
-                )
-                delay = timedelta(seconds=seconds)
+                delay = self.settings.hook_backoff(attempts)
             if updated_at + delay <= now:
                 candidates.append(batch_id)
         return tuple(candidates)

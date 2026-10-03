@@ -100,6 +100,15 @@ def test_defaults_match_architecture_table() -> None:
     assert {field.name: getattr(value, field.name) for field in fields(value)} == expected
 
 
+def test_engine_settings_carry_every_engine_field() -> None:
+    value = Settings(hook_backoff_initial=timedelta(seconds=7), hook_backoff_max=timedelta(hours=1))
+    engine = value.engine_settings()
+    # Каждое поле DTO engine берётся из одноимённой настройки клиента.
+    for field in fields(engine):
+        assert getattr(engine, field.name) == getattr(value, field.name), field.name
+    assert engine.hook_backoff_initial == timedelta(seconds=7)
+
+
 @pytest.mark.parametrize(
     "settings",
     [
