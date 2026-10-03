@@ -298,9 +298,16 @@ class WorkerServices(Protocol):
         ...
 
     async def finish_dead(
-        self, item_id: UUID, batch_id: UUID, *, error_type: str, detail: str
+        self, item_id: UUID, *, generation: int, error_type: str, detail: str
     ) -> None:
-        """Завершить Item, окончательно убитый внешним брокером."""
+        """Разобрать событие DLQ брокера по правилу сверки (ARCHITECTURE UC-15).
+
+        Args:
+            item_id: Item из служебного маркера мёртвой джобы.
+            generation: поколение отправки из маркера (:attr:`DeadLetter.generation`).
+            error_type: ``type`` в ``th_item.error``, если Item будет завершён.
+            detail: текст ошибки брокера.
+        """
         ...
 
 

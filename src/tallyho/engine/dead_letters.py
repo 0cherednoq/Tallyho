@@ -19,6 +19,9 @@ DLQ брокера, а читать DLQ умеет только адаптер, 
 
 Правило не зависит от времени: Item, переотправленный после мёртвой джобы,
 имеет другое поколение, и запись DLQ прошлой отправки его не касается.
+
+Событие DLQ брокера (``JOB_DEAD`` у flexiq) применяет то же правило через
+:meth:`DeadLetterReconciler.settle` — шаг 3 без курсора.
 """
 
 from __future__ import annotations
@@ -182,16 +185,42 @@ class DeadLetterReconciler:
             outcome = await run_transaction(
                 self.engine, self._round, settings=self.settings.tx, policy=self.settings.retry
             )
-            if outcome.kick and self.relay is not None:
-                self.relay.kick(outcome.kick)
-            for batch_id in outcome.finalize:
-                _ = await self.finalizer.try_finalize(batch_id)
+            await self._after_commit(outcome.kick, outcome.finalize)
             total += outcome.finished
             if not outcome.more:
                 break
         if total:
             _log.info("сверка с DLQ: завершено %d Items, оставшихся без исполнителя", total)
         return total
+
+    async def settle(self, entries: Sequence[DeadLetter], *, error_type: str = _ERROR_TYPE) -> int:
+        """Применить правило сверки к мёртвым джобам из события брокера (``JOB_DEAD``).
+
+        Курсор не читается и не двигается: событие называет джобу само. Правило
+        то же, что у прохода сверки, и так же идемпотентно — запись DLQ этой
+        джобы сверка позже разберёт ещё раз без последствий.
+
+        Args:
+            entries: Мёртвые джобы: Item, поколение отправки и текст ошибки.
+            error_type: ``type`` в ``th_item.error`` завершённых Items.
+
+        Returns:
+            Сколько Items завершено.
+        """
+        applied = await run_transaction(
+            self.engine,
+            lambda conn: self._apply(conn, entries, error_type=error_type),
+            settings=self.settings.tx,
+            policy=self.settings.retry,
+        )
+        await self._after_commit(applied.kick, applied.finalize)
+        return applied.finished
+
+    async def _after_commit(self, kick: Sequence[UUID], finalize: Sequence[UUID]) -> None:
+        if kick and self.relay is not None:
+            self.relay.kick(kick)
+        for batch_id in finalize:
+            _ = await self.finalizer.try_finalize(batch_id)
 
     async def _round(self, conn: AsyncConnection) -> _Round:
         locked, cursor = await self._lock_cursor(conn)
@@ -235,7 +264,9 @@ class DeadLetterReconciler:
         except TimeoutError as exc:
             raise _DeadLetterReadTimeoutError(_READ_TIMEOUT) from exc
 
-    async def _apply(self, conn: AsyncConnection, entries: Sequence[DeadLetter]) -> _Applied:
+    async def _apply(
+        self, conn: AsyncConnection, entries: Sequence[DeadLetter], *, error_type: str = _ERROR_TYPE
+    ) -> _Applied:
         details: dict[tuple[UUID, int], str | None] = {}
         for entry in entries:
             _ = details.setdefault((entry.item_id, entry.generation), entry.detail)
@@ -255,7 +286,7 @@ class DeadLetterReconciler:
         orphans = await self._orphans(conn, rows, now)
         errors: dict[UUID, object] = {
             row.item_id: {
-                "type": _ERROR_TYPE,
+                "type": error_type,
                 "message": details[row.item_id, row.generation] or _NO_DETAIL,
             }
             for row in orphans

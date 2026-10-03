@@ -979,12 +979,14 @@ sequenceDiagram
         MW->>T: await task(*args)
         T->>MW: item.spawn / incr / ok(label) → в буфер
         T-->>MW: return
-        MW->>C: finish(item, result, spawns, metrics)
-        C->>DB: групповая tx, см. §9.2
+        MW->>C: finish(item, attempt, result, spawns, metrics)
+        C->>DB: групповая tx, см. §9.2: lease не у этой попытки → ничего не пишет
         C-->>MW: future resolved после commit
         MW-->>B: return, брокер фиксирует успех
     end
 ```
+
+**Владение lease в пути A.** `finish` и `release` из обёртки передают номер попытки из claim. Групповая транзакция блокирует строку `th_item`, затем `th_lease` (§9.2) и применяет операцию, только если lease взят этим процессом для этой попытки: совпадают `worker_id` и `attempt` — то же условие, что у `complete_in` (UC-08). Попытка, чей lease истёк и был перехвачен (claim другого исполнителя или этого же процесса делает `attempt += 1`), удалён sweeper-ом или возвращён в outbox, ничего не пишет: ни итог в Item, ни удаление чужого lease, ни `attempt += 1`. Обёртка завершает такую попытку тихо, как при `LeaseLostError` пути B: брокеру — успех без ретрая, иначе ретрай или DLQ задели бы Item, который выполняет другой исполнитель. Истёкший, но никем не перехваченный lease завершению не мешает. Обработчик DLQ номера попытки не знает и идёт по правилу сверки (UC-15).
 
 ### UC-04 Ретрай и финальная ошибка
 
@@ -999,22 +1001,26 @@ sequenceDiagram
 
     MW->>MW: задача бросила исключение exc
     MW->>A: retry_verdict(exc)
-    alt RETRY, брокер повторит
-        MW->>C: release(item, attempt+1)
-        C->>DB: DELETE th_lease, attempt += 1
+    alt lease не у этой попытки (перехвачен, удалён sweeper-ом)
+        MW->>C: release или finish с attempt попытки
+        C-->>MW: ничего не записано
+        MW-->>B: успех без ретрая (как LeaseLostError, UC-08)
+    else RETRY, брокер повторит
+        MW->>C: release(item, attempt)
+        C->>DB: lease этой попытки → DELETE th_lease, attempt += 1
         opt th_lease.redelivered — дубль уже закрыл джобу, брокер не повторит
             C->>DB: INSERT th_outbox (parked, если батч на паузе), dispatched -= 1
             C-->>C: после commit — kick relay
         end
         MW-->>B: пробросить exc, брокер планирует ретрай
     else FINAL
-        MW->>C: finish(item, error, label=exhausted или mapped(exc))
-        C->>DB: CAS state=error, счётчики, th_item_mark
+        MW->>C: finish(item, attempt, error, label=exhausted или mapped(exc))
+        C->>DB: lease этой попытки → CAS state=error, счётчики, th_item_mark
         MW-->>B: пробросить exc, брокер отправит в DLQ
     end
     opt брокер всё же отправил в DLQ после вердикта RETRY
         B-->>A: DLQ-хук
-        A->>C: finish(item, error, exhausted), CAS идемпотентен
+        A->>DB: finish_dead(item, generation) — правило сверки UC-15: error(exhausted), только если поколение текущее и нет ни lease, ни outbox
     end
     opt DLQ-хук потерян или не смог записать итог
         A-->>DB: сверка с DLQ (UC-15): error(exhausted), если джоба — текущее поколение Item
@@ -1147,7 +1153,7 @@ sequenceDiagram
 * **Проверка и запись — под одной блокировкой.** Владельца lease меняют только claim, `release`, возврат при остановке и sweeper, и все они блокируют строку `th_item` раньше строки lease. Между проверкой и commit транзакции пользователя перехват невозможен. Новых блокировок путь B не добавляет: обе строки он и так меняет (CAS и `DELETE th_lease`).
 * **`LeaseLostError` — не ошибка задачи.** Ловить её не нужно: исключение должно выйти из блока транзакции, чтобы та откатилась. Обёртка `tracked` на ней не пишет ни `finish`, ни `release` и возвращает брокеру успех, как при `DUPLICATE` и `TERMINAL` в UC-03: Item уже завершён или принадлежит другому исполнителю, ретрай и DLQ ему только навредили бы. Если задача поймала `LeaseLostError` и вернулась обычным образом, бросила вместо неё другое исключение или была отменена, обёртка тоже ничего не пишет; чужое исключение уходит брокеру как есть.
 * **Повторный вызов в той же попытке.** После commit — ничего не делает. До commit на том же соединении, пока первая запись в силе, — тоже ничего не делает: итог и `spawn`, накопленные после первого вызова, не записываются. До commit на другом соединении — `ConfigurationError`: Item завершается в одной транзакции. После отката транзакции или savepoint первая запись отменена вместе с удалением lease, и следующий вызов выполняет проверку и запись заново (A-DB-09).
-* **Путь A не меняется.** `finish` из обёртки и из DLQ по-прежнему защищён только CAS по `state`: у него нет доменной записи, которую нужно откатывать.
+* **Путь A проверяет то же владение.** `finish` и `release` из обёртки передают `attempt` попытки и под теми же блокировками ничего не пишут, если lease не у неё (UC-03); обёртка тогда завершает попытку тихо. Доменной записи у пути A нет, но без проверки `error("exhausted")` или `release` устаревшей попытки задели бы Item и lease другого исполнителя. Обработчик DLQ идёт по правилу сверки (UC-15).
 
 ### UC-09 Снимок прогресса в доменную таблицу
 
@@ -1354,9 +1360,9 @@ sequenceDiagram
 
 Курсор — непрозрачная строка адаптера в `th_meta` (`dead_letter_cursor`). Он читается под блокировкой строки и записывается в той же транзакции, что и завершения Items: проход либо применён целиком вместе со сдвигом курсора, либо не применён вовсе. Адаптер не возвращает курсор назад. Один проход — до 5 порций (порция — одна страница DLQ); остаток разбирает следующий проход. Чтение DLQ ограничено 30 с и идёт внутри транзакции, которая держит только строку курсора; строки Items блокируются после чтения и на время записи.
 
-Событие DLQ (`JOB_DEAD` у flexiq) остаётся основным путём и завершает Item сразу; сверка — страховка с задержкой до `sweep_interval`. Сверку выполняют только процессы, где работает цикл relay: установка, в которой после рестарта нет ни одного такого процесса (только воркеры без spawn и CLI `tallyho maintenance`), DLQ не сверяет, как и не сканирует outbox.
+Событие DLQ (`JOB_DEAD` у flexiq) остаётся основным путём и применяет то же правило сразу, в своей транзакции: мёртвая джоба несёт поколение в маркере, живой lease того же поколения получает `redelivered = true`, Item без lease и outbox завершается. Безусловного `finish` по событию нет: событие о джобе прошлого поколения или о джобе, которую брокер закрыл при живом выполнении, иначе завершило бы Item, который выполняет или ждёт другая отправка. Сверка — страховка с задержкой до `sweep_interval`. Сверку выполняют только процессы, где работает цикл relay: установка, в которой после рестарта нет ни одного такого процесса (только воркеры без spawn и CLI `tallyho maintenance`), DLQ не сверяет, как и не сканирует outbox.
 
-Что сверка не покрывает: у брокера, который дедуплицирует постановку по ключу, повторная отправка нового поколения может слиться с ещё живой джобой прошлого (у flexiq — `idempotency_key`, пока джоба pending/running). Если эта джоба потом уйдёт в DLQ, не взяв lease, а событие DLQ потеряется, сверка увидит прошлое поколение и Item не завершит. Нужны два отказа подряд; такой Item снимает дедлайн батча (§10).
+Ключ дедупликации брокера включает поколение (у flexiq — `idempotency_key=th:{item_id}:{generation}`, §11.3). Иначе повторная отправка нового поколения слилась бы с ещё живой джобой прошлого: если та потом уйдёт в DLQ, не взяв lease, а событие DLQ потеряется, сверка увидит прошлое поколение и Item не завершит. С поколением в ключе у новой отправки своя джоба и своя запись DLQ; повтор relay в пределах одного поколения по-прежнему дедуплицируется. Ключ, заданный пользователем, передаётся как есть (§11.4): с ним слияние поколений остаётся возможным, и такой Item в этом редком случае снимает дедлайн батча (§10).
 
 ### UC-16 Повтор упавших
 
@@ -1439,6 +1445,8 @@ flowchart LR
 ```
 BEGIN; SET LOCAL lock_timeout = '5s'
  1. SELECT id FROM th_item WHERE id = ANY(:ids) ORDER BY id FOR UPDATE      -- порядок блокировок
+    SELECT worker_id, attempt FROM th_lease WHERE item_id = ANY(:ids) ORDER BY item_id FOR UPDATE
+      → finish/release попытки, которой lease уже не принадлежит, отбрасываются (UC-03)
  2. UPDATE th_item SET state, label, result, error, finished_at
       WHERE id = ANY(:ids) AND state = active RETURNING id, batch_id, state, label, weight
                                                                             -- считаем только вернувшиеся
@@ -1529,7 +1537,8 @@ ratio_корня = Σ w_done_детей / Σ ожидаемый w_total_дете
 | PostgreSQL недоступен при claim, release или finish | операция бросает `CompleterError`; адаптер flexiq добавляет её в `retry_on` задачи, поэтому джоба уходит в ретрай брокера, а не сразу в DLQ (§11.3) | как у брокера; незавершённый lease — `lease_ttl` |
 | Джоба ушла в DLQ, не завершив Item и не оставив lease: PostgreSQL недоступен дольше ретраев брокера, событие DLQ потеряно или его обработчик тоже не смог записать итог | сверка с DLQ в процессах с адаптером: `error("exhausted")`, если мёртвая джоба — текущее поколение отправки Item (UC-15) | `sweep_interval` после восстановления PostgreSQL |
 | Воркер убит посреди задачи | lease + heartbeat → sweeper | `lease_ttl` (60 с) |
-| Задача пережила свой lease: Item завершён sweeper-ом (`lease_expired`), отменён или перехвачен, а задача вызывает `complete_in` | проверка lease попытки под блокировкой строки `th_item` → `LeaseLostError`, транзакция пользователя откатывается, обёртка завершает попытку без записи итога и без ретрая (UC-08) | мгновенно |
+| Задача пережила свой lease: Item завершён sweeper-ом (`lease_expired`), отменён или перехвачен, а задача вызывает `complete_in` или завершается (путь A: успех, `RETRY`, `FINAL`) | проверка lease попытки (`worker_id`, `attempt`) под блокировкой строки `th_item`: `complete_in` бросает `LeaseLostError`, транзакция пользователя откатывается; `finish`/`release` пути A ничего не пишут. Обёртка завершает попытку без записи итога и без ретрая (UC-03, UC-08) | мгновенно |
+| Событие DLQ о джобе прошлого поколения или о джобе, закрытой при живом выполнении | обработчик события применяет правило сверки (UC-15): поколение, lease, outbox | мгновенно |
 | Процесс останавливается штатно (`SIGTERM`), а задачи ещё выполняются или операции лежат в буфере | `th.aclose()`: буфер Completer досылается, удержанные Items возвращаются в outbox без траты попытки (§11.1) | мгновенно, повторная отправка — `relay_grace` + `sweep_interval`; если закрытие не уложилось в `close_timeout` — `lease_ttl` |
 | Воркер убит посреди flush Completer | транзакция откатилась, задача не вернула результат → повтор брокера | как у брокера |
 | Две параллельные «последние» задачи | проверка после commit + CAS финализации | мгновенно |
@@ -1677,10 +1686,10 @@ await th.migrate()  # или ревизии Alembic: upgrade(..., version=1), з
 | Middleware только синхронные `before/after`, around-хука нет; `on_retry/on_dead_letter` вызываются вне задачи с `SimpleNamespace(id, task_name)` | На sync-хуках нельзя `await` Completer | **`@fq.task(...)` = `queue.task(...)(tracked(fn))`**: обёртка — `async def` в том же event loop, что и задача, то есть настоящий around. `functools.wraps` сохраняет `module.qualname`, имя задачи не меняется |
 | Async-задачи идут в одном event loop на процесс (поток `flexiq-async-executor`, семафор `async_concurrency=100`) | Completer должен жить в этом loop | Completer создаётся лениво в loop первой задачи. Отслеживаемые задачи — только `async def` (проверка при декорировании) |
 | Prefork-пул исполняет async-задачу через `asyncio.run` в новом event loop на каждую джобу, на Windows — `NotImplementedError` (спайк T8.0) | Completer и lease не переживают джобу | v1 поддерживает только `pool="thread"`. Prefork — ошибка при `install` |
-| В задаче известен `current_job.retry_count`, но не `max_retries`; решение «ретрай или DLQ» принимает Rust **после** задачи (`retry_on/dont_retry_on`, `retry_budget`, circuit breaker) | Задача не знает точно, последняя ли это попытка | `retry_verdict(exc)` считает по конфигу `TaskWrapper` и `retry_count`. Страховка: событие `JOB_DEAD` (`queue.on_event`, пул `flexiq-events`) через `loop.call_soon_threadsafe` → `finish(error)` с идемпотентным CAS + периодическая сверка `dead_letters_after` → `get_job(original_job_id)` → `_th` из payload (D-014) → правило UC-15 |
+| В задаче известен `current_job.retry_count`, но не `max_retries`; решение «ретрай или DLQ» принимает Rust **после** задачи (`retry_on/dont_retry_on`, `retry_budget`, circuit breaker) | Задача не знает точно, последняя ли это попытка | `retry_verdict(exc)` считает по конфигу `TaskWrapper` и `retry_count`. Страховка: событие `JOB_DEAD` (`queue.on_event`, пул `flexiq-events`) через `loop.call_soon_threadsafe` → `aget_job` → `_th` (Item и поколение) → правило UC-15 в транзакции события + периодическая сверка `dead_letters_after` → `get_job(original_job_id)` → `_th` из payload (D-014) → правило UC-15 |
 | `dead_letters_after` листает DLQ **от новых записей к старым** (`failed_at DESC`), курсор страницы ведёт вглубь истории и равен `None` на последней странице; `failed_at` ставит воркер по своим часам | Курсором flexiq нельзя «дочитать новое»; запись воркера с отстающими часами появляется ниже уже разобранных | Курсор сверки — свой: водяной знак `failed_at` самой новой разобранной записи и позиция незаконченного обхода. Каждый обход идёт от самой новой записи вниз до `водяной знак − dead_letter_overlap` (15 мин, параметр `FlexiqAdapter`), по странице в 200 записей за вызов. Записи внутри перекрытия отдаются повторно на каждом обходе — правило UC-15 идемпотентно; соответствие «запись DLQ → Item» кэшируется в процессе. Первый обход разбирает всю сохранившуюся историю DLQ |
 | Нет transactional enqueue: у flexiq свой пул соединений в Rust | Без нашего outbox — dual write | Наш outbox и relay обязательны. Это прямая ценность библиотеки для flexiq |
-| `idempotency_key` дедуплицирует только пока джоба pending/running | Повтор relay после падения может создать дубль | Relay передаёт `idempotency_key=f"th:{item_id}"`. Поздние дубли отсекает наш claim |
+| `idempotency_key` дедуплицирует только пока джоба pending/running | Повтор relay после падения может создать дубль; повторная отправка нового поколения с тем же ключом слилась бы с живой джобой прошлого | Relay передаёт `idempotency_key=f"th:{item_id}:{generation}"`: повтор relay той же записи outbox дедуплицируется (D-013 — поштучный `enqueue` при дубле в пачке), новое поколение получает свою джобу (UC-15). Поздние дубли отсекает наш claim. Ключ пользователя (`idempotency_key`, `unique_key`) передаётся как есть (§11.4) |
 | `aenqueue_many` — это sync `enqueue_many` в общем `ThreadPoolExecutor(max_workers=2)`; один набор `task_name, queue, priority, max_retries, timeout` на вызов; `None` берёт умолчания Queue, а не `@task`; дубль `idempotency_key` роняет всю пачку | Узкое место отправки, потеря опций задачи | Relay передаёт опции задачи явно, группирует по `(task_name, queue, priority, max_retries, timeout)`, шлёт чанками по 1 000 через **свой** executor; при дубле ключа — поштучный `enqueue`. То же умолчание `max_retries` адаптер отдаёт sweeper-у через `RetryLimits` (UC-15) |
 | Нет per-job heartbeat; мёртвый воркер обнаруживается через ~43 с (порог 30 с + heartbeat воркеров + цикл reaper), его джобы уходят в retry и тратят попытку | Ретрай flexiq может прийти при ещё живом нашем lease | Claim при живом чужом lease отдаёт успех и помечает lease `redelivered`. Item остаётся за lease: если владелец lease умер, sweeper переотправит Item по истечении (задержка ≤ `lease_ttl`); если он жив и завершит попытку вердиктом `RETRY`, `release` сам вернёт Item в outbox (UC-04) |
 | `requeue_job` возвращает Running-джобу в Pending, не останавливая исходное выполнение; успех повторной доставки завершает джобу, а отчёт исходного выполнения об ошибке после этого отбрасывается | После no-op дубля ретрая от брокера не будет | То же: `th_lease.redelivered` + возврат в outbox при `release`. Новая джоба получает свой бюджет ретраев |
@@ -1701,7 +1710,7 @@ sequenceDiagram
     participant F as Функция пользователя
     participant H as on_dead_letter (sync)
 
-    R->>Q: enqueue_many(task, kwargs_list с _th={i,b,r[,g]}, metadata, idempotency_key=th:item)
+    R->>Q: enqueue_many(task, kwargs_list с _th={i,b,r[,g]}, metadata, idempotency_key=th:item:g)
     Q->>X: run_coroutine_threadsafe(job)
     X->>W: await wrapper(*args, _th=...)
     W->>C: claim(item)
@@ -1724,11 +1733,11 @@ sequenceDiagram
     end
     opt Rust отправил в DLQ вопреки вердикту RETRY
         Q->>H: on_dead_letter(ctx.id)
-        H->>C: call_soon_threadsafe(finish_dead(job_id)) → aget_job → kwargs._th → item
+        H->>C: call_soon_threadsafe(finish_dead(job_id)) → aget_job → kwargs._th → item, поколение → правило UC-15
     end
 ```
 
-Исключение `LeaseLostError` из `complete_in` в ветку «исключение» не попадает: обёртка не вызывает `retry_verdict`, ничего не пишет и возвращает `None`, flexiq фиксирует успех (UC-08).
+Исключение `LeaseLostError` из `complete_in` в ветку «исключение» не попадает: обёртка не вызывает `retry_verdict`, ничего не пишет и возвращает `None`, flexiq фиксирует успех (UC-08). Так же завершается ветка «исключение», если `finish` или `release` попытки ничего не записали: lease уже не у неё (UC-03).
 
 ### 11.4 Опции постановки flexiq
 
@@ -1742,7 +1751,7 @@ sequenceDiagram
 | `priority`, `queue`, `max_retries`, `timeout`, `result_ttl` | передаются как есть | A-FQ-04 |
 | `expires` | передаётся как есть. Просроченную джобу flexiq не выполнит, поэтому relay при отправке пишет `th_expiry(item_id, expires_at)` — узкую side-таблицу, только для Items с `expires`. Claim удаляет строку; sweeper завершает не захваченные вовремя Items как `error("expired")`. Иначе такой Item висел бы в `dispatched` вечно | A-FQ-04 |
 | `delay` | отсчитывается от момента отправки relay'ем. Отложенный старт всего батча — `start_at` | A-FQ-05 |
-| `idempotency_key` / `unique_key` / `idempotent` | если пользователь задал свой ключ, передаётся его ключ, а повторную отправку отсекает наш claim. Иначе наш `th:{item_id}` | A-FQ-06 |
+| `idempotency_key` / `unique_key` / `idempotent` | если пользователь задал свой ключ, передаётся его ключ, а повторную отправку отсекает наш claim. Иначе наш `th:{item_id}:{generation}`: повтор relay дедуплицируется, повторная отправка нового поколения — нет (§11.3) | A-FQ-06 |
 | `depends_on` | **не поддерживается** для отслеживаемых задач: id джоб flexiq неизвестны при постановке. Явная ошибка `UnsupportedOption`, альтернатива — этапы `fed_by` | A-FQ-07 |
 | `debounce*`, `@task(batch=...)` | **не поддерживается**: flexiq сливает или буферизует задачи в памяти, и это ломает правило «один Item — одна джоба». Ошибка при декорировании или постановке | A-FQ-07 |
 | параметры задачи (`retry_on`, `dont_retry_on`, `retry_backoff`, `retry_delays`, `retry_budget`, `circuit_breaker`, `soft_timeout`, `rate_limit`, `max_concurrent`, `middleware`, `inject`, `serializer`, `codecs`, `predicate`) | работают как у обычной задачи flexiq; `retry_verdict` учитывает фильтры ретраев, бюджет и breaker страхуются сверкой с DLQ. К непустому `retry_on` адаптер добавляет `CompleterError` (§11.3) | A-FQ-08 … A-FQ-12 |

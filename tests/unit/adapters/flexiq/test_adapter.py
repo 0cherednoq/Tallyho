@@ -44,7 +44,8 @@ if TYPE_CHECKING:
 
     from flexiq import Queue
 
-    from tallyho.engine.completer import Completer, FinishResult, ItemRef
+    from tallyho.engine.completer import Completer
+    from tallyho.engine.dead_letters import DeadLetterReconciler
     from tallyho.engine.spawn import TreeCache
     from tallyho.protocols.broker import DeadLetters, WorkerRuntime
 
@@ -186,23 +187,26 @@ class _CurrentJob:
 
 
 @final
-class _FakeCompleter:
+class _FakeDeadLetters:
+    """Сверка с DLQ движка: запоминает, что событие передало правилу UC-15."""
+
     def __init__(self, *, fail: bool = False) -> None:
         self.fail = fail
-        self.finished: list[tuple[ItemRef, FinishResult]] = []
+        self.settled: list[tuple[tuple[DeadLetter, ...], str]] = []
 
-    async def finish(self, ref: ItemRef, value: FinishResult) -> bool:
+    async def settle(self, entries: Sequence[DeadLetter], *, error_type: str) -> int:
         await asyncio.sleep(0)
         if self.fail:
             raise RuntimeError(_FAILURE)
-        self.finished.append((ref, value))
-        return True
+        self.settled.append((tuple(entries), error_type))
+        return len(entries)
 
 
 def _services(
     completer: object | None = None,
     *,
     adapter: FlexiqAdapter | None = None,
+    dead_letters: _FakeDeadLetters | None = None,
 ) -> RuntimeServices:
     raw_completer = object() if completer is None else completer
     tree_cache = object()
@@ -224,16 +228,20 @@ def _services(
         tree_cache=cast("TreeCache", tree_cache),
         heartbeat_every=timedelta(seconds=10),
         runtime=runtime,
+        dead_letters=cast("DeadLetterReconciler | None", dead_letters),
     )
 
 
 def _adapter(
-    *, pool: str = "thread", completer: object | None = None
+    *,
+    pool: str = "thread",
+    completer: object | None = None,
+    dead_letters: _FakeDeadLetters | None = None,
 ) -> tuple[FlexiqAdapter, _FakeQueue]:
     queue = _FakeQueue()
     adapter = FlexiqAdapter(cast("Queue", cast("object", queue)), pool=pool)
     if pool == "thread":
-        adapter.install_runtime(_services(completer, adapter=adapter))
+        adapter.install_runtime(_services(completer, adapter=adapter, dead_letters=dead_letters))
     return adapter, queue
 
 
@@ -355,7 +363,7 @@ async def test_dispatch_maps_options_markers_and_user_keys_exactly() -> None:
     assert batch["notes_list"] == [notes, None]
     assert batch["expires_list"] == [2.5, 30.0]
     assert batch["result_ttl_list"] == [44, None]
-    assert batch["idempotency_keys"] == [f"th:{first.id}", f"th:{second.id}"]
+    assert batch["idempotency_keys"] == [f"th:{first.id}:0", f"th:{second.id}:0"]
     markers = [kwargs["_th"] for kwargs in cast("list[dict[str, object]]", batch["kwargs_list"])]
     assert markers == [
         {"i": str(first.id), "b": str(first.batch_id), "r": 6},
@@ -389,15 +397,16 @@ async def test_dispatch_groups_by_task_and_chunks_at_one_thousand() -> None:
 async def test_duplicate_batch_falls_back_to_idempotent_single_enqueue() -> None:
     adapter, queue = _adapter()
     name = adapter.task_name(adapter.task(name="echo")(_echo))
-    messages = [_message(adapter, name), _message(adapter, name)]
+    messages = [_message(adapter, name), replace(_message(adapter, name), generation=4)]
     queue.reject_many_once = True
 
     await adapter.dispatch(messages)
 
+    # D-013: дубль ключа в пачке — поштучный повтор с теми же ключами поколений.
     assert queue.many == []
     assert [item["idempotency_key"] for item in queue.one] == [
-        f"th:{messages[0].id}",
-        f"th:{messages[1].id}",
+        f"th:{messages[0].id}:0",
+        f"th:{messages[1].id}:4",
     ]
     await adapter.close()
 
@@ -815,6 +824,30 @@ async def test_item_marker_carries_generation_only_after_redispatch() -> None:
     await adapter.close()
 
 
+async def test_own_idempotency_key_separates_send_generations() -> None:
+    adapter, queue = _adapter()
+    name = adapter.task_name(adapter.task(name="echo")(_echo))
+    first = _message(adapter, name)
+    resent = replace(first, generation=1)
+    custom = replace(first, generation=1, options={"idempotency_key": "user-idem"})
+    unique = replace(first, generation=1, options={"unique_key": "user-unique"})
+
+    await adapter.dispatch([first, first, resent, custom, unique])
+
+    # Повтор relay той же записи outbox — тот же ключ; новое поколение — свой ключ,
+    # иначе flexiq слил бы его с ещё живой джобой прошлой отправки. Ключи
+    # пользователя не меняются, а при unique_key свой ключ не подставляется.
+    keys = [key for call in queue.many for key in cast("list[object]", call["idempotency_keys"])]
+    assert keys == [
+        f"th:{first.id}:0",
+        f"th:{first.id}:0",
+        f"th:{first.id}:1",
+        "user-idem",
+        None,
+    ]
+    await adapter.close()
+
+
 async def test_callback_marker_contains_stable_callback_identity() -> None:
     adapter, queue = _adapter()
     name = adapter.task_name(adapter.task(name="echo")(_echo))
@@ -1022,14 +1055,20 @@ def test_install_rejects_bad_services_and_version(monkeypatch: pytest.MonkeyPatc
         adapter.install_runtime(_services())
 
 
-async def test_job_dead_event_finishes_item_on_worker_loop() -> None:
-    completer = _FakeCompleter()
-    adapter, queue = _adapter(completer=completer)
+@pytest.mark.parametrize("generation", [0, 3])
+async def test_job_dead_event_passes_item_and_generation_to_reconciliation_rule(
+    generation: int,
+) -> None:
+    dead_letters = _FakeDeadLetters()
+    adapter, queue = _adapter(dead_letters=dead_letters)
     task = adapter.task(name="echo")(_echo)
     await task("bind-loop")
     item_id = uuid4()
     batch_id = uuid4()
-    payload = adapter.encode("echo", (), {"_th": {"i": item_id, "b": batch_id, "r": 3}})
+    marker: dict[str, object] = {"i": item_id, "b": batch_id, "r": 3}
+    if generation:
+        marker["g"] = generation
+    payload = adapter.encode("echo", (), {"_th": marker})
     queue.jobs["dead-job"] = _Job(_StoredJob("echo", payload))
     callback = queue.events[EventType.JOB_DEAD]
 
@@ -1038,16 +1077,29 @@ async def test_job_dead_event_finishes_item_on_worker_loop() -> None:
     await asyncio.sleep(0)
     await adapter.close()
 
-    assert len(completer.finished) == 1
-    ref, result = completer.finished[0]
-    assert ref.id == item_id
-    assert result.label == "exhausted"
-    assert result.error == {"type": "FlexiqDeadLetter", "message": "boom"}
+    # Безусловного finish нет: поколение, lease и outbox проверяет правило сверки.
+    assert dead_letters.settled == [
+        ((DeadLetter(item_id, generation, "boom"),), "FlexiqDeadLetter")
+    ]
+
+
+async def test_job_dead_event_without_reconciler_is_reported() -> None:
+    adapter, queue = _adapter()
+    task = adapter.task(name="echo")(_echo)
+    await task("bind-loop")
+    payload = adapter.encode("echo", (), {"_th": {"i": str(uuid4()), "b": str(uuid4())}})
+    queue.jobs["dead-job"] = _Job(_StoredJob("echo", payload))
+
+    queue.events[EventType.JOB_DEAD](EventType.JOB_DEAD, {"job_id": "dead-job"})
+    await asyncio.sleep(0)
+    with pytest.raises(ConfigurationError, match="сверка с DLQ не собрана"):
+        await _services().finish_dead(uuid4(), generation=0, error_type="t", detail="d")
+    await adapter.close()
 
 
 async def test_job_dead_event_is_best_effort_for_missing_job_and_finish_failure() -> None:
-    completer = _FakeCompleter(fail=True)
-    adapter, queue = _adapter(completer=completer)
+    dead_letters = _FakeDeadLetters(fail=True)
+    adapter, queue = _adapter(dead_letters=dead_letters)
     task = adapter.task(name="echo")(_echo)
     await task("bind-loop")
     callback = queue.events[EventType.JOB_DEAD]
@@ -1062,14 +1114,14 @@ async def test_job_dead_event_is_best_effort_for_missing_job_and_finish_failure(
     await asyncio.sleep(0)
     await adapter.close()
 
-    assert completer.finished == []
+    assert dead_letters.settled == []
 
 
 async def test_close_does_not_wait_for_dlq_tasks_of_the_worker_loop(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # DLQ-задачи живут в loop исполнителя flexiq, а close могут вызвать из другого loop.
-    adapter, queue = _adapter(completer=_FakeCompleter())
+    adapter, queue = _adapter(dead_letters=_FakeDeadLetters())
     task = adapter.task(name="echo")(_echo)
     entered = threading.Event()
     release = threading.Event()

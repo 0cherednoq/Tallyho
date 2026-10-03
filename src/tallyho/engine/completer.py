@@ -390,6 +390,8 @@ class _Heartbeat:
 class _Release:
     item: ItemRef
     future: asyncio.Future[bool]
+    attempt: int | None = None
+    """Попытка-владелец lease (UC-03); ``None`` — проверка только по ``worker_id``."""
 
 
 @dataclass(eq=False, slots=True)
@@ -397,6 +399,8 @@ class _Finish:
     item: ItemRef
     value: FinishResult
     future: asyncio.Future[bool]
+    attempt: int | None = None
+    """Попытка-владелец lease (UC-03); ``None`` — без проверки lease, только CAS."""
 
 
 _Op = _Claim | _Heartbeat | _Release | _Finish
@@ -449,6 +453,10 @@ class _Applied:
     beating: set[UUID] = field(default_factory=set["UUID"])
     """Items, чей lease продлён heartbeat'ом: lease всё ещё у этого процесса."""
     released: set[UUID] = field(default_factory=set["UUID"])
+    releasers: dict[UUID, _Release] = field(default_factory=dict["UUID", _Release])
+    """Операция release, применённая к Item: другие release того же Item в пачке — ``False``."""
+    finishers: dict[UUID, _Finish] = field(default_factory=dict["UUID", _Finish])
+    """Операция finish, переданная в CAS: другие finish того же Item в пачке — ``False``."""
     requeued: set[UUID] = field(default_factory=set["UUID"])
     """Items, которые release вернул в outbox: дубль доставки уже закрыл джобу брокера."""
     finalize: set[UUID] = field(default_factory=set["UUID"])
@@ -847,6 +855,24 @@ class _Tx:
             if (lease := self.leases.get(item_id)) is not None and lease.worker_id == worker
         )
 
+    def owns(self, item_id: UUID, attempt: int) -> bool:
+        """Взят ли lease Item этим процессом для попытки ``attempt`` (UC-03, D-053).
+
+        Читает строку, заблокированную :meth:`lock_leases`. Срок lease не
+        проверяется: истёкший, но никем не перехваченный lease всё ещё
+        принадлежит попытке. Перехват (claim другого процесса или этого же)
+        меняет ``worker_id`` или ``attempt``, sweeper и ``release`` удаляют строку.
+
+        Returns:
+            ``True``, если lease принадлежит этой попытке этого процесса.
+        """
+        lease = self.leases.get(item_id)
+        return (
+            lease is not None
+            and lease.worker_id == self.c.settings.worker_id
+            and lease.attempt == attempt
+        )
+
     def holds(self, item: ItemRef, attempt: int) -> bool:
         """Владеет ли попытка ``attempt`` этого процесса активным Item (UC-08).
 
@@ -859,14 +885,11 @@ class _Tx:
             ``True``, если завершить Item вправе эта попытка.
         """
         row = self.items.get(item.id)
-        lease = self.leases.get(item.id)
         return (
             row is not None
-            and lease is not None
             and row.batch_id == item.batch_id
             and not row.state.is_terminal
-            and lease.worker_id == self.c.settings.worker_id
-            and lease.attempt == attempt
+            and self.owns(item.id, attempt)
         )
 
     async def release(self, item_ids: Iterable[UUID]) -> None:
@@ -1243,6 +1266,50 @@ _ACTIVE: Final = literal_column(str(int(ItemState.ACTIVE)), SmallInteger())
 _INFINITY: Final = literal_column("'infinity'::timestamptz", DateTime(timezone=True))
 
 
+def _expansion_batches(finish_ops: Sequence[_Finish], batch_ids: list[UUID]) -> bool:
+    """Добавить в ``batch_ids`` батчи, которые меняют spawn, expect и под-батчи.
+
+    Returns:
+        ``True``, если пачка создаёт под-батчи: строки батчей нужны ``FOR UPDATE``.
+    """
+    writes_structure = False
+    for op in finish_ops:
+        value = op.value
+        for spawn_request in value.spawns:
+            route = spawn_request.route
+            batch_ids.extend([route.source_id, route.target_id, route.root_id])
+        for expect_request in value.expects:
+            route = expect_request.route
+            batch_ids.extend([route.source_id, route.target_id, route.root_id])
+        for sub_batch in value.sub_batches:
+            writes_structure = True
+            batch_ids.extend(sub_batch.spec.fed_by)
+    return writes_structure
+
+
+_Owned = TypeVar("_Owned", _Release, _Finish)
+
+
+def _owners(tx: _Tx, ops: Sequence[_Owned]) -> dict[UUID, _Owned]:
+    """Первая операция каждого Item, которой разрешено писать (UC-03).
+
+    Операция с ``attempt`` проходит, только если lease взят этим процессом
+    для этой попытки; без ``attempt`` — всегда (CAS по ``state`` сам
+    идемпотентен). Устаревшая и текущая попытки того же Item могут прийти в
+    одну пачку: применяется операция владельца.
+
+    Returns:
+        Item → операция, которая к нему применяется.
+    """
+    chosen: dict[UUID, _Owned] = {}
+    for op in ops:
+        if op.item.id in chosen:
+            continue
+        if op.attempt is None or tx.owns(op.item.id, op.attempt):
+            chosen[op.item.id] = op
+    return chosen
+
+
 def _small(value: int) -> ColumnElement[int]:
     # Коды состояний — литералами, а не bind-параметрами (D-020).
     return literal_column(str(int(value)), SmallInteger())
@@ -1390,7 +1457,7 @@ class Completer:
         op = _Heartbeat(item, (progress_done, progress_total), future)
         return await self._submit(op, future)
 
-    async def release(self, item: ItemRef) -> bool:
+    async def release(self, item: ItemRef, *, attempt: int | None = None) -> bool:
         """Отпустить lease перед ретраем брокера: ``attempt += 1`` (UC-04, вердикт RETRY).
 
         Если за время выполнения брокеру был подтверждён дубль доставки этого
@@ -1400,23 +1467,37 @@ class Completer:
 
         Args:
             item: Item, захваченный этим процессом.
+            attempt: Номер попытки из claim. С ним lease отпускается, только
+                если взят этим процессом для этой попытки (UC-03): попытка,
+                чей lease перехвачен, даже этим же процессом, ничего не пишет.
 
         Returns:
-            ``True``, если lease был у этого процесса и удалён.
+            ``True``, если lease был у этого процесса (и этой попытки) и удалён.
         """
         future = self._new_future(bool)
-        return await self._submit(_Release(item, future), future)
+        return await self._submit(_Release(item, future, attempt), future)
 
     async def finish(
         self,
         item: ItemRef,
         value: FinishResult,
+        *,
+        attempt: int | None = None,
     ) -> bool:
         """Завершить Item идемпотентным CAS и дождаться commit.
 
+        Args:
+            item: Завершаемый Item.
+            value: Итог и накопленные динамические операции.
+            attempt: Номер попытки из claim. С ним Item завершается, только если
+                lease взят этим процессом для этой попытки (UC-03): иначе не
+                пишется ничего — ни итог, ни удаление чужого lease. ``None`` —
+                только CAS по ``state``.
+
         Returns:
             ``True``, если этот вызов перевёл Item из active в терминальное
-            состояние; ``False`` для повторного или уже завершённого Item.
+            состояние; ``False`` для повторного или уже завершённого Item и
+            для попытки, которой lease уже не принадлежит.
 
         Raises:
             ConfigurationError: есть динамические операции, но Completer
@@ -1425,7 +1506,7 @@ class Completer:
         if (value.spawns or value.sub_batches) and self.triggers.producer is None:
             raise ConfigurationError(_SPAWN_SERVICES)
         future = self._new_future(bool)
-        return await self._submit(_Finish(item, value, future), future)
+        return await self._submit(_Finish(item, value, future, attempt), future)
 
     async def complete_in(
         self,
@@ -1757,8 +1838,8 @@ class Completer:
         claims: dict[UUID, ItemRef] = {}
         repeated: set[UUID] = set()
         beats: dict[UUID, _Progress] = {}
-        releases: set[UUID] = set()
-        finishes: dict[UUID, tuple[ItemRef, FinishResult]] = {}
+        release_ops: list[_Release] = []
+        finish_ops: list[_Finish] = []
         for op in ops:
             if isinstance(op, _Claim):
                 if op.item.id in claims:
@@ -1772,42 +1853,29 @@ class Completer:
                     total if new_total is None else new_total,
                 )
             elif isinstance(op, _Release):
-                releases.add(op.item.id)
+                release_ops.append(op)
             else:
-                _ = finishes.setdefault(op.item.id, (op.item, op.value))
+                finish_ops.append(op)
         # Все блокировки строк — в начале и по порядку: batch → item → lease.
         batch_ids = [ref.batch_id for ref in claims.values()]
         # release может вернуть Item в outbox, а там важна пауза батча.
         batch_ids.extend(op.item.batch_id for op in ops if isinstance(op, _Finish | _Release))
-        writes_structure = False
-        for _, value in finishes.values():
-            for spawn_request in value.spawns:
-                batch_ids.extend(
-                    [
-                        spawn_request.route.source_id,
-                        spawn_request.route.target_id,
-                        spawn_request.route.root_id,
-                    ]
-                )
-            for expect_request in value.expects:
-                batch_ids.extend(
-                    [
-                        expect_request.route.source_id,
-                        expect_request.route.target_id,
-                        expect_request.route.root_id,
-                    ]
-                )
-            for sub_batch in value.sub_batches:
-                writes_structure = True
-                batch_ids.extend(sub_batch.spec.fed_by)
+        writes_structure = _expansion_batches(finish_ops, batch_ids)
         await tx.lock_batches(batch_ids, write=writes_structure)
-        await tx.lock_items([*releases, *claims, *finishes])
-        await tx.lock_leases([*releases, *claims, *beats, *finishes])
+        touched = [op.item.id for op in release_ops]
+        touched.extend(op.item.id for op in finish_ops)
+        await tx.lock_items([*touched, *claims])
+        await tx.lock_leases([*touched, *claims, *beats])
         # release раньше claim: ретрай брокера мог прийти в ту же пачку.
-        await tx.release(releases)
+        tx.applied.releasers = _owners(tx, release_ops)
+        await tx.release(tx.applied.releasers)
         await tx.claim(claims)
         await tx.mark_redelivered(repeated)
         await tx.heartbeat(beats)
+        # Владение — после claim: перехват lease в этой же пачке отнимает Item у
+        # устаревшей попытки (UC-03).
+        tx.applied.finishers = _owners(tx, finish_ops)
+        finishes = {item_id: (op.item, op.value) for item_id, op in tx.applied.finishers.items()}
         await tx.finish(finishes)
         await tx.expand(finishes)
         await tx.write_counters()
@@ -1816,8 +1884,6 @@ class Completer:
 
     def _resolve(self, ops: Sequence[_Op], applied: _Applied) -> None:
         seen: set[UUID] = set()
-        released: set[UUID] = set()
-        finished: set[UUID] = set()
         for op in ops:
             if isinstance(op, _Claim):
                 self._resolve_claim(op, applied.claims[op.item.id], again=op.item.id in seen)
@@ -1825,14 +1891,17 @@ class Completer:
                 continue
             if isinstance(op, _Heartbeat):
                 value = op.item.id in applied.beating
+                drop = not value
+            # Повторный release или finish того же Item в пачке уже ничего не
+            # меняет. Отброшенная операция попытки, потерявшей lease, не
+            # трогает _held: Item, возможно, снова у этого процесса.
             elif isinstance(op, _Release):
-                # Повторный release того же Item в пачке уже ничего не отпускает.
-                value = op.item.id in applied.released and op.item.id not in released
-                released.add(op.item.id)
+                drop = applied.releasers.get(op.item.id) is op
+                value = drop and op.item.id in applied.released
             else:
-                value = op.item.id in applied.finished and op.item.id not in finished
-                finished.add(op.item.id)
-            if not value or isinstance(op, _Release | _Finish):
+                drop = applied.finishers.get(op.item.id) is op
+                value = drop and op.item.id in applied.finished
+            if drop:
                 _ = self._held.pop(op.item.id, None)
             if not op.future.done():
                 op.future.set_result(value)

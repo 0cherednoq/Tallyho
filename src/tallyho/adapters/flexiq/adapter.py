@@ -692,12 +692,7 @@ class FlexiqAdapter(
             "notes_list": [item.notes for item in chunk],
             "expires_list": [item.expires for item in chunk],
             "result_ttl_list": [item.result_ttl for item in chunk],
-            "idempotency_keys": [
-                item.idempotency_key
-                if item.idempotency_key is not None or item.unique_key is not None
-                else f"th:{item.message.id}"
-                for item in chunk
-            ],
+            "idempotency_keys": [_idempotency_key(item) for item in chunk],
             "idempotent": first.idempotent,
         }
 
@@ -717,11 +712,7 @@ class FlexiqAdapter(
             "notes": item.notes,
             "expires": item.expires,
             "result_ttl": item.result_ttl,
-            "idempotency_key": (
-                item.idempotency_key
-                if item.idempotency_key is not None or item.unique_key is not None
-                else f"th:{item.message.id}"
-            ),
+            "idempotency_key": _idempotency_key(item),
             "idempotent": item.idempotent,
         }
 
@@ -753,9 +744,11 @@ class FlexiqAdapter(
         services = self._services
         if services is None:
             raise ConfigurationError(_NOT_INSTALLED)
+        # Правило сверки (UC-15): событие о джобе прошлого поколения или о
+        # джобе, закрытой при живом выполнении, Item не завершает.
         await services.finish_dead(
             marker.item_id,
-            marker.batch_id,
+            generation=marker.generation,
             error_type="FlexiqDeadLetter",
             detail=detail,
         )
@@ -888,6 +881,15 @@ def _with_infrastructure_retries(config: _TaskConfig) -> _TaskConfig:
         error for error in _INFRASTRUCTURE_ERRORS if not issubclass(error, config.retry_on)
     )
     return replace(config, retry_on=(*config.retry_on, *missing)) if missing else config
+
+
+def _idempotency_key(item: _Prepared) -> str | None:
+    # Ключ пользователя — как есть (§11.4). Свой ключ включает поколение отправки:
+    # повтор relay той же записи outbox flexiq сольёт с ещё живой джобой, а новое
+    # поколение получит свою джобу и свою запись DLQ (ARCHITECTURE UC-15, §11.3).
+    if item.idempotency_key is not None or item.unique_key is not None:
+        return item.idempotency_key
+    return f"th:{item.message.id}:{item.message.generation}"
 
 
 def _major_version() -> int:
