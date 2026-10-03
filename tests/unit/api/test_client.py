@@ -34,6 +34,10 @@ class FakeEngine:
     def execution_options(self, **_options: object) -> Self:
         return self
 
+    def get_execution_options(self) -> dict[str, object]:
+        # Без schema= схема блокировки лидера берётся из опций движка.
+        return {}
+
 
 class Adapter:
     """Dispatcher с необязательным worker install hook."""
