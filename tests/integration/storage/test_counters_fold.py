@@ -1,4 +1,4 @@
-"""Свёртка дельт пути B: ``fold_deltas`` на PostgreSQL."""
+"""Свёртка дельт пути B: ``fold_delta_ids`` на PostgreSQL."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from sqlalchemy import func, select
 from tallyho.storage.counters import (
     CounterDelta,
     CounterTotals,
-    fold_deltas,
+    fold_delta_ids,
     insert_delta,
     read_counters,
     upsert_slots,
@@ -19,7 +19,7 @@ from tallyho.storage.counters import (
 from tests.helpers.db import schema_connection, schema_transaction
 
 if TYPE_CHECKING:
-    from sqlalchemy.ext.asyncio import AsyncEngine
+    from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
     from tallyho.storage.tables import Tables
 
@@ -28,11 +28,18 @@ B = UUID(int=2)
 SLOT = 3
 
 
+async def visible_ids(conn: AsyncConnection, tables: Tables, *batch_ids: UUID) -> list[int]:
+    delta = tables.counter_delta
+    rows = await conn.scalars(select(delta.c.id).where(delta.c.batch_id.in_(batch_ids)))
+    return list(rows)
+
+
 async def fold_into_slot(
-    engine: AsyncEngine, schema: str, tables: Tables, *ids: UUID
+    engine: AsyncEngine, schema: str, tables: Tables, *batch_ids: UUID
 ) -> dict[UUID, CounterDelta]:
     async with schema_transaction(engine, schema) as conn:
-        folded = await fold_deltas(conn, tables, ids)
+        ids = await visible_ids(conn, tables, *batch_ids)
+        folded = await fold_delta_ids(conn, tables, ids)
         await upsert_slots(conn, tables, {(b, SLOT): d for b, d in folded.items()})
     return folded
 
@@ -49,8 +56,8 @@ async def read_a(engine: AsyncEngine, schema: str, tables: Tables) -> CounterTot
 
 async def test_fold_nothing(engine: AsyncEngine, schema: str, tables: Tables) -> None:
     async with schema_transaction(engine, schema) as conn:
-        assert await fold_deltas(conn, tables, []) == {}
-        assert await fold_deltas(conn, tables, [A]) == {}
+        assert await fold_delta_ids(conn, tables, []) == {}
+        assert await fold_delta_ids(conn, tables, [1]) == {}
 
 
 async def test_fold_moves_deltas_into_slot(
@@ -83,8 +90,12 @@ async def test_uncommitted_deltas_are_not_folded(
     engine: AsyncEngine, schema: str, tables: Tables
 ) -> None:
     async with schema_connection(engine, schema) as user:
-        await insert_delta(user, tables, {A: CounterDelta(total=1, ok=1)}, created_at=func.now())
-        assert await fold_into_slot(engine, schema, tables, A) == {}
+        inserted = await insert_delta(
+            user, tables, {A: CounterDelta(total=1, ok=1)}, created_at=func.now()
+        )
+        async with schema_transaction(engine, schema) as conn:
+            # Id известен (его вернул complete_in), но строка ещё не видна снимку.
+            assert await fold_delta_ids(conn, tables, inserted[A]) == {}
         await user.commit()
     assert await fold_into_slot(engine, schema, tables, A) == {A: CounterDelta(total=1, ok=1)}
     assert await read_a(engine, schema, tables) == CounterTotals(total=1, ok=1)
@@ -94,13 +105,13 @@ async def test_concurrent_folds_count_delta_once(
     engine: AsyncEngine, schema: str, tables: Tables
 ) -> None:
     async with schema_transaction(engine, schema) as conn:
-        await insert_delta(conn, tables, {A: CounterDelta(ok=1)}, created_at=func.now())
+        ids = (await insert_delta(conn, tables, {A: CounterDelta(ok=1)}, created_at=func.now()))[A]
     async with (
         schema_connection(engine, schema) as first,
         schema_connection(engine, schema) as second,
     ):
-        assert await fold_deltas(first, tables, [A]) == {A: CounterDelta(ok=1)}
-        waiting = asyncio.create_task(fold_deltas(second, tables, [A]))
+        assert await fold_delta_ids(first, tables, ids) == {A: CounterDelta(ok=1)}
+        waiting = asyncio.create_task(fold_delta_ids(second, tables, ids))
         await asyncio.sleep(0.2)
         assert not waiting.done()
         await first.commit()
