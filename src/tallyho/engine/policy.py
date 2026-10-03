@@ -261,9 +261,14 @@ class PolicyEnforcer:
         item = self.tables.item
         lease = self.tables.lease
         ids = select(batch.c.id).where(batch.c.root_id == root_id)
+        # Первая причина выигрывает (§6.1): узлы, уже отменённые по своей причине, её сохраняют.
         _ = await conn.execute(
             update(batch)
-            .where(batch.c.root_id == root_id, batch.c.state < int(BatchState.SUCCEEDED))
+            .where(
+                batch.c.root_id == root_id,
+                batch.c.state < int(BatchState.SUCCEEDED),
+                batch.c.cancel_requested_at.is_(None),
+            )
             .values(cancel_requested_at=now, cancel_reason=reason.value, updated_at=now)
         )
         cancellable = (

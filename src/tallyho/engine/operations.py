@@ -231,6 +231,10 @@ class Operations:
     ) -> int:
         """Запросить отмену дерева и сразу завершить все Items в outbox.
 
+        Первая причина выигрывает (ARCHITECTURE §6.1): флаг и ``reason`` получают
+        только узлы поддерева без флага. Отмена неотправленных Items идемпотентна
+        и выполняется при каждом вызове.
+
         Returns:
             Число немедленно отменённых Items.
         """
@@ -240,7 +244,11 @@ class Operations:
         batch = self.tables.batch
         _ = await conn.execute(
             update(batch)
-            .where(batch.c.id.in_(ids), batch.c.state < TERMINAL_THRESHOLD)
+            .where(
+                batch.c.id.in_(ids),
+                batch.c.state < TERMINAL_THRESHOLD,
+                batch.c.cancel_requested_at.is_(None),
+            )
             .values(cancel_requested_at=now, cancel_reason=reason.value, updated_at=now)
         )
         changed = 0

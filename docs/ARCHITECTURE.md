@@ -605,6 +605,8 @@ stateDiagram-v2
 * **Этап с `fed_by` продюсер не закрывает** — `seal()` для него ошибка. Его закрывает транзакция финализации последнего из источников (§8.1, UC-17). Источник в любом терминальном состоянии считается финализированным. Если он `completed_with_errors`/`failed`/`cancelled`, этап по умолчанию закрывается и доделывает полученное (`on_feeder_failed="seal"`) либо получает запрос отмены (`"cancel"`).
 * **Пустой батч финализируется сразу.** Закрытый батч с `pending = 0` (в том числе с `found = 0`) финализируется в той же цепочке «после commit», что и любой другой, и каскадом закрывает этапы, которые он наполняет. Этап без единого Item — нормальная ситуация, а не зависание.
 * **Отмена, дедлайн и `fail_fast` — не мгновенный переход, а флаг** `cancel_requested_at` (с причиной). Флаг запрещает новые `add`/`spawn`, неотправленные Items сразу становятся `cancelled`, отправленные отменяются лениво при claim, выполняющиеся доделываются. Когда `pending = 0`, срабатывает обычная финализация с `on_finalized`, и хук получает `summary.state = cancelled` или `failed` с `summary.reason`. Флаг, закоммиченный раньше финализации, определяет итог, даже если финализация уже шла: итог перепроверяется под блокировкой строки батча (§7.3). Поэтому все пути в терминальное состояние проходят через один и тот же транзакционный хук.
+* **Первая причина выигрывает.** Все пути, которые ставят флаг (`cancel()`, дедлайн, `fail_fast` и политика с `action="fail"`, `on_feeder_failed="cancel"`), пишут `cancel_requested_at` и `cancel_reason` только батчу, у которого флага ещё нет (`cancel_requested_at IS NULL`). Повторный запрос с любой причиной не меняет у такого батча ни причину, ни время запроса, а значит и итог: дедлайн после `cancel()` оставляет `cancelled` с `reason=cancel`, `cancel()` после дедлайна — `failed` с `reason=deadline`. Остальная часть запроса идемпотентна и выполняется всегда: каскад проходит по всему поддереву (у `cancel()` и дедлайна — от узла вниз, у политики — по всему дереву), узлы без флага получают причину этого запроса, неотправленные Items поддерева сразу становятся `cancelled`. Причина хранится у каждого узла своя: под-батч, отменённый раньше по своему дедлайну, после ручной отмены корня остаётся `failed` с `reason=deadline`, а корень становится `cancelled`. Дедлайн проверяется у любого узла, не только у корня: просроченный под-батч получает запрос отмены вместе со своим поддеревом.
+* **`retry_failed()` флаг не снимает.** Отмена необратима: переоткрытый батч, проваленный по запросу отмены (`deadline`, `fail_fast`, `policy`), сохраняет `cancel_requested_at` и причину. Повторённые Items отменяются при claim, и батч снова финализируется `failed` с той же причиной (`on_finalized` вызывается ещё раз). В работу `retry_failed()` возвращает батчи, завершившиеся без запроса отмены: `completed_with_errors` и `failed` по порогу политики, оценённому при финализации.
 
 **Пауза и отложенный старт** — ортогональные флаги, не состояния:
 
@@ -1239,7 +1241,7 @@ sequenceDiagram
     participant T as Выполняющаяся задача
     participant F as Finalizer
 
-    O->>DB: handle.cancel(session): cancel_requested_at=now для дерева, add и spawn запрещены
+    O->>DB: handle.cancel(session): cancel_requested_at=now, reason=cancel узлам поддерева без флага, add и spawn запрещены
     O->>DB: чанками: Items из outbox → cancelled, DELETE outbox, cancelled += n
     Note over MW: отправленные, но не начатые → ленивая отмена при claim
     T->>T: item.cancelled() == True → кооперативный выход
@@ -1304,7 +1306,7 @@ sequenceDiagram
         SW->>DB: attempt исчерпан → finish error, label=lease_expired
         SW->>DB: lease у терминального Item → DELETE
         SW->>F: sealed, pending 0, updated_at старше grace или hook_error и backoff истёк → try_finalize
-        SW->>DB: deadline_at меньше now → cancel_requested_at, reason=deadline → итог failed
+        SW->>DB: deadline_at меньше now, флага ещё нет → cancel_requested_at, reason=deadline для узла и потомков без флага → итог failed
         SW->>DB: этап open, все источники в th_feed терминальны → seal, страховка к UC-17
         SW->>DB: sealed, pending больше 0, но нет lease и outbox → reconcile по count(*)
         SW->>DB: несвёрнутые th_counter_delta старше grace → fold

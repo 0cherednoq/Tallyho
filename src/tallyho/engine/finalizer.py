@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 from datetime import timedelta
 from typing import TYPE_CHECKING, Final, Protocol, cast
 
-from sqlalchemy import SmallInteger, func, insert, literal_column, select, update
+from sqlalchemy import SmallInteger, case, func, insert, literal_column, select, update
 
 from tallyho.engine.producer import CallbackName, StoredCallback
 from tallyho.model.errors import ConfigurationError, HookMissingError, TallyhoError
@@ -503,9 +503,13 @@ class Finalizer:
                 continue
             values: dict[str, object] = {"updated_at": now}
             if failed and stage.on_feeder_failed is OnFeederFailed.CANCEL:
+                # Первая причина выигрывает (§6.1): этап, отменённый раньше, её сохраняет.
+                unflagged = batch.c.cancel_requested_at.is_(None)
                 values |= {
-                    "cancel_requested_at": now,
-                    "cancel_reason": CancelReason.CANCEL.value,
+                    "cancel_requested_at": func.coalesce(batch.c.cancel_requested_at, now),
+                    "cancel_reason": case(
+                        (unflagged, CancelReason.CANCEL.value), else_=batch.c.cancel_reason
+                    ),
                 }
             else:
                 values["state"] = int(BatchState.SEALED)
