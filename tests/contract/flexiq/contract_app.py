@@ -278,6 +278,24 @@ def build_app(  # ruff: ignore[complex-structure, too-many-statements]  # one fa
         _record(root, "doomed", key=key, job_id=current_job.id)
         await asyncio.sleep(0)
 
+    @adapter.task(timeout=3, max_retries=2, retry_delays=[0.01, 0.01], retry_on=[RetryableError])
+    async def stranded(key: str) -> None:
+        # Fix-19: первая попытка ждёт сигнала теста и падает с повторяемой ошибкой,
+        # пока flexiq не может записать её результат; следующая завершается успешно.
+        attempt = current_job.retry_count
+        _record(
+            root, "stranded-start", key=key, job_id=current_job.id, attempt=attempt, at=time.time()
+        )
+        if attempt:
+            await asyncio.sleep(0)
+            return
+        release = root / f"stranded-release-{key}"
+        for _ in range(400):  # сигнал приходит из процесса теста файлом; ждём не дольше 20 с
+            if release.exists():
+                break
+            await asyncio.sleep(0.05)
+        raise RetryableError(key)
+
     @adapter.task(max_retries=0)
     async def cancellable(key: str) -> None:
         _record(root, "cancel-start", key=key, job_id=current_job.id)
@@ -340,6 +358,7 @@ def build_app(  # ruff: ignore[complex-structure, too-many-statements]  # one fa
         "hard_timeout": cast("Probe", hard_timeout),
         "requeued": cast("Probe", requeued),
         "doomed": cast("Probe", doomed),
+        "stranded": cast("Probe", stranded),
         "cancellable": cast("Probe", cancellable),
         "limited": cast("Probe", limited),
         "rate_limited": cast("Probe", rate_limited),

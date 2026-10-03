@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING, cast
 from uuid import UUID
 
 import pytest
-from sqlalchemy import select, text
+from sqlalchemy import func, select, text
 
 from tallyho import Tallyho
 from tallyho.adapters.flexiq import FlexiqAdapter
@@ -582,6 +582,76 @@ async def test_fix_6_dead_job_without_recorded_result_is_reconciled(  # ruff: ig
     assert final.state is BatchState.SUCCEEDED
     (run,) = flexiq_contract.events("doomed")
     assert run["job_id"] != letter["original_job_id"]
+
+
+@asynccontextmanager
+async def _result_outage(app: ContractApp) -> AsyncGenerator[None]:
+    """Пока контекст открыт, flexiq не может записать результат: таблицы джоб «нет»."""
+    schema = app.engine.dialect.identifier_preparer.quote(app.flexiq_schema)
+    async with app.engine.begin() as conn:
+        _ = await conn.execute(text(f"ALTER TABLE {schema}.jobs RENAME TO jobs_down"))
+    try:
+        yield
+    finally:
+        async with app.engine.begin() as conn:
+            _ = await conn.execute(text(f"ALTER TABLE {schema}.jobs_down RENAME TO jobs"))
+
+
+async def _without_executor(app: ContractApp) -> tuple[int, int]:
+    """Сколько строк ``th_lease`` и ``th_outbox`` осталось у Items."""
+    tables = build_metadata()
+    async with schema_connection(app.engine, app.tallyho_schema) as conn:
+        leases = await conn.scalar(select(func.count()).select_from(tables.lease))
+        outbox = await conn.scalar(select(func.count()).select_from(tables.outbox))
+    return int(leases or 0), int(outbox or 0)
+
+
+async def test_fix_19_lost_result_is_recovered_by_flexiq_timeout(
+    flexiq_contract: FlexiqContract,
+) -> None:
+    """Fix-19: flexiq не записал результат попытки без lease — Item ждёт ``timeout`` джобы.
+
+    Факт о flexiq (ARCHITECTURE §11.3): отчёт о результате, который воркер не смог
+    записать, не повторяется, джоба остаётся ``running`` за живым воркером, и её
+    подбирает только реапер таймаута. Item без lease и outbox при этом не видят ни
+    sweeper, ни сверка с DLQ; после реапа повтор проходит обычный claim.
+    """
+    app = flexiq_contract.app
+    stranded = app.tasks["stranded"]
+    async with app.th.batch("fix-19", key="lost-result") as batch:
+        await batch.add(stranded, "one")
+    (first,) = await flexiq_contract.wait_events("stranded-start")
+    job_id = cast("str", first["job_id"])
+
+    worker_log = flexiq_contract.root / "worker.log"
+    async with _result_outage(app):
+        # Попытка падает с повторяемой ошибкой: release удаляет lease, а flexiq не может
+        # записать ни ошибку, ни ретрай.
+        _ = (flexiq_contract.root / "stranded-release-one").write_text("go", encoding="utf-8")
+        async with asyncio.timeout(15):
+            while "result handling error" not in worker_log.read_text(
+                encoding="utf-8", errors="replace"
+            ):
+                flexiq_contract.assert_worker_alive()
+                await asyncio.sleep(0.05)
+
+    # Item active без lease и outbox, джоба числится выполняющейся; обслуживание его не видит.
+    for _ in range(5):
+        _ = await app.th.run_maintenance_once()
+    assert await _item_rows(app, batch.handle.id) == [(0, None, None, 0)]
+    assert await _without_executor(app) == (0, 0)
+    job = await app.queue.aget_job(job_id)
+    assert job is not None
+    assert job.status == "running"
+
+    # Реапер таймаута flexiq (timeout=3 с у задачи) повторяет ту же джобу; claim проходит.
+    view = await flexiq_contract.wait_terminal(batch.handle, timeout_seconds=20)
+
+    assert view.state is BatchState.SUCCEEDED
+    runs = flexiq_contract.events("stranded-start")
+    assert [(run["job_id"], run["attempt"]) for run in runs] == [(job_id, 0), (job_id, 1)]
+    # Повтор пришёл не раньше timeout задачи от старта первой попытки.
+    assert cast("float", runs[1]["at"]) - cast("float", first["at"]) >= 3 - 0.5
 
 
 async def test_a_fq_11_flexiq_cancellation_finishes_item_cancelled(
