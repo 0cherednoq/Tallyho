@@ -88,6 +88,7 @@ from tallyho.storage.counters import (
     take_metric_slot,
     upsert_metrics,
     upsert_slots,
+    user_metric_slot,
 )
 from tallyho.storage.metric_names import metric_rows
 from tallyho.storage.now import sql_now
@@ -114,7 +115,7 @@ if TYPE_CHECKING:
     from tallyho.protocols.broker import RetryLimits
     from tallyho.protocols.clock import Clock
     from tallyho.protocols.observer import Observer
-    from tallyho.storage.counters import CounterTotals
+    from tallyho.storage.counters import CounterTotals, SlotKey
     from tallyho.storage.tables import Tables
 
 __all__ = [
@@ -1406,23 +1407,6 @@ def _owners(tx: _Tx, ops: Sequence[_Owned]) -> dict[UUID, _Owned]:
     return chosen
 
 
-_USER_SLOTS: Final = 32_767
-"""Сколько отрицательных слотов ``th_metric`` у транзакций пути B."""
-
-
-def _user_slot(delta_ids: Iterable[int]) -> int:
-    """Слот ``th_metric`` транзакции пути B.
-
-    Id дельт уникальны и растут, поэтому одновременные транзакции получают
-    разные слоты и не блокируют строки друг друга и групповой транзакции
-    Completer (слоты процессов неотрицательны).
-
-    Returns:
-        ``-1 - min(id дельт) mod 32767``: от ``-32767`` до ``-1``.
-    """
-    return -1 - min(delta_ids) % _USER_SLOTS
-
-
 @dataclass(frozen=True, slots=True, kw_only=True)
 class _UserCommit:
     """Что сделать после commit транзакции пользователя с ``complete_in``."""
@@ -1430,9 +1414,8 @@ class _UserCommit:
     item_id: UUID
     attempt: int | None
     delta_ids: frozenset[int]
-    metric_slot: int
-    """Слот транзакции в ``th_metric``."""
-    metric_batches: tuple[UUID, ...]
+    metric_slots: tuple[SlotKey, ...]
+    """Слоты транзакции в ``th_metric`` по батчам."""
 
 
 def _small(value: int) -> ColumnElement[int]:
@@ -1724,21 +1707,26 @@ class Completer:
         inserted = await insert_delta(conn, self.tables, tx.deltas, created_at=tx.now)
         delta_ids = frozenset(delta_id for ids in inserted.values() for delta_id in ids)
         # Метрики — в собственный слот транзакции, а не в слот процесса, который
-        # в это же время обновляет групповая транзакция Completer (UC-08).
-        # Дельта завершённого Item ненулевая, поэтому delta_ids не пуст.
-        slot = _user_slot(delta_ids)
+        # в это же время обновляет групповая транзакция Completer (UC-08). Слот
+        # батча считается по его дельте: по ней строку найдёт sweeper, если
+        # перенос после commit не состоится. Метрики пишутся только в батч
+        # завершённого Item, а его дельта ненулевая; общий минимум — страховка.
+        first = min(delta_ids)
+        slots = {
+            batch_id: user_metric_slot(min(inserted.get(batch_id, (first,))))
+            for batch_id, _, _ in tx.metrics
+        }
         await upsert_metrics(
             conn,
             self.tables,
-            {(batch_id, name, slot): n for (batch_id, name, _), n in tx.metrics.items()},
+            {(batch_id, name, slots[batch_id]): n for (batch_id, name, _), n in tx.metrics.items()},
         )
         tx.applied.progress.update(tx.deltas)
         done = _UserCommit(
             item_id=item.id,
             attempt=attempt,
             delta_ids=delta_ids,
-            metric_slot=slot,
-            metric_batches=tuple(sorted({key[0] for key in tx.metrics})),
+            metric_slots=tuple(sorted(slots.items())),
         )
         await after_commit(target, lambda: self._schedule_external(tx.applied, done))
         return True
@@ -1913,10 +1901,12 @@ class Completer:
     async def _settle_external(self, conn: AsyncConnection, done: _UserCommit) -> None:
         """Транзакция после commit пути B: lease, дельты, метрики (UC-08).
 
-        Порядок блокировок §9.2: ``th_item`` → ``th_lease`` → ``th_counter``
-        → ``th_metric``. Строки слота транзакции в ``th_metric`` другие
-        транзакции не трогают, поэтому они забираются до горячих строк: те
-        держатся до commit как можно меньше.
+        Порядок блокировок §9.2: ``th_item`` → ``th_lease`` →
+        ``th_counter_delta`` → слоты транзакции в ``th_metric`` →
+        ``th_counter`` → ``th_metric``. Строки слотов транзакции, кроме неё,
+        трогает только sweeper, и только через ``SKIP LOCKED`` в том же
+        порядке, поэтому они забираются до горячих строк: те держатся до
+        commit как можно меньше.
         """
         item = self.tables.item
         lease = self.tables.lease
@@ -1930,9 +1920,7 @@ class Completer:
         )
         _ = await conn.execute(delete(lease).where(lease.c.item_id == finished))
         folded = await fold_delta_ids(conn, self.tables, done.delta_ids)
-        taken = await take_metric_slot(
-            conn, self.tables, done.metric_batches, slot=done.metric_slot
-        )
+        taken = await take_metric_slot(conn, self.tables, done.metric_slots)
         slot = self.settings.slot
         metrics = {(batch_id, name, slot): n for (batch_id, name), n in taken.items()}
         await upsert_slots(
