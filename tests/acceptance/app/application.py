@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import TYPE_CHECKING, cast
@@ -73,6 +74,17 @@ class StandTuning:
     sweep_interval: timedelta = timedelta(milliseconds=100)
     drain_timeout: int = 1
     hook_delay: float = 0.0
+
+    @property
+    def job_timeout(self) -> int:
+        """FlexIQ ``timeout`` of every stand task, seconds: ``lease_ttl``, not the 300 s default.
+
+        A result FlexIQ could not record during a PostgreSQL outage leaves the job
+        ``running`` until this timeout, and a non-holding attempt leaves its Item without
+        lease and outbox until then (ARCHITECTURE §11.3, Fix-19). Tying it to ``lease_ttl``
+        keeps that recovery inside ``T_rec`` (ACCEPTANCE §6); stand tasks take seconds.
+        """
+        return max(1, math.ceil(self.lease_ttl.total_seconds()))
 
 
 @dataclass(frozen=True, slots=True)
@@ -269,6 +281,7 @@ def build_app(  # ruff: ignore[complex-structure, too-many-statements, too-many-
         scheduler_reap_interval=1,
     )
     adapter = FlexiqAdapter(queue)
+    job_timeout = knobs.job_timeout
     th = Tallyho(
         engine,
         schema=tallyho_schema,
@@ -310,6 +323,7 @@ def build_app(  # ruff: ignore[complex-structure, too-many-statements, too-many-
 
     @adapter.task(
         max_retries=3,
+        timeout=job_timeout,
         retry_delays=[0.01, 0.02, 0.03],
         retry_on=[TransientError],
         dont_retry_on=[PermanentError],
@@ -341,6 +355,7 @@ def build_app(  # ruff: ignore[complex-structure, too-many-statements, too-many-
 
     @adapter.task(
         max_retries=3,
+        timeout=job_timeout,
         retry_delays=[0.01, 0.02, 0.03],
         retry_on=[TransientError],
         dont_retry_on=[PermanentError],
@@ -387,6 +402,7 @@ def build_app(  # ruff: ignore[complex-structure, too-many-statements, too-many-
 
     @adapter.task(
         max_retries=3,
+        timeout=job_timeout,
         retry_delays=[0.01, 0.02, 0.03],
         retry_on=[TransientError],
         dont_retry_on=[PermanentError],
@@ -442,7 +458,7 @@ def build_app(  # ruff: ignore[complex-structure, too-many-statements, too-many-
                 body = cast("dict[str, object]", await response.json())
         return status, body
 
-    @adapter.task(max_retries=3, retry_delays=[0.01, 0.02, 0.03])
+    @adapter.task(max_retries=3, timeout=job_timeout, retry_delays=[0.01, 0.02, 0.03])
     async def parse_page(run_id: int, page: int) -> None:
         item_id = await prepare("parse_page")
         status, body = await get_json(f"/pages/{page}")
@@ -478,7 +494,7 @@ def build_app(  # ruff: ignore[complex-structure, too-many-statements, too-many-
                 item.error("not_found")
             await item.complete_in(connection)
 
-    @adapter.task(max_retries=3, retry_delays=[0.01, 0.02, 0.03])
+    @adapter.task(max_retries=3, timeout=job_timeout, retry_delays=[0.01, 0.02, 0.03])
     async def parse_card(run_id: int, url: str) -> None:
         item_id = await prepare("parse_card")
         status, body = await get_json(url)
@@ -515,7 +531,7 @@ def build_app(  # ruff: ignore[complex-structure, too-many-statements, too-many-
                 item.error("not_found")
             await item.complete_in(connection)
 
-    @adapter.task(max_retries=3, retry_delays=[0.01, 0.02, 0.03])
+    @adapter.task(max_retries=3, timeout=job_timeout, retry_delays=[0.01, 0.02, 0.03])
     async def download_pdf(run_id: int, url: str) -> None:
         item_id = await prepare("download_pdf")
         item.progress(1, 2)

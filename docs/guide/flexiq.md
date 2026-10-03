@@ -130,6 +130,11 @@ await batch.add_calls([call])
 | `debounce`, `debounce_key`, `debounce_max_wait`, `debounce_replace_payload`, `batch` | **не поддерживаются** — `UnsupportedOption` |
 | любая другая опция | `UnsupportedOption` |
 
+`timeout` задачи — не только жёсткий лимит выполнения. Это и срок, через который flexiq вернёт в
+работу джобу, чей результат воркер не смог записать при отказе PostgreSQL; до тех пор задача
+батча стоит незавершённой (см. [ограничения](limitations.md#несовместимые-опции-flexiq)). Задавайте
+его по реальной длительности задачи с запасом, а не оставляйте умолчание flexiq в 300 секунд.
+
 Параметры самой задачи в `@fq.task(...)` — `retry_on`, `dont_retry_on`, `retry_backoff`,
 `retry_delays`, `retry_budget`, `circuit_breaker`, `soft_timeout`, `rate_limit`, `max_concurrent`,
 `middleware`, `inject`, `serializer`, `codecs`, `predicate` — работают как у обычной задачи flexiq.
