@@ -10,11 +10,15 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import time
 from dataclasses import dataclass
 from datetime import timedelta
+from itertools import starmap
 from typing import TYPE_CHECKING, ParamSpec, TypeVar
 
 import pytest
+from sqlalchemy import select
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import create_async_engine
 from typing_extensions import override
 
@@ -24,7 +28,7 @@ from tallyho.engine.sweeper import Sweeper, SweeperSettings
 from tallyho.model.states import ItemState, ResultClass
 from tallyho.protocols.broker import DeadLetters, Runtime, Verdict
 from tallyho.runtime import TaskRuntime, item
-from tests.helpers.probe import create_probe
+from tests.helpers.probe import committed_ids, create_probe, insert_id
 from tests.helpers.relay import RecordingDispatcher
 from tests.integration.engine.completer_env import (
     COMPLETER_SLOT,
@@ -197,6 +201,131 @@ async def test_held_forgets_item_whose_path_a_attempt_lost_lease(env: Env) -> No
         )
         assert completer.held == frozenset()
     assert await _state(env, ref.id) is ItemState.ERROR
+
+
+# --- (2) heartbeat против долгой транзакции пути B --------------------------------------
+
+
+@pytest.mark.parametrize("label", ["shared", "distinct"])
+async def test_long_user_transaction_does_not_delay_heartbeat_and_finish_of_batch(
+    env: Env, probe: Table[ProbeColumns], *, label: str
+) -> None:
+    """Транзакция пути B открыта ``HOLD`` с после ``complete_in``.
+
+    Остальные Items пачки в это время продлевают lease и завершаются путём A
+    (с тем же label, что у медленного Item, и с разными).
+    """
+    others = 4
+    seeded = await seed(env, 1 + others)
+    slow, fast = seeded.refs[0], seeded.refs[1:]
+    completed = asyncio.Event()
+    async with open_completer(env) as completer:
+        runtime = _runtime(completer)
+
+        async def slow_task(**_kwargs: object) -> None:
+            async with env.transaction() as conn:
+                await insert_id(conn, probe, 0)
+                item.ok("ok" if label == "shared" else "slow")
+                await item.complete_in(conn)
+                completed.set()
+                await asyncio.sleep(HOLD)
+
+        async def fast_task(index: int, **_kwargs: object) -> None:
+            # Задача живёт несколько интервалов heartbeat, затем завершается путём A.
+            await asyncio.sleep(BEAT.total_seconds() * 5)
+            item.ok("ok" if label == "shared" else f"fast-{index}")
+
+        async def run_fast(index: int, ref: ItemRef) -> float:
+            await completed.wait()
+            started = time.monotonic()
+            await runtime.wrap(fast_task)(index, _th=_marker(ref))
+            return time.monotonic() - started
+
+        async def run_slow() -> None:
+            await runtime.wrap(slow_task)(_th=_marker(slow))
+
+        slow_run = asyncio.create_task(run_slow())
+        try:
+            elapsed = await asyncio.gather(*starmap(run_fast, enumerate(fast)))
+            leases_left = [await lease_row(env, ref.id) for ref in fast]
+        finally:
+            await slow_run
+        await completer.settled()
+        # Lease медленного Item удалён после commit, метрики перенесены в слот процесса.
+        assert await lease_row(env, slow.id) is None
+        metric = env.tables.metric
+        async with env.connection() as conn:
+            slots = set(await conn.scalars(select(metric.c.slot).distinct()))
+        assert slots == {COMPLETER_SLOT}
+    # Без ожидания блокировок путь A укладывается в доли секунды, а не в HOLD.
+    assert max(elapsed) < HOLD / 3, elapsed
+    assert leases_left == [None] * others
+    assert await committed_ids(env.engine, probe) == [0]
+    counters = await env.counters(seeded.batch_id)
+    assert (counters.ok, counters.pending) == (1 + others, 0)
+
+
+@pytest.mark.parametrize("isolation", ["REPEATABLE READ", "SERIALIZABLE"])
+async def test_heartbeat_before_complete_in_gives_no_serialization_failure(
+    env: Env, probe: Table[ProbeColumns], *, isolation: str
+) -> None:
+    """Heartbeat продлевает lease между снимком транзакции и ``complete_in``."""
+    seeded = await seed(env, 1)
+    ref = seeded.refs[0]
+    engine = schema_engine(env).execution_options(isolation_level=isolation)
+    async with open_completer(env) as completer:
+
+        async def task(**_kwargs: object) -> None:
+            async with engine.begin() as conn:
+                await insert_id(conn, probe, 1)  # снимок взят
+                await asyncio.sleep(BEAT.total_seconds() * 8)
+                item.ok()
+                await item.complete_in(conn)
+                await asyncio.sleep(BEAT.total_seconds() * 8)
+
+        try:
+            await _runtime(completer).wrap(task)(_th=_marker(ref))
+        except DBAPIError as exc:  # pragma: no cover - падение теста с понятной причиной
+            pytest.fail(f"транзакция пользователя упала: {exc.orig!r}")
+    assert await committed_ids(env.engine, probe) == [1]
+    assert await _state(env, ref.id) is ItemState.OK
+    assert await lease_row(env, ref.id) is None
+
+
+@pytest.mark.parametrize("isolation", ["REPEATABLE READ", "SERIALIZABLE"])
+async def test_path_a_finish_of_same_label_gives_no_serialization_failure(
+    env: Env, probe: Table[ProbeColumns], *, isolation: str
+) -> None:
+    """Completer того же процесса завершает Item с тем же label после снимка пользователя."""
+    seeded = await seed(env, 2)
+    slow, fast = seeded.refs
+    engine = schema_engine(env).execution_options(isolation_level=isolation)
+    snapshot = asyncio.Event()
+    async with open_completer(env) as completer:
+        runtime = _runtime(completer, beat=timedelta(seconds=30))
+
+        async def slow_task(**_kwargs: object) -> None:
+            async with engine.begin() as conn:
+                await insert_id(conn, probe, 1)
+                snapshot.set()
+                await asyncio.sleep(0.3)
+                item.ok()
+                await item.complete_in(conn)
+
+        async def fast_task(**_kwargs: object) -> None:
+            await snapshot.wait()
+            item.ok()
+
+        try:
+            _ = await asyncio.gather(
+                runtime.wrap(slow_task)(_th=_marker(slow)),
+                runtime.wrap(fast_task)(_th=_marker(fast)),
+            )
+        except DBAPIError as exc:  # pragma: no cover - падение теста с понятной причиной
+            pytest.fail(f"транзакция пользователя упала: {exc.orig!r}")
+    assert await committed_ids(env.engine, probe) == [1]
+    counters = await env.counters(seeded.batch_id)
+    assert (counters.ok, counters.pending) == (2, 0)
 
 
 # --- (3) heartbeat устаревшей попытки -------------------------------------------------------

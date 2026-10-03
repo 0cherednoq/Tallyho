@@ -84,6 +84,7 @@ from tallyho.storage.counters import (
     fold_deltas,
     insert_delta,
     read_counters,
+    take_metric_slot,
     upsert_metrics,
     upsert_slots,
 )
@@ -482,9 +483,13 @@ class _Tx:
     побочных эффектов вне БД не имеет.
     """
 
-    def __init__(self, completer: Completer, conn: AsyncConnection) -> None:
+    def __init__(
+        self, completer: Completer, conn: AsyncConnection, *, user_tx: bool = False
+    ) -> None:
         self.c = completer
         self.conn = conn
+        self.user_tx = user_tx
+        """Транзакция пользователя (путь B): строку ``th_lease`` не меняем (UC-08)."""
         self.tables = completer.tables
         self.now = sql_now(completer.clock)
         self.batches: dict[UUID, _BatchFlags] = {}
@@ -563,12 +568,18 @@ class _Tx:
                 weight=weight,
             )
 
-    async def lock_leases(self, item_ids: Iterable[UUID]) -> None:
+    async def lock_leases(self, item_ids: Iterable[UUID], *, lock: bool = True) -> None:
+        """Прочитать строки ``th_lease``; с ``lock`` — под ``FOR UPDATE`` по порядку.
+
+        Без блокировки читает путь B (UC-08): владельца lease меняют только
+        операции, которые раньше блокируют строку ``th_item``, а её путь B уже
+        держит. Так транзакция пользователя не ждёт heartbeat и не мешает ему.
+        """
         ids = sorted(set(item_ids))
         if not ids:
             return
         lease = self.tables.lease
-        result = await self.conn.execute(
+        statement = (
             select(
                 lease.c.item_id,
                 lease.c.worker_id,
@@ -578,8 +589,10 @@ class _Tx:
             )
             .where(lease.c.item_id == any_(_uuids(ids)))
             .order_by(lease.c.item_id)
-            .with_for_update()
         )
+        if lock:
+            statement = statement.with_for_update()
+        result = await self.conn.execute(statement)
         for item_id, worker_id, live, attempt, redelivered in result:
             self.leases[item_id] = _LeaseRow(
                 worker_id=worker_id, live=live, attempt=attempt, redelivered=redelivered
@@ -689,7 +702,9 @@ class _Tx:
             self._result(item_id, ClaimOutcome.CANCELLED)
 
     async def _delete_leases(self, item_ids: list[UUID]) -> None:
-        if not item_ids:
+        if not item_ids or self.user_tx:
+            # Путь B lease не удаляет: это сделает Completer после commit (UC-08),
+            # иначе heartbeat ждал бы транзакцию пользователя, а та ловила 40001.
             return
         lease = self.tables.lease
         _ = await self.conn.execute(
@@ -1335,6 +1350,23 @@ def _owners(tx: _Tx, ops: Sequence[_Owned]) -> dict[UUID, _Owned]:
     return chosen
 
 
+_USER_SLOTS: Final = 32_767
+"""Сколько отрицательных слотов ``th_metric`` у транзакций пути B."""
+
+
+def _user_slot(delta_ids: Iterable[int]) -> int:
+    """Слот ``th_metric`` транзакции пути B.
+
+    Id дельт уникальны и растут, поэтому одновременные транзакции получают
+    разные слоты и не блокируют строки друг друга и групповой транзакции
+    Completer (слоты процессов неотрицательны).
+
+    Returns:
+        ``-1 - min(id дельт) mod 32767``: от ``-32767`` до ``-1``.
+    """
+    return -1 - min(delta_ids) % _USER_SLOTS
+
+
 @dataclass(frozen=True, slots=True, kw_only=True)
 class _UserCommit:
     """Что сделать после commit транзакции пользователя с ``complete_in``."""
@@ -1342,6 +1374,9 @@ class _UserCommit:
     item_id: UUID
     attempt: int | None
     delta_ids: frozenset[int]
+    metric_slot: int
+    """Слот транзакции в ``th_metric``."""
+    metric_batches: tuple[UUID, ...]
 
 
 def _small(value: int) -> ColumnElement[int]:
@@ -1592,7 +1627,7 @@ class Completer:
         if (value.spawns or value.sub_batches) and self.triggers.producer is None:
             raise ConfigurationError(_SPAWN_SERVICES)
         conn = await resolve_connection(target)
-        tx = _Tx(self, conn)
+        tx = _Tx(self, conn, user_tx=True)
         batch_ids: list[UUID] = []
         writes_structure = bool(value.sub_batches)
         for spawn_request in value.spawns:
@@ -1617,7 +1652,9 @@ class Completer:
             await tx.lock_batches(batch_ids, write=writes_structure)
         if attempt is not None:
             await tx.lock_items([item.id])
-            await tx.lock_leases([item.id])
+            # th_lease — без блокировки и без записи (UC-08): heartbeat этой же
+            # попытки не ждёт транзакцию пользователя и не даёт ей 40001.
+            await tx.lock_leases([item.id], lock=False)
             if not tx.holds(item, attempt):
                 self._forget(item.id, attempt)
                 return False
@@ -1629,12 +1666,23 @@ class Completer:
             self._forget(item.id, attempt)
             return False
         inserted = await insert_delta(conn, self.tables, tx.deltas, created_at=tx.now)
-        await upsert_metrics(conn, self.tables, tx.metrics)
+        delta_ids = frozenset(delta_id for ids in inserted.values() for delta_id in ids)
+        # Метрики — в собственный слот транзакции, а не в слот процесса, который
+        # в это же время обновляет групповая транзакция Completer (UC-08).
+        # Дельта завершённого Item ненулевая, поэтому delta_ids не пуст.
+        slot = _user_slot(delta_ids)
+        await upsert_metrics(
+            conn,
+            self.tables,
+            {(batch_id, name, slot): n for (batch_id, name, _), n in tx.metrics.items()},
+        )
         tx.applied.progress.update(tx.deltas)
         done = _UserCommit(
             item_id=item.id,
             attempt=attempt,
-            delta_ids=frozenset(delta_id for ids in inserted.values() for delta_id in ids),
+            delta_ids=delta_ids,
+            metric_slot=slot,
+            metric_batches=tuple(sorted({key[0] for key in tx.metrics})),
         )
         await after_commit(target, lambda: self._schedule_external(tx.applied, done))
         return True
@@ -1796,18 +1844,42 @@ class Completer:
             )
             self._notify(len(applied.finished), 0.0, applied)
             await self._after_commit(applied)
-        except Exception:  # ruff: ignore[blind-except]  # commit уже состоялся; sweeper повторит fold/finalize
+        except Exception:  # ruff: ignore[blind-except]  # commit уже состоялся; sweeper повторит fold/finalize и удалит lease
             _log.exception("обработка complete_in после commit упала")
         finally:
             self._forget(done.item_id, done.attempt)
 
     async def _settle_external(self, conn: AsyncConnection, done: _UserCommit) -> None:
+        """Транзакция после commit пути B: lease, дельты, метрики (UC-08).
+
+        Порядок блокировок §9.2: ``th_item`` → ``th_lease`` → ``th_counter``
+        → ``th_metric``. Строки слота транзакции в ``th_metric`` другие
+        транзакции не трогают, поэтому они забираются до горячих строк: те
+        держатся до commit как можно меньше.
+        """
+        item = self.tables.item
+        lease = self.tables.lease
+        # Строка Item — под блокировкой; Item, переоткрытый retry_failed после
+        # commit, не терминальный, и его новый lease остаётся.
+        finished = (
+            select(item.c.id)
+            .where(item.c.id == done.item_id, item.c.state != _ACTIVE)
+            .with_for_update()
+            .scalar_subquery()
+        )
+        _ = await conn.execute(delete(lease).where(lease.c.item_id == finished))
         folded = await fold_delta_ids(conn, self.tables, done.delta_ids)
+        taken = await take_metric_slot(
+            conn, self.tables, done.metric_batches, slot=done.metric_slot
+        )
+        slot = self.settings.slot
+        metrics = {(batch_id, name, slot): n for (batch_id, name), n in taken.items()}
         await upsert_slots(
             conn,
             self.tables,
             {(batch_id, self.settings.slot): delta for batch_id, delta in folded.items()},
         )
+        await upsert_metrics(conn, self.tables, metrics)
 
     # --- буфер -------------------------------------------------------------------------
 
