@@ -98,13 +98,23 @@ _DUPLICATE_ORPHAN = _Defect(
 #
 # Fix-6 исправлен: сверка с DLQ завершает Items, чья джоба умерла без записанного итога
 # (A-CH-04 на S1 и S3, seed 1: зависших Items нет, красный только I-10). Метки
-# A-CH-02/03/04/12 остаются: I-10 без зависших Items, описанный выше, ждёт решения владельца;
-# кроме того, в одном из двух прогонов A-CH-04 на S2 два Item остались active с джобой
-# pending/running во flexiq (не в DLQ) — сверка такие не видит. Перепроверяет T11.3b.
+# A-CH-02/03/12 остаются: I-10 без зависших Items, описанный выше, ждёт решения владельца;
+# перепроверяет T11.3b.
+#
+# Fix-19: Items A-CH-04 на S2, остававшиеся active с джобой running во flexiq, - результат
+# попытки, который flexiq не смог записать при отказе PostgreSQL; джобу возвращает только
+# реапер таймаута flexiq (ARCHITECTURE §11.3), поэтому стенд регистрирует задачи с timeout =
+# lease_ttl. Второй источник зависания - круг «дубль доставки → RETRY → outbox» без лимита
+# попыток (UC-04) - исправлен в release. S2: шесть прогонов подряд (seed 1-5, 7) без зависших
+# Items; S1 и S3 (seed 1, 4) тоже. Метка A-CH-04 осталась только за I-10: оракул ещё не
+# приведён к D-056 (Item ok/skip с джобой в DLQ допустим) - T11.3b.
+_DLQ_AFTER_OK = _Defect(
+    "T11.3b", "I-10: Item ok/skip с джобой в DLQ — оракул не приведён к D-056", strict=False
+)
 _INVARIANT_DEFECTS: Mapping[str, _Defect] = {
     "A-CH-02": _DEAD_JOB_ORPHAN,
     "A-CH-03": _DEAD_JOB_ORPHAN,
-    "A-CH-04": _DEAD_JOB_ORPHAN,
+    "A-CH-04": _DLQ_AFTER_OK,
     "A-CH-05": _DUPLICATE_ORPHAN,
     "A-CH-09": _DUPLICATE_ORPHAN,
     "A-CH-12": _DEAD_JOB_ORPHAN,
