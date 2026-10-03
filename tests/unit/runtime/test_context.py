@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from datetime import timedelta
 from typing import TYPE_CHECKING, cast
 from uuid import uuid4
@@ -11,6 +11,7 @@ from uuid import uuid4
 import pytest
 
 from tallyho.engine.completer import ItemRef
+from tallyho.engine.producer import CallbackName
 from tallyho.engine.spawn import TreeNode, TreeSnapshot
 from tallyho.model.calls import TaskCall
 from tallyho.model.errors import ConfigurationError
@@ -179,9 +180,39 @@ async def test_runtime_sub_batch_buffers_only_successful_context_manager() -> No
     assert len(context.sub_batches) == 1
 
 
+def test_sub_batch_takes_callbacks_as_named_parameters() -> None:
+    """Колбэки динамического под-батча — ``on_...=``, как у ``BatchBuilder.sub_batch``."""
+    context, _ = _context()
+    done, failed = TaskCall(task_name="done"), TaskCall(task_name="failed")
+    with activate_item(context):
+        builder = item.sub_batch(
+            "parts", on_succeeded=done, on_failed=failed, on_finalized_task=done
+        )
+    assert dict(builder.spec.callbacks) == {
+        CallbackName.ON_SUCCEEDED: done,
+        CallbackName.ON_FAILED: failed,
+        CallbackName.ON_FINALIZED_TASK: done,
+    }
+    every = context.sub_batch(
+        "all",
+        on_succeeded=done,
+        on_completed_with_errors=done,
+        on_failed=done,
+        on_cancelled=done,
+        on_finalized_task=done,
+    )
+    assert set(every.spec.callbacks) == set(CallbackName)
+    assert context.sub_batch("none").spec.callbacks == {}
+
+
+def test_callback_context_has_no_summary() -> None:
+    """Сводки в контексте колбэка нет: итог читается через handle (ARCHITECTURE §11.2)."""
+    assert [value.name for value in fields(CallbackContext)] == ["callback_id", "batch_id"]
+
+
 def test_facades_delegate_inside_scoped_context() -> None:
     context, completer = _context()
-    callback_context = CallbackContext(uuid4(), context.batch_id, {"ok": 1})
+    callback_context = CallbackContext(uuid4(), context.batch_id)
     with activate_item(context):
         assert item.current() is context
         assert item.id() == context.id

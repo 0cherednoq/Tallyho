@@ -79,6 +79,8 @@ _DEFAULT_OVERLAP = timedelta(minutes=15)
 _FLEXIQ_MAJOR = 2
 _PAIR_SIZE = 2
 _BATCH_OPTION = "batch"
+_WEIGHT_OPTION = "weight"
+_WEIGHT_HINT = "вес — опция вызова tallyho: th.call(...).opts(weight=...)"
 _ENCODE_PAYLOAD = "_encode_payload"
 _DECODE_PAYLOAD = "_deserialize_payload"
 _PY_JOB = "_py_job"
@@ -363,11 +365,18 @@ class FlexiqAdapter(
     ) -> Callable[[Callable[P, Awaitable[R]]], Callable[P, Awaitable[R]]]:
         """Зарегистрировать tracked async-задачу в flexiq.
 
+        Вес задачи — опция вызова tallyho (``th.call(...).opts(weight=)``), а
+        не декоратора (ARCHITECTURE §11.4).
+
         Returns:
             Декоратор, сохраняющий сигнатуру исходной функции.
 
+        Raises:
+            UnsupportedOption: опция агрегации flexiq или ``weight``.
         """
         self._reject_decorated_options(options)
+        if _WEIGHT_OPTION in options:
+            raise UnsupportedOption(_WEIGHT_OPTION, hint=_WEIGHT_HINT)
 
         def decorate(fn: Callable[P, Awaitable[R]]) -> Callable[P, Awaitable[R]]:
             if not inspect.iscoroutinefunction(fn):

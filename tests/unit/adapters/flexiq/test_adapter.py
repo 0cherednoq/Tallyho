@@ -432,6 +432,16 @@ def test_task_rejects_aggregation_options(options: Mapping[str, object]) -> None
         _ = adapter.task(**options)(_echo)
 
 
+def test_task_rejects_weight_with_hint_to_call_options() -> None:
+    """Вес — опция вызова tallyho, а не декоратора flexiq (ARCHITECTURE §11.4)."""
+    adapter, _queue = _adapter()
+    with pytest.raises(UnsupportedOption) as info:
+        _ = adapter.task(max_retries=3, weight=2)
+    assert info.value.option == "weight"
+    assert info.value.hint is not None
+    assert ".opts(weight=" in info.value.hint
+
+
 def test_task_rejects_sync_function() -> None:
     adapter, _queue = _adapter()
 

@@ -134,7 +134,9 @@ await batch.add_calls([call])
 `retry_delays`, `retry_budget`, `circuit_breaker`, `soft_timeout`, `rate_limit`, `max_concurrent`,
 `middleware`, `inject`, `serializer`, `codecs`, `predicate` — работают как у обычной задачи flexiq.
 Исключения: `@fq.task(batch=...)` и `@fq.task(debounce...=...)` отклоняются с `UnsupportedOption`.
-Вес задачи задаётся в вызове (`.opts(weight=...)`), а не в декораторе.
+Вес задачи задаётся в вызове (`.opts(weight=...)`), а не в декораторе: `@fq.task(weight=...)`
+отклоняется с `UnsupportedOption`. Из задачи вызов с опциями ставится через
+`item.spawn_call(th.call(...).opts(...), into=...)`.
 
 Несовместимые опции отклоняются сразу, в процессе, который ставит задачу, — до записи в базу:
 

@@ -330,6 +330,7 @@ class Tallyho:
         kind: str,
         *,
         key: str | None = None,
+        seal: bool = True,
         start_at: datetime | None = None,
         on_succeeded: TaskCall | None = None,
         on_completed_with_errors: TaskCall | None = None,
@@ -352,6 +353,12 @@ class Tallyho:
         ``attributes`` и ``memo`` — неизменяемый контекст корреляции корня
         (ARCHITECTURE §5.1): проверяются здесь, до обращения к БД; повторный
         вызов с тем же ``(kind, key)`` их не меняет.
+
+        ``seal=False`` — потоковое добавление (ARCHITECTURE UC-02): выход из
+        ``async with`` коммитит добавленное, но не закрывает ни корень, ни
+        под-батчи этого builder. Следующий вход с тем же ``(kind, key)``
+        дописывает в открытый батч; закрывает его вход без ``seal=False`` или
+        явный ``seal()``.
 
         Returns:
             Builder, который нужно использовать как ``async with``.
@@ -399,6 +406,7 @@ class Tallyho:
                 memo=normalize_memo(memo, limits=limits),
             ),
             _target=session,
+            _auto_seal=seal,
         )
 
     def handle(self, batch_id: UUID) -> BatchHandle:

@@ -54,7 +54,7 @@
 | Интеграция с любым брокером | Протоколы `Dispatcher` + `Runtime`, первый адаптер — flexiq |
 | Быстрые запросы на больших объёмах | Узкие индексы без изменяемых колонок, side-таблицы для разреженных множеств, UUIDv7, групповой коммит (§9) |
 | «Ничего не зависнет» | Outbox, lease + heartbeat, sweeper, CAS-переходы, reconcile (§10) |
-| Своя сессия БД пользователя | `session=` во всех пишущих методах, `th.item.complete_in(session)` |
+| Своя сессия БД пользователя | `session=` во всех пишущих методах, `item.complete_in(session)` |
 | Доменные таблицы не зависят от retention | Транзакционные хуки финализации и снимков прогресса, `release()` (§7) |
 | Расширяемость | Протоколы: брокер, сериализатор, хуки наблюдаемости, часы, генератор ID |
 | Только async | `AsyncEngine` / `AsyncSession` / `AsyncConnection` |
@@ -102,7 +102,7 @@ flowchart LR
     end
     subgraph TH["tallyho (библиотека внутри процессов)"]
         P["Producer API<br/>batch / handle"]
-        MW["th.tracked + Completer"]
+        MW["tracked + Completer"]
         R["Relay"]
         S["Sweeper + снимки прогресса"]
         HK["Tx-хуки пользователя"]
@@ -136,7 +136,7 @@ flowchart TB
     end
     subgraph wproc["Процесс воркера flexiq (N штук)"]
         B1["flexiq worker, pool=thread"]
-        B2["th.tracked обёртка"]
+        B2["tracked обёртка"]
         B3["Completer<br/>в async-loop flexiq"]
         B4["Relay: fast-path, scan,<br/>сверка с DLQ"]
         B5["Finalizer + tx-хуки"]
@@ -166,7 +166,7 @@ flowchart TB
 flowchart TB
     api["tallyho.api<br/>Tallyho, BatchBuilder, BatchHandle, call"]
     hooks["tallyho.hooks<br/>registry, on_finalized, on_progress, on_policy_breach"]
-    item["tallyho.runtime<br/>tracked, ItemContext, system task"]
+    item["tallyho.runtime<br/>tracked, item, callback, ItemContext"]
     eng["tallyho.engine<br/>Completer, Relay, Sweeper,<br/>Finalizer, Snapshotter, Counters"]
     st["tallyho.storage<br/>tables, queries, migrations"]
     model["tallyho.model<br/>states, summaries, views, errors"]
@@ -192,7 +192,7 @@ flowchart TB
     cli --> eng
 ```
 
-Правило слоёв: `storage` не знает про брокер, `engine` — только про протоколы, адаптеры — только про `protocols` и `runtime`. Циклов нет. Правило проверяется в CI через `import-linter`.
+Правило слоёв: `storage` не знает про брокер, `engine` — только про протоколы, адаптеры — только про `protocols` и `runtime`, `api` и `runtime` друг друга не импортируют. Циклов нет. Правило проверяется в CI через `import-linter`.
 
 ### 3.4 Основные классы
 
@@ -463,7 +463,7 @@ erDiagram
         timestamptz lease_until
         text worker_id
         smallint attempt
-        bigint progress_done "NULL, th.item.progress"
+        bigint progress_done "NULL, item.progress"
         bigint progress_total "NULL"
         boolean redelivered "дубль доставки подтверждён брокеру при живом lease"
     }
@@ -932,17 +932,25 @@ sequenceDiagram
     participant DB as PostgreSQL
     participant W as Воркеры
 
-    U->>TH: create batch, state=open
     loop пока читаем источник
-        U->>TH: add_many(chunk)
-        TH->>DB: INSERT items + outbox, total += n, commit
+        U->>TH: async with th.batch(kind, key=k, seal=False): map / add_calls(chunk)
+        TH->>DB: INSERT th_batch ON CONFLICT (kind,key) DO NOTHING → новый или открытый батч
+        TH->>DB: INSERT items + outbox, total += n, commit (seal нет)
         Note over W: воркеры уже выполняют первые Items
     end
     Note over DB: pending может стать 0 раньше конца чтения,<br/>но state=open → финализации нет
-    U->>TH: seal()
+    U->>TH: async with th.batch(kind, key=k) — без seal=False (или builder.seal())
     TH->>DB: UPDATE state=sealed, commit
     TH->>DB: после commit — проверка pending == 0 → UC-07
 ```
+
+Каждая порция — отдельный вход в `th.batch(..., seal=False)` со своей транзакцией (или с `session=` пользователя): выход из `async with` коммитит Items, а батч остаётся `open`. Повторный вход по тому же `(kind, key)` находит открытый батч (UC-01) и дописывает в него. Закрывает батч вход без `seal=False` — он может и сам добавить последнюю порцию — или явный `await builder.seal()` внутри блока.
+
+* **Параметры батча задаёт первый вход.** Колбэки, политика, `deadline`, атрибуты и прочие параметры повторных входов не применяются (как при любом повторном `th.batch` с тем же ключом, D-038).
+* **`seal=False` действует на всё builder-дерево:** под-батчи, объявленные в этом блоке, при выходе тоже не закрываются. Этапы с `fed_by` по-прежнему закрывает финализация источников.
+* **Закрытый батч не принимает порции:** вход после seal, финализации или запроса отмены даёт `SealError` на `add`. Продюсер, который хочет продолжить после отмены, создаёт новый батч с другим ключом.
+* **Незакрытый батч не финализируется никогда.** Продюсер, упавший посреди чтения, оставляет батч `open`: дочитать и закрыть его может повторный запуск продюсера с тем же ключом, а предохранитель — `deadline` батча (UC-12).
+* Ключ обязателен: без `key` каждый вход создаёт новый батч.
 
 ### UC-03 Выполнить Item
 
@@ -950,7 +958,7 @@ sequenceDiagram
 sequenceDiagram
     autonumber
     participant B as Брокер
-    participant MW as th.tracked
+    participant MW as tracked
     participant C as Completer
     participant DB as PostgreSQL
     participant T as Функция задачи
@@ -969,7 +977,7 @@ sequenceDiagram
         C-->>MW: ok
         MW->>MW: ContextVar = ItemContext, старт heartbeat
         MW->>T: await task(*args)
-        T->>MW: th.item.spawn / incr / ok(label) → в буфер
+        T->>MW: item.spawn / incr / ok(label) → в буфер
         T-->>MW: return
         MW->>C: finish(item, result, spawns, metrics)
         C->>DB: групповая tx, см. §9.2
@@ -984,7 +992,7 @@ sequenceDiagram
 sequenceDiagram
     autonumber
     participant B as Брокер
-    participant MW as th.tracked
+    participant MW as tracked
     participant A as Adapter
     participant C as Completer
     participant DB as PostgreSQL
@@ -1111,10 +1119,10 @@ sequenceDiagram
     participant S as AsyncSession пользователя
     participant DB as PostgreSQL
     participant C as Completer
-    participant MW as th.tracked
+    participant MW as tracked
 
     T->>S: begin, бизнес-записи
-    T->>DB: th.item.complete_in(S): th_item FOR UPDATE, затем th_lease FOR UPDATE
+    T->>DB: item.complete_in(S): th_item FOR UPDATE, затем th_lease FOR UPDATE
     alt Item active, lease принадлежит этой попытке
         T->>DB: CAS th_item, DELETE th_lease,<br/>INSERT th_counter_delta, дельты th_metric, spawns
         Note over DB: горячие строки th_counter не трогаем:<br/>нет ожидания блокировок, нет 40001 при REPEATABLE READ
@@ -1137,7 +1145,7 @@ sequenceDiagram
 
 * **Истёкший, но никем не занятый lease завершению не мешает.** Строка lease на месте и принадлежит попытке, строка Item заблокирована: sweeper пропустит её (`SKIP LOCKED`), claim дубля дождётся commit и увидит терминальный Item.
 * **Проверка и запись — под одной блокировкой.** Владельца lease меняют только claim, `release`, возврат при остановке и sweeper, и все они блокируют строку `th_item` раньше строки lease. Между проверкой и commit транзакции пользователя перехват невозможен. Новых блокировок путь B не добавляет: обе строки он и так меняет (CAS и `DELETE th_lease`).
-* **`LeaseLostError` — не ошибка задачи.** Ловить её не нужно: исключение должно выйти из блока транзакции, чтобы та откатилась. Обёртка `th.tracked` на ней не пишет ни `finish`, ни `release` и возвращает брокеру успех, как при `DUPLICATE` и `TERMINAL` в UC-03: Item уже завершён или принадлежит другому исполнителю, ретрай и DLQ ему только навредили бы. Если задача поймала `LeaseLostError` и вернулась обычным образом, бросила вместо неё другое исключение или была отменена, обёртка тоже ничего не пишет; чужое исключение уходит брокеру как есть.
+* **`LeaseLostError` — не ошибка задачи.** Ловить её не нужно: исключение должно выйти из блока транзакции, чтобы та откатилась. Обёртка `tracked` на ней не пишет ни `finish`, ни `release` и возвращает брокеру успех, как при `DUPLICATE` и `TERMINAL` в UC-03: Item уже завершён или принадлежит другому исполнителю, ретрай и DLQ ему только навредили бы. Если задача поймала `LeaseLostError` и вернулась обычным образом, бросила вместо неё другое исключение или была отменена, обёртка тоже ничего не пишет; чужое исключение уходит брокеру как есть.
 * **Повторный вызов в той же попытке.** После commit — ничего не делает. До commit на том же соединении, пока первая запись в силе, — тоже ничего не делает: итог и `spawn`, накопленные после первого вызова, не записываются. До commit на другом соединении — `ConfigurationError`: Item завершается в одной транзакции. После отката транзакции или savepoint первая запись отменена вместе с удалением lease, и следующий вызов выполняет проверку и запись заново (A-DB-09).
 * **Путь A не меняется.** `finish` из обёртки и из DLQ по-прежнему защищён только CAS по `state`: у него нет доменной записи, которую нужно откатывать.
 
@@ -1196,7 +1204,7 @@ sequenceDiagram
     participant O as API-код
     participant TH as tallyho
     participant DB as PostgreSQL
-    participant MW as th.tracked
+    participant MW as tracked
     participant B as Брокер
     participant H as on_policy_breach
 
@@ -1221,14 +1229,14 @@ sequenceDiagram
     autonumber
     participant O as API-код
     participant DB as PostgreSQL
-    participant MW as th.tracked
+    participant MW as tracked
     participant T as Выполняющаяся задача
     participant F as Finalizer
 
     O->>DB: handle.cancel(session): cancel_requested_at=now для дерева, add и spawn запрещены
     O->>DB: чанками: Items из outbox → cancelled, DELETE outbox, cancelled += n
     Note over MW: отправленные, но не начатые → ленивая отмена при claim
-    T->>T: th.item.cancelled() == True → кооперативный выход
+    T->>T: item.cancelled() == True → кооперативный выход
     F->>DB: когда pending = 0: on_finalized(summary.state=cancelled) + CAS → cancelled
 ```
 
@@ -1413,7 +1421,7 @@ sequenceDiagram
 ```mermaid
 flowchart LR
     subgraph A["Путь A: 99% завершений"]
-        a1["th.tracked"] --> a2["Completer buffer"]
+        a1["tracked"] --> a2["Completer buffer"]
         a2 -->|"тик 20 мс или 500 шт"| a3["одна короткая tx"]
         a3 --> ctr[("th_counter<br/>слот процесса")]
     end
@@ -1501,7 +1509,7 @@ ratio_корня = Σ w_done_детей / Σ ожидаемый w_total_дете
 
 **ETA** — время до опустошения, а не процент: `(expected − done) / скорость`, где скорость — экспоненциальное скользящее среднее `done` в секунду по снимкам (окно `eta_window`, по умолчанию 60 с). Считается в Snapshotter и в `watch()`, не хранится. Без `expected` ETA нет.
 
-**Собственный прогресс задачи.** `th.item.progress(done, total)` пишется в `th_lease` вместе с ближайшим heartbeat — лишних транзакций нет. Он виден в `handle.in_flight()`: id, возраст lease, попытка, `progress_done/progress_total`. На общий прогресс батча не влияет, служит для отладки долгих и застрявших задач.
+**Собственный прогресс задачи.** `item.progress(done, total)` пишется в `th_lease` вместе с ближайшим heartbeat — лишних транзакций нет. Он виден в `handle.in_flight()`: id, возраст lease, попытка, `progress_done/progress_total`. На общий прогресс батча не влияет, служит для отладки долгих и застрявших задач.
 
 ---
 
@@ -1551,7 +1559,7 @@ ratio_корня = Σ w_done_детей / Σ ожидаемый w_total_дете
 ### 11.1 Установка
 
 ```python
-from tallyho import Tallyho
+from tallyho import Tallyho, item
 from tallyho.adapters.flexiq import FlexiqAdapter
 
 th = Tallyho(engine, schema="app", hook_modules=["app.mailing.hooks"])
@@ -1559,14 +1567,17 @@ fq = FlexiqAdapter(queue)  # flexiq.Queue пользователя
 th.install(fq)  # системная задача tallyho.system и DLQ-хук
 
 
-@fq.task(max_retries=4)  # = queue.task(...)(th.tracked(fn)), см. §11.3
-async def my_task(x: int) -> None: ...
+@fq.task(max_retries=4)  # = queue.task(...)(tracked(fn)), см. §11.3
+async def my_task(x: int) -> None:
+    item.incr("seen", x)  # фасад текущей задачи — модульный, не атрибут th
 
 
 await th.migrate()  # или ревизии Alembic: upgrade(..., version=1), затем version=2, 3, 4 и 5
 ```
 
 `th.install(adapter)` запускает в процессе relay (§3.2): отправка после commit не требует отдельного процесса maintenance. В том же цикле идёт сверка с DLQ брокера (UC-15). `th.install(None)` — установка без брокера для процессов обслуживания и чтения (CLI): `th.batch` и `th.call` в ней бросают `ConfigurationError`, relay не создаётся, `th.maintenance()` выполняет sweeper, финализацию и снимки.
+
+**Фасады задачи.** `item`, `callback` и `tracked` импортируются из пакета (`from tallyho import item, callback, tracked`) и атрибутами `Tallyho` не являются. Контекст выполняемой задачи живёт в `ContextVar` процесса и к установке не привязан: тот же `item` работает с любым адаптером и вне задачи ничего не делает, поэтому модуль задач не обязан видеть объект `th`. `tracked(fn)` нужен адаптеру брокера без собственного декоратора; `@fq.task(...)` применяет его сам (§11.3). Слой `api` не импортирует `runtime` (§3.3), и атрибуты `th.item`/`th.tracked` нарушили бы это разделение.
 
 **Схема и соединения.** `schema` записывается в сами таблицы библиотеки (`MetaData(schema=...)`), поэтому каждый её запрос содержит имя схемы и не зависит от настроек соединения. Из этого следуют три правила:
 
@@ -1604,22 +1615,29 @@ await th.migrate()  # или ревизии Alembic: upgrade(..., version=1), з
 
 | Область | Методы |
 |---|---|
-| Батч | `th.batch(kind, key=, start_at=, on_succeeded=, on_completed_with_errors=, on_failed=, on_cancelled=, on_finalized_task=, failure_policy=, max_in_flight=, expected_total=, max_items=, deadline=, retention=, release_required=, attributes=, memo=, session=)` → `BatchBuilder`: `add`, `map`, `add_calls`, `sub_batch`, `expect`, `seal` |
-| Под-батч / этап | `builder.sub_batch(key, fed_by=[...], on_feeder_failed="seal" или "cancel", max_in_flight=, max_depth=, expected_total=, failure_policy=, on_...=)` — те же параметры, что у батча, кроме `retention`/`release_required`/`max_items`/`attributes`/`memo` (задаются только у корня) |
+| Батч | `th.batch(kind, key=, seal=, start_at=, on_succeeded=, on_completed_with_errors=, on_failed=, on_cancelled=, on_finalized_task=, failure_policy=, max_in_flight=, expected_total=, max_items=, deadline=, retention=, release_required=, attributes=, memo=, session=)` → `BatchBuilder`: `add`, `map`, `add_calls`, `sub_batch`, `expect`, `seal` |
+| Под-батч / этап | `builder.sub_batch(key, fed_by=[...], on_feeder_failed="seal" или "cancel", max_in_flight=, max_depth=, expected_total=, failure_policy=, on_...=)` — те же параметры, что у батча, плюс `kind=`, кроме `retention`/`release_required`/`max_items`/`attributes`/`memo` (задаются только у корня) и `seal`/`session` (действуют на весь builder корня) |
 | Поиск | `th.handle(batch_id)`, `th.find(kind, key)`, `handle.child(key)`, `th.list_batches(kinds=, states=, attributes=, created_after=, created_before=, limit=, cursor=)` → `BatchPage` |
 | Handle | `view`, `watch`, `wait`, `in_flight(limit=)`, `reschedule`, `pause`, `resume`, `cancel`, `retry_failed(labels=)`, `retry_finalize`, `release`, `items(states=, labels=)` |
-| Задача | `th.item.id()`, `spawn(fn, *args, into=, key=, **kwargs)`, `spawn_call(call, into=)`, `sub_batch`, `expect(n, into=)`, `progress(done, total)`, `incr`, `ok(label=, result=)`, `skip(label)`, `error(label, detail=)`, `complete_in(session)`, `cancelled()`, `current()` |
+| Задача | `from tallyho import item`: `item.id()`, `spawn(fn, *args, **kwargs)`, `spawn(fn, *args, into=, key=)`, `spawn_call(call, into=)`, `sub_batch(key, kind=, start_at=, deadline=, failure_policy=, max_in_flight=, expected_total=, max_depth=, on_...=)`, `expect(n, into=)`, `progress(done, total)`, `incr`, `ok(label=, result=)`, `skip(label)`, `error(label, detail=)`, `complete_in(session)`, `cancelled()`, `current()` |
+| Колбэк | `from tallyho import callback`: `callback.current()` → `CallbackContext(callback_id, batch_id)`; `None` вне колбэк-задачи |
 | Вызовы | `th.call(fn, *args, **kwargs).opts(key=, weight=, queue=)` — типизировано через `ParamSpec` |
 | Tx-хуки | `@th.on_finalized(kind)`, `@th.on_progress(kind, every=)`, `@th.on_policy_breach(kind)` |
 | Политики | `th.FailurePolicy.continue_() / fail_fast() / threshold(ratio=, min_processed=, labels=, action="fail" или "pause")` |
 
-`into=` — ключ под-батча внутри дерева (`"cards"`) или `BatchHandle`. `key=` — ключ дедупликации Item в целевом батче. Для URL рекомендуем нормализованный адрес без фрагмента, как `uniqueKey` у Crawlee.
+`into=` — ключ под-батча внутри дерева (`"cards"`) или его id (`UUID`, например `handle.id`). `BatchHandle` целиком не принимается: `runtime` не зависит от `api` (§3.3), а id в задаче доступен и без handle. `key=` — ключ дедупликации Item в целевом батче. Для URL рекомендуем нормализованный адрес без фрагмента, как `uniqueKey` у Crawlee.
+
+**Формы `spawn`.** Сигнатура задачи проверяется через `ParamSpec` (A-NF-04), а `ParamSpec` не умеет добавлять к чужой сигнатуре keyword-only параметры. Поэтому у `spawn` две типизированные формы: `spawn(fn, *args, **kwargs)` — аргументы задачи как есть, цель — свой батч; `spawn(fn, a1[, a2[, a3]], into=, key=)` — до трёх позиционных аргументов задачи и маршрут. Имена `into` и `key` зарезервированы: `spawn` забирает их себе и в задачу не передаёт. Остальное — именованные аргументы задачи вместе с маршрутом, вес, очередь, опции брокера — задаётся подготовленным вызовом: `item.spawn_call(th.call(fn, *args, **kwargs).opts(key=, weight=, queue=, ...), into=)`. Отдельного `opts=` у `spawn` нет: второй способ задать те же опции только расширил бы API.
+
+**Колбэк-задача.** `callback.current()` даёт `callback_id` (стабилен при повторной доставке — ключ идемпотентности) и `batch_id` финализированного батча. Сводки в контексте нет: итоговые счётчики атомарно с финализацией пишет `on_finalized` (§7.2), а колбэку, которому они нужны, хватает `th.handle(batch_id).view()`. Возить `BatchSummary` всего дерева в payload каждой колбэк-джобы ради редкого чтения — лишний объём outbox и брокера.
+
+**Потоковое добавление.** `th.batch(..., seal=False)`: выход из `async with` коммитит добавленное, но не закрывает ни корень, ни под-батчи этого builder. Следующий вход с тем же `(kind, key)` находит открытый батч и добавляет в него в новой транзакции; закрывает батч вход без `seal=False` или явный `await builder.seal()`. Сценарий и правила — UC-02.
 
 `max_in_flight` действует **на этот экземпляр батча**. Глобальный лимит на тип задачи для всех батчей сразу — это забота брокера (flexiq `max_concurrent`, `rate_limit`). Это разделение важно: у Airflow `max_active_tis_per_dag` неожиданно действует на все запуски.
 
 Окно считается по узкой таблице `th_window`: relay при захвате записи outbox вставляет строку `(item_id, batch_id)`, завершение Item её удаляет и возвращает в очередь столько запаркованных записей батча, сколько мест освободилось. Захват по батчу с окном сериализуется `pg_try_advisory_xact_lock`: занятый батч relay пропускает до следующего прохода. Записи сверх окна паркуются (`available_at = ∞`), scan relay страхует возврат мест. Строка окна ключом по `item_id`, поэтому повторный захват после падения relay место не удваивает.
 
-`th.item.complete_in(session)` бросает `LeaseLostError`, если попытка больше не владеет Item (UC-08). Вне отслеживаемой задачи это no-op, как и остальные методы `th.item`.
+`item.complete_in(session)` бросает `LeaseLostError`, если попытка больше не владеет Item (UC-08). Вне отслеживаемой задачи это no-op, как и остальные методы `item`, кроме `sub_batch`: он возвращает builder и вне задачи бросает `ConfigurationError`.
 
 Метки итога — свободные строки. По умолчанию `ok()` без label → `"ok"`, исчерпанные попытки → `error("exhausted")`, lease истёк на последней попытке → `error("lease_expired")`, отмена → `cancelled`. `error()` по умолчанию помечается в `th_item_mark`, `ok()`/`skip()` — нет (переопределяется `mark=`).
 
@@ -1654,8 +1672,8 @@ await th.migrate()  # или ревизии Alembic: upgrade(..., version=1), з
 
 | Факт о flexiq | Следствие | Решение в адаптере |
 |---|---|---|
-| Нет своего job id при enqueue: id генерирует Rust (`Uuid::now_v7()`) | `item.id` ≠ id джобы flexiq | Relay добавляет в kwargs служебный `_th={"i": item_id, "b": batch_id, "r": effective_max_retries}` (`r` нужен runtime, потому что `current_job` лимит не показывает), а при повторной отправке — ещё и поколение `"g": generation` (у первой отправки ключа нет, это поколение 0). Обёртка `th.tracked` вынимает маркер до вызова функции. Kwargs переносятся в DLQ, по ним идёт сверка. **`metadata` и `notes` пользователя не трогаем** (§11.4) |
-| Middleware только синхронные `before/after`, around-хука нет; `on_retry/on_dead_letter` вызываются вне задачи с `SimpleNamespace(id, task_name)` | На sync-хуках нельзя `await` Completer | **`@fq.task(...)` = `queue.task(...)(th.tracked(fn))`**: обёртка — `async def` в том же event loop, что и задача, то есть настоящий around. `functools.wraps` сохраняет `module.qualname`, имя задачи не меняется |
+| Нет своего job id при enqueue: id генерирует Rust (`Uuid::now_v7()`) | `item.id` ≠ id джобы flexiq | Relay добавляет в kwargs служебный `_th={"i": item_id, "b": batch_id, "r": effective_max_retries}` (`r` нужен runtime, потому что `current_job` лимит не показывает), а при повторной отправке — ещё и поколение `"g": generation` (у первой отправки ключа нет, это поколение 0). Обёртка `tracked` вынимает маркер до вызова функции. Kwargs переносятся в DLQ, по ним идёт сверка. **`metadata` и `notes` пользователя не трогаем** (§11.4) |
+| Middleware только синхронные `before/after`, around-хука нет; `on_retry/on_dead_letter` вызываются вне задачи с `SimpleNamespace(id, task_name)` | На sync-хуках нельзя `await` Completer | **`@fq.task(...)` = `queue.task(...)(tracked(fn))`**: обёртка — `async def` в том же event loop, что и задача, то есть настоящий around. `functools.wraps` сохраняет `module.qualname`, имя задачи не меняется |
 | Async-задачи идут в одном event loop на процесс (поток `flexiq-async-executor`, семафор `async_concurrency=100`) | Completer должен жить в этом loop | Completer создаётся лениво в loop первой задачи. Отслеживаемые задачи — только `async def` (проверка при декорировании) |
 | Prefork-пул исполняет async-задачу через `asyncio.run` в новом event loop на каждую джобу, на Windows — `NotImplementedError` (спайк T8.0) | Completer и lease не переживают джобу | v1 поддерживает только `pool="thread"`. Prefork — ошибка при `install` |
 | В задаче известен `current_job.retry_count`, но не `max_retries`; решение «ретрай или DLQ» принимает Rust **после** задачи (`retry_on/dont_retry_on`, `retry_budget`, circuit breaker) | Задача не знает точно, последняя ли это попытка | `retry_verdict(exc)` считает по конфигу `TaskWrapper` и `retry_count`. Страховка: событие `JOB_DEAD` (`queue.on_event`, пул `flexiq-events`) через `loop.call_soon_threadsafe` → `finish(error)` с идемпотентным CAS + периодическая сверка `dead_letters_after` → `get_job(original_job_id)` → `_th` из payload (D-014) → правило UC-15 |
@@ -1677,7 +1695,7 @@ sequenceDiagram
     participant R as Relay
     participant Q as flexiq Queue
     participant X as flexiq async executor loop
-    participant W as th.tracked обёртка
+    participant W as tracked обёртка
     participant C as Completer в том же loop
     participant F as Функция пользователя
     participant H as on_dead_letter (sync)
@@ -1713,7 +1731,7 @@ sequenceDiagram
 
 ### 11.4 Опции постановки flexiq
 
-Отслеживаемая задача ставится через наш outbox и relay, но для пользователя это должно выглядеть как обычный `apply_async`. Все параметры постановки flexiq задаются в `th.call(...).opts(...)` или `spawn(..., opts=...)`. Они сохраняются в `payload` Item и передаются в `enqueue_many` при отправке.
+Отслеживаемая задача ставится через наш outbox и relay, но для пользователя это должно выглядеть как обычный `apply_async`. Все параметры постановки flexiq задаются в `th.call(...).opts(...)`; из задачи такой вызов ставится через `item.spawn_call(call, into=)` (§11.2). Они сохраняются в `payload` Item и передаются в `enqueue_many` при отправке.
 
 | Опция flexiq | Поведение | Проверка в приёмке |
 |---|---|---|
@@ -1727,6 +1745,7 @@ sequenceDiagram
 | `depends_on` | **не поддерживается** для отслеживаемых задач: id джоб flexiq неизвестны при постановке. Явная ошибка `UnsupportedOption`, альтернатива — этапы `fed_by` | A-FQ-07 |
 | `debounce*`, `@task(batch=...)` | **не поддерживается**: flexiq сливает или буферизует задачи в памяти, и это ломает правило «один Item — одна джоба». Ошибка при декорировании или постановке | A-FQ-07 |
 | параметры задачи (`retry_on`, `dont_retry_on`, `retry_backoff`, `retry_delays`, `retry_budget`, `circuit_breaker`, `soft_timeout`, `rate_limit`, `max_concurrent`, `middleware`, `inject`, `serializer`, `codecs`, `predicate`) | работают как у обычной задачи flexiq; `retry_verdict` учитывает фильтры ретраев, бюджет и breaker страхуются сверкой с DLQ. К непустому `retry_on` адаптер добавляет `CompleterError` (§11.3) | A-FQ-08 … A-FQ-12 |
+| `weight` в `@fq.task(...)` | **не принимается** — `UnsupportedOption` при декорировании. Вес — опция tallyho, а не flexiq: он хранится в Item и задаётся вызову, `th.call(...).opts(weight=)`; умолчание — 1. Второго источника веса (декоратор) нет, чтобы вес Item не зависел от того, какой процесс зарегистрировал задачу | — |
 
 ---
 
@@ -1982,9 +2001,11 @@ async def auto_pause(session: AsyncSession, s: BatchSummary, breach: PolicyBreac
 
 #### Задачи
 
-`fq.task(...)` принимает те же параметры, что и `queue.task(...)` flexiq, и оборачивает функцию в `th.tracked`.
+`fq.task(...)` принимает те же параметры, что и `queue.task(...)` flexiq, и оборачивает функцию в `tracked`. Итог и порождение детей — через модульный фасад `item` (§11.1). У `send_email` есть именованный аргумент и маршрут с ключом сразу, поэтому ребёнок ставится подготовленным вызовом `spawn_call` (§11.2, «Формы `spawn`»).
 
 ```python
+from tallyho import item
+
 PAGE = 1000
 
 
@@ -2010,16 +2031,10 @@ async def expand_audience(campaign_id: int, after_id: int) -> None:
 
     boxes = c.mailbox_ids
     for ct in contacts:
-        th.item.spawn(
-            send_email,
-            campaign_id,
-            ct.id,
-            mailbox_id=boxes[ct.id % len(boxes)],
-            into="send",
-            key=normalize_email(ct.email),
-        )  # дедуп адресов
+        call = th.call(send_email, campaign_id, ct.id, mailbox_id=boxes[ct.id % len(boxes)])
+        item.spawn_call(call.opts(key=normalize_email(ct.email)), into="send")  # дедуп адресов
     if len(contacts) == PAGE:
-        th.item.spawn(expand_audience, campaign_id, after_id=contacts[-1].id)  # в свой этап
+        item.spawn(expand_audience, campaign_id, after_id=contacts[-1].id)  # в свой этап
     # всё записывается атомарно с завершением этой задачи
 
 
@@ -2028,15 +2043,15 @@ async def send_email(campaign_id: int, contact_id: int, mailbox_id: int) -> None
     async with db.begin() as s:
         contact = await s.get(Contact, contact_id)
         if contact is None or contact.deleted_at:
-            return th.item.skip("recipient_not_found")
+            return item.skip("recipient_not_found")
         if contact.unsubscribed_at:
-            return th.item.skip("unsubscribed")
+            return item.skip("unsubscribed")
         if await s.get(Suppression, normalize_email(contact.email)):
-            return th.item.skip("suppressed")
+            return item.skip("suppressed")
         c = await s.get(Campaign, campaign_id)
     if not is_valid_email(contact.email):
-        return th.item.error("invalid_address")
-    if th.item.cancelled():
+        return item.error("invalid_address")
+    if item.cancelled():
         return
 
     try:
@@ -2050,13 +2065,13 @@ async def send_email(campaign_id: int, contact_id: int, mailbox_id: int) -> None
     except HardBounce as e:
         async with db.begin() as s:  # suppression и итог Item — одной транзакцией
             s.add(Suppression(email=normalize_email(contact.email), reason="hard_bounce"))
-            th.item.error("hard_bounce", detail=str(e))
-            await th.item.complete_in(s)
+            item.error("hard_bounce", detail=str(e))
+            await item.complete_in(s)
         return
     except Rejected as e:
-        return th.item.error("rejected", detail=str(e))
+        return item.error("rejected", detail=str(e))
     # TemporaryMailError пробрасывается → ретрай flexiq → error("exhausted") на последней попытке
-    th.item.ok("sent", result={"message_id": message_id})
+    item.ok("sent", result={"message_id": message_id})
 ```
 
 #### Чтение прогресса
@@ -2193,7 +2208,7 @@ pie showData
 #### Тесты
 
 `tallyho.testing` даёт:
-* `InlineBroker` — адаптер, который выполняет отправленные сообщения в этом же процессе через `th.tracked` и эмулирует ретраи и дубли доставки;
+* `InlineBroker` — адаптер, который выполняет отправленные сообщения в этом же процессе через `tracked` и эмулирует ретраи и дубли доставки;
 * `FakeClock` — управление временем для `start_at`, lease и снимков;
 * `run_maintenance_once()`.
 
@@ -2423,8 +2438,8 @@ async def send_email(campaign_id: int, contact_id: int, mailbox_id: int) -> None
     ...
     async with db.begin() as s:  # строка доставки и исход Item — один commit
         await set_delivery(s, campaign_id, email, status="sent")
-        th.item.ok("sent")
-        await th.item.complete_in(s)
+        item.ok("sent")
+        await item.complete_in(s)
 
 
 @th.on_finalized(KIND)
@@ -2548,24 +2563,26 @@ async def parse_page(url: str, page: int) -> None:
     html = await fetch(url, page)
     if page == 1:
         n = total_pages(html)
-        th.item.expect(n)  # у pages будет n
+        item.expect(n)  # у pages будет n
         for p in range(2, n + 1):
-            th.item.spawn(parse_page, url, p)
+            item.spawn(parse_page, url, p)
     for card in cards_of(html):
-        th.item.spawn(parse_card, card.url, into="cards", key=normalize_url(card.url))
+        call = th.call(parse_card, card.url).opts(key=normalize_url(card.url), weight=2)
+        item.spawn_call(call, into="cards")  # вес — опция вызова, не декоратора
 
 
-@fq.task(max_retries=3, weight=2)
+@fq.task(max_retries=3)
 async def parse_card(url: str) -> None:
     for pdf in pdf_links(await fetch(url)):
-        th.item.spawn(download_pdf, pdf, into="pdfs", key=normalize_url(pdf))
+        call = th.call(download_pdf, pdf).opts(key=normalize_url(pdf), weight=4)
+        item.spawn_call(call, into="pdfs")
 
 
-@fq.task(max_retries=5, weight=4)
+@fq.task(max_retries=5)
 async def download_pdf(url: str) -> None:
     async for done, total in stream_download(url):
-        th.item.progress(done, total)  # видно в handle.in_flight()
-    th.item.ok("downloaded")
+        item.progress(done, total)  # видно в handle.in_flight()
+    item.ok("downloaded")
 
 
 @th.on_progress("catalog_parse", every=timedelta(seconds=2))
@@ -2718,7 +2735,7 @@ xychart-beta
 
 **v1**: всё из §§5–13 на PostgreSQL.
 * батчи, spawn, под-батчи, конвейеры этапов (`fed_by`, `into=`, каскад пустых этапов, `max_items`/`max_depth`), labels;
-* модель прогресса: найдено / сделано / оценка / ETA, `in_flight`, `th.item.progress`;
+* модель прогресса: найдено / сделано / оценка / ETA, `in_flight`, `item.progress`;
 * отложенный старт, pause/resume/cancel, retry_failed;
 * групповой коммит, sweeper;
 * tx-хуки `on_finalized / on_progress / on_policy_breach`, retention + release;

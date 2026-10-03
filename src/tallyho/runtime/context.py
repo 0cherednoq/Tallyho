@@ -8,7 +8,7 @@ from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, ParamSpec, Protocol, Self, TypeVar, cast, overload
 
 from tallyho.engine.completer import ExpectRequest, FinishResult, SpawnRequest, SubBatchRequest
-from tallyho.engine.producer import SubBatchSpec
+from tallyho.engine.producer import CallbackName, SubBatchSpec
 from tallyho.model.calls import TaskCall
 from tallyho.model.errors import ConfigurationError, LeaseLostError
 from tallyho.model.states import OnFeederFailed, ResultClass
@@ -23,7 +23,6 @@ if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession
 
     from tallyho.engine.completer import Completer, ItemRef
-    from tallyho.engine.producer import CallbackName
     from tallyho.engine.spawn import TreeSnapshot
     from tallyho.model.policy import FailurePolicy
 
@@ -65,11 +64,14 @@ class CallFactory(Protocol):
 
 @dataclass(frozen=True, slots=True)
 class CallbackContext:
-    """Служебная информация текущей callback-задачи."""
+    """Служебная информация текущей callback-задачи (ARCHITECTURE §11.2).
+
+    ``callback_id`` стабилен при повторной доставке — ключ идемпотентности.
+    Сводки здесь нет: итог батча читается через ``th.handle(batch_id).view()``.
+    """
 
     callback_id: UUID
     batch_id: UUID
-    summary: object = None
 
 
 @dataclass(slots=True)
@@ -260,7 +262,11 @@ class ItemContext:
         kind: str | None = None,
         start_at: datetime | None = None,
         deadline: datetime | timedelta | None = None,
-        callbacks: Mapping[CallbackName, TaskCall] | None = None,
+        on_succeeded: TaskCall | None = None,
+        on_completed_with_errors: TaskCall | None = None,
+        on_failed: TaskCall | None = None,
+        on_cancelled: TaskCall | None = None,
+        on_finalized_task: TaskCall | None = None,
         failure_policy: FailurePolicy | None = None,
         max_in_flight: int | None = None,
         expected_total: int | None = None,
@@ -269,9 +275,19 @@ class ItemContext:
     ) -> RuntimeSubBatch:
         """Создать асинхронный builder динамического под-батча.
 
+        Колбэки задаются так же, как у ``BatchBuilder.sub_batch``:
+        ``on_succeeded=th.call(...)`` и т. д. (ARCHITECTURE §11.2).
+
         Returns:
             Буфер под-батча.
         """
+        named = {
+            CallbackName.ON_SUCCEEDED: on_succeeded,
+            CallbackName.ON_COMPLETED_WITH_ERRORS: on_completed_with_errors,
+            CallbackName.ON_FAILED: on_failed,
+            CallbackName.ON_CANCELLED: on_cancelled,
+            CallbackName.ON_FINALIZED_TASK: on_finalized_task,
+        }
         return RuntimeSubBatch(
             self,
             SubBatchSpec(
@@ -279,7 +295,7 @@ class ItemContext:
                 kind=kind,
                 start_at=start_at,
                 deadline=deadline,
-                callbacks={} if callbacks is None else callbacks,
+                callbacks={name: call for name, call in named.items() if call is not None},
                 failure_policy=failure_policy,
                 max_in_flight=max_in_flight,
                 expected_total=expected_total,
@@ -533,7 +549,11 @@ class ItemFacade:
         kind: str | None = None,
         start_at: datetime | None = None,
         deadline: datetime | timedelta | None = None,
-        callbacks: Mapping[CallbackName, TaskCall] | None = None,
+        on_succeeded: TaskCall | None = None,
+        on_completed_with_errors: TaskCall | None = None,
+        on_failed: TaskCall | None = None,
+        on_cancelled: TaskCall | None = None,
+        on_finalized_task: TaskCall | None = None,
         failure_policy: FailurePolicy | None = None,
         max_in_flight: int | None = None,
         expected_total: int | None = None,
@@ -555,7 +575,11 @@ class ItemFacade:
             kind=kind,
             start_at=start_at,
             deadline=deadline,
-            callbacks=callbacks,
+            on_succeeded=on_succeeded,
+            on_completed_with_errors=on_completed_with_errors,
+            on_failed=on_failed,
+            on_cancelled=on_cancelled,
+            on_finalized_task=on_finalized_task,
             failure_policy=failure_policy,
             max_in_flight=max_in_flight,
             expected_total=expected_total,
