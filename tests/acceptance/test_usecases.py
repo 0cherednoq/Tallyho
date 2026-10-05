@@ -61,13 +61,8 @@ class _Defect:
 
 # Нарушения инвариантов и невыполненные ожидания A-UC, ждущие задачи Fix-N.
 #
-# A-UC-19: `ProgressWatcher` читает `Reads.view` без скоростей, ETA в `watch()` всегда None,
-# хотя ARCHITECTURE §9.4 обещает её «в Snapshotter и в watch()»; в снимках on_progress ETA есть.
-_WATCH_ETA = _Defect("Fix-NEW-watch-eta", "watch() не считает ETA: скорости не передаются")
 _INVARIANT_DEFECTS: Mapping[str, _Defect] = {}
-_EXPECTATION_DEFECTS: Mapping[str, _Defect] = {
-    "A-UC-19": _WATCH_ETA,
-}
+_EXPECTATION_DEFECTS: Mapping[str, _Defect] = {}
 
 
 def _cases(defects: Mapping[str, _Defect]) -> list[ParameterSet]:

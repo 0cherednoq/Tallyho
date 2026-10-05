@@ -1268,7 +1268,7 @@ sequenceDiagram
 
     UI->>H: view()
     H->>DB: один SELECT по дереву: sum(th_counter) + sum(th_counter_delta) + th_metric + th_feed + count(th_lease)
-    H-->>UI: Progress на каждый батч дерева: found, done по классам, in_flight, expected, ratio, eta, labels
+    H-->>UI: Progress на каждый батч дерева: found, done по классам, in_flight, expected, ratio, labels (eta = None)
     UI->>H: watch()
     loop
         DB-->>H: NOTIFY th_progress, payload=batch_id, не чаще 1 раза в 500 мс на батч
@@ -1532,6 +1532,8 @@ ratio_корня = Σ w_done_детей / Σ ожидаемый w_total_дете
 `ratio` может немного откатиться назад, если оценка выросла. Библиотека отдаёт честные числа; рецепт для домена — `progress = GREATEST(progress, :ratio)` в `on_progress`.
 
 **ETA** — время до опустошения, а не процент: `(expected − done) / скорость`, где скорость — экспоненциальное скользящее среднее `done` в секунду по снимкам (окно `eta_window`, по умолчанию 60 с). Считается в Snapshotter и в `watch()`, не хранится. Без `expected` ETA нет.
+
+Скорость — состояние того, кто читает несколько раз подряд: Snapshotter ведёт её по своим проходам, `watch()` — по чтениям своего потока (тот же один SELECT по дереву, лишних запросов нет; первое обновление потока ETA ещё не содержит). Разовый `view()` скорости не знает, поэтому `Progress.eta` в нём всегда `None`: хранить скорость в БД или делать второй замер ради `view()` значило бы добавить запись на горячем пути или задержку чтения. Изменение одной ETA (она растёт, пока работа стоит) — не повод для нового обновления `watch()`; ETA обновляется вместе с остальными полями.
 
 **Собственный прогресс задачи.** `item.progress(done, total)` пишется в `th_lease` вместе с ближайшим heartbeat — лишних транзакций нет. Он виден в `handle.in_flight()`: id, возраст lease, попытка, `progress_done/progress_total`. На общий прогресс батча не влияет, служит для отладки долгих и застрявших задач.
 

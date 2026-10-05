@@ -14,6 +14,7 @@ import pytest
 from sqlalchemy import func, select, update
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import create_async_engine
+from typing_extensions import override
 
 from tallyho.engine.maintenance import (
     Maintenance,
@@ -25,9 +26,11 @@ from tallyho.engine.maintenance import (
 from tallyho.engine.producer import RootSpec
 from tallyho.engine.reads import Reads
 from tallyho.engine.sweeper import SweepResult
+from tallyho.model.calls import TaskCall
 from tallyho.model.errors import ConfigurationError
 from tallyho.model.states import BatchState
 from tallyho.protocols.clock import SystemClock
+from tallyho.storage.counters import CounterDelta, upsert_slots
 from tests.integration.engine.completer_env import schema_engine
 
 if TYPE_CHECKING:
@@ -36,6 +39,21 @@ if TYPE_CHECKING:
     from tests.integration.engine.conftest import Env
 
 __all__: list[str] = []
+
+
+@dataclass
+class ManualClock(SystemClock):
+    """Монотонное время чтений ``watch()``, которое двигает тест."""
+
+    value: float = 0.0
+
+    @override
+    def monotonic(self) -> float:
+        return self.value
+
+    def advance(self, seconds: float) -> None:
+        """Сдвинуть время вперёд."""
+        self.value += seconds
 
 
 @dataclass
@@ -354,6 +372,42 @@ async def test_watch_is_throttled_and_never_loses_final_state(env: Env) -> None:
     assert all(right - left >= 0.06 for left, right in itertools.pairwise(moments))
     with pytest.raises(StopAsyncIteration):
         _ = await anext(stream)
+
+
+async def test_watch_reports_eta_once_rate_is_known(env: Env) -> None:
+    engine = schema_engine(env)
+    clock = ManualClock()
+    async with env.transaction() as conn:
+        root = await env.producer.create_root(conn, RootSpec(kind="watch-eta", expected_total=4))
+        _ = await env.producer.add_items(
+            conn,
+            root.id,
+            [TaskCall(task_name="task", args=(index,), kwargs={}) for index in range(4)],
+        )
+    notifier = ProgressNotifier(engine=engine, throttle=timedelta(milliseconds=1))
+    watcher = ProgressWatcher(
+        engine=engine,
+        reads=Reads(engine, env.tables, clock),
+        # Длинный throttle: чтение по таймауту не вклинится между записью и сдвигом часов.
+        throttle=timedelta(seconds=1),
+    )
+    stream = watcher.watch(root.id)
+    try:
+        initial = await anext(stream)
+        # Первое чтение потока: скорости ещё нет.
+        assert (initial.progress.done, initial.progress.eta) == (0, None)
+
+        async with env.transaction() as conn:
+            await upsert_slots(conn, env.tables, {(root.id, 7): CounterDelta(ok=2, w_done=2)})
+        clock.advance(10)
+        assert await notifier.notify([root.id]) == 1
+        changed = await anext(stream)
+
+        # 2 Items за 10 с - 0.2 в секунду; осталось 2 из 4 - 10 с (§9.4).
+        assert changed.progress.done == 2
+        assert changed.progress.eta == timedelta(seconds=10)
+    finally:
+        await stream.aclose()
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="psycopg async requires selector loop")
