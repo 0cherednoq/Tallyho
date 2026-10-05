@@ -15,7 +15,12 @@ from tallyho.engine.finalizer import Finalizer
 from tallyho.engine.operations import Operations, OperationTriggers
 from tallyho.engine.producer import RootSpec, SubBatchSpec
 from tallyho.model.calls import TaskCall
-from tallyho.model.errors import DownstreamFinalized, InvalidStateError, NotFoundError
+from tallyho.model.errors import (
+    BatchPurged,
+    DownstreamFinalized,
+    InvalidStateError,
+    NotFoundError,
+)
 from tallyho.model.states import BatchState, ItemState
 from tallyho.protocols.clock import SystemClock
 from tallyho.storage.counters import CounterDelta, read_counters, upsert_metrics, upsert_slots
@@ -743,7 +748,7 @@ async def test_retry_finalize_release_triggers_and_invalid_states(env: Env) -> N
     async with env.transaction() as conn:
         with pytest.raises(NotFoundError):
             await subject.pause(conn, missing)
-        with pytest.raises(NotFoundError, match="батч не найден"):
+        with pytest.raises(BatchPurged, match="удалён по retention"):
             _ = await subject.retry_failed(conn, missing)
         with pytest.raises(NotFoundError):
             await subject.release(conn, missing)
