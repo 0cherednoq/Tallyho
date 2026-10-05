@@ -108,6 +108,21 @@ class _ReadsSpy:
         return {}
 
 
+def rate_ids(subject: Snapshotter) -> set[UUID]:
+    """Батчи, чьи скорости держит Snapshotter."""
+    return set(subject._rates)  # ruff: ignore[private-member-access]  # проверка памяти лидера
+
+
+async def finish(env: Env, batch_id: UUID) -> None:
+    """Перевести батч в терминальное состояние, как финализация."""
+    async with env.transaction() as conn:
+        _ = await conn.execute(
+            update(env.tables.batch)
+            .where(env.tables.batch.c.id == batch_id)
+            .values(state=int(BatchState.SUCCEEDED), finished_at=func.now())
+        )
+
+
 def snapshotter(env: Env, registry: HookRegistry, clock: ManualClock) -> Snapshotter:
     """Snapshotter над схемой теста."""
     return Snapshotter(
@@ -164,7 +179,8 @@ async def test_tick_writes_only_changes_with_strict_seq_and_eta(
     assert await subject.tick() == 1
     latest = seen[-1]
     assert (latest.id, latest.seq, latest.progress.done) == (first.id, 2, 1)
-    assert latest.progress.eta is not None
+    # EMA по одному интервалу: 1 Item за 10 с, остался 1 Item -> 10 с.
+    assert latest.progress.eta == timedelta(seconds=10)
     assert (await env.batch(first.id))["snap_seq"] == 2
     assert (await env.batch(second.id))["snap_seq"] == 1
     clock.advance(10)
@@ -391,6 +407,96 @@ async def test_overlapping_tree_rates_and_missing_hook_are_safe(
     assert await missing.tick() == 0
     assert await missing.tick() == 0
     assert observer.missing_calls == 2
+
+
+async def test_rates_of_finished_batches_are_forgotten(env: Env, registry: HookRegistry) -> None:
+    clock = ManualClock()
+
+    @registry.on_progress("tree", every=timedelta(seconds=1))
+    async def save(_session: AsyncSession, _summary: BatchSummary) -> None:
+        await asyncio.sleep(0)
+
+    @registry.on_progress("keep", every=timedelta(seconds=100))
+    async def save_keep(_session: AsyncSession, _summary: BatchSummary) -> None:
+        await asyncio.sleep(0)
+
+    async with env.transaction() as conn:
+        # Живой корень, который всё время теста не попадает в due.
+        keeper = await env.producer.create_root(conn, RootSpec(kind="keep"))
+        root = await env.producer.create_root(conn, RootSpec(kind="tree"))
+        child = await env.producer.create_sub_batch(
+            conn, root.id, SubBatchSpec(key="child", kind="leaf")
+        )
+
+    subject = snapshotter(env, registry, clock)
+    assert await subject.tick() == 2
+    assert rate_ids(subject) == {keeper.id, root.id, child.id}
+
+    await finish(env, root.id)
+    clock.advance(1)
+    assert await subject.tick() == 0
+    assert rate_ids(subject) == {keeper.id}
+
+    # Поток новых деревьев не копит скорости завершённых.
+    for index in range(3):
+        async with env.transaction() as conn:
+            fresh = await env.producer.create_root(conn, RootSpec(kind="tree", key=f"k{index}"))
+        clock.advance(1)
+        assert await subject.tick() == 1
+        assert rate_ids(subject) == {keeper.id, fresh.id}
+        await finish(env, fresh.id)
+    clock.advance(1)
+    assert await subject.tick() == 0
+    assert rate_ids(subject) == {keeper.id}
+
+    await finish(env, keeper.id)
+    assert await subject.tick() == 0
+    assert rate_ids(subject) == set()
+
+
+async def test_rate_survives_ticks_where_batch_is_not_due(env: Env, registry: HookRegistry) -> None:
+    clock = ManualClock()
+    seen: list[BatchSummary] = []
+
+    @registry.on_progress("fast", every=timedelta(seconds=1))
+    async def save_fast(_session: AsyncSession, _summary: BatchSummary) -> None:
+        await asyncio.sleep(0)
+
+    @registry.on_progress("slow", every=timedelta(seconds=10))
+    async def save_slow(_session: AsyncSession, summary: BatchSummary) -> None:
+        await asyncio.sleep(0)
+        seen.append(summary)
+
+    async with env.transaction() as conn:
+        fast = await env.producer.create_root(conn, RootSpec(kind="fast"))
+        slow = await env.producer.create_root(conn, RootSpec(kind="slow", expected_total=4))
+        _ = await env.producer.add_items(
+            conn,
+            fast.id,
+            [TaskCall(task_name="task", args=(index,), kwargs={}) for index in range(5)],
+        )
+        _ = await env.producer.add_items(
+            conn,
+            slow.id,
+            [TaskCall(task_name="task", args=(index,), kwargs={}) for index in range(4)],
+        )
+
+    subject = snapshotter(env, registry, clock)
+    assert await subject.tick() == 2
+    for step in range(1, 5):
+        async with env.transaction() as conn:
+            await upsert_slots(conn, env.tables, {(fast.id, step): CounterDelta(ok=1, w_done=1)})
+        clock.advance(1)
+        assert await subject.tick() == 1
+        assert rate_ids(subject) == {fast.id, slow.id}
+
+    async with env.transaction() as conn:
+        await upsert_slots(conn, env.tables, {(slow.id, 1): CounterDelta(ok=2, w_done=2)})
+    clock.advance(6)
+    assert await subject.tick() == 1
+    # Скорость slow считается от замера t=0: 2 Item за 10 с, осталось 2 -> 10 с.
+    assert seen[-1].id == slow.id
+    assert seen[-1].progress.eta == timedelta(seconds=10)
 
 
 def test_settings_validation() -> None:

@@ -19,7 +19,7 @@ from tallyho.storage.tables import PROGRESS_HOOK
 from tallyho.storage.tx import RetryPolicy, TxSettings, hook_session, run_transaction
 
 if TYPE_CHECKING:
-    from collections.abc import Hashable, Iterable
+    from collections.abc import Hashable, Mapping
     from uuid import UUID
 
     from sqlalchemy import ColumnElement
@@ -111,6 +111,7 @@ class Snapshotter:
     observer: Observer = field(default_factory=NullObserver)
     _schedule: dict[UUID, _Schedule] = field(default_factory=dict, init=False)
     _rates: dict[UUID, _Rate] = field(default_factory=dict, init=False)
+    _trees: dict[UUID, frozenset[UUID]] = field(default_factory=dict, init=False)
     _missing: set[UUID] = field(default_factory=set, init=False)
 
     async def tick(self) -> int:
@@ -122,6 +123,7 @@ class Snapshotter:
         now = self.clock.monotonic()
         active = await self._active()
         self._refresh_schedule(active, now)
+        self._forget_rates()
         due = [
             batch_id
             for batch_id, value in sorted(
@@ -139,7 +141,7 @@ class Snapshotter:
             progress=self.settings.progress,
         )
         previews = await reader.summaries(due)
-        self._observe_rates(previews.values(), now)
+        self._observe_rates(previews, now)
         changed: list[UUID] = []
         for batch_id in due:
             schedule = self._schedule.get(batch_id)
@@ -212,30 +214,52 @@ class Snapshotter:
             self._schedule.pop(batch_id, None)
         self._missing.intersection_update(active)
 
-    def _observe_rates(self, summaries: Iterable[BatchSummary], now: float) -> None:
+    def _forget_rates(self) -> None:
+        """Забыть скорости узлов, не входящих в деревья запланированных корней.
+
+        Корень уходит из расписания, когда финализирован, удалён или потерял хук;
+        временное отсутствие в ``due`` дерево не трогает, скорость сохраняется.
+        """
+        stale = self._trees.keys() - self._schedule.keys()
+        if not stale:
+            return
+        for root_id in stale:
+            del self._trees[root_id]
+        live: set[UUID] = set()
+        for tree in self._trees.values():
+            live.update(tree)
+        for batch_id in self._rates.keys() - live:
+            del self._rates[batch_id]
+
+    def _observe_rates(self, summaries: Mapping[UUID, BatchSummary], now: float) -> None:
         seen: set[UUID] = set()
 
-        def visit(summary: BatchSummary) -> None:
-            if summary.id in seen:
-                return
-            seen.add(summary.id)
-            previous = self._rates.get(summary.id)
-            if previous is None:
-                self._rates[summary.id] = _Rate(summary.progress.done, now)
-            else:
-                previous.value = ema_rate(
-                    previous.value,
-                    done_delta=summary.progress.done - previous.done,
-                    elapsed=timedelta(seconds=now - previous.observed_at),
-                    window=self.settings.progress.eta_window,
-                )
-                previous.done = summary.progress.done
-                previous.observed_at = now
+        def visit(summary: BatchSummary, tree: set[UUID]) -> None:
+            tree.add(summary.id)
+            if summary.id not in seen:
+                seen.add(summary.id)
+                self._observe_rate(summary.id, summary.progress.done, now)
             for child in summary.children.values():
-                visit(child)
+                visit(child, tree)
 
-        for summary in summaries:
-            visit(summary)
+        for root_id, summary in summaries.items():
+            tree: set[UUID] = set()
+            visit(summary, tree)
+            self._trees[root_id] = frozenset(tree)
+
+    def _observe_rate(self, batch_id: UUID, done: int, now: float) -> None:
+        previous = self._rates.get(batch_id)
+        if previous is None:
+            self._rates[batch_id] = _Rate(done, now)
+            return
+        previous.value = ema_rate(
+            previous.value,
+            done_delta=done - previous.done,
+            elapsed=timedelta(seconds=now - previous.observed_at),
+            window=self.settings.progress.eta_window,
+        )
+        previous.done = done
+        previous.observed_at = now
 
     async def _commit(self, summary: BatchSummary, hook: ProgressHook, schedule: _Schedule) -> bool:
         settings = TxSettings(
