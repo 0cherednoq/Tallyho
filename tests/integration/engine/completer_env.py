@@ -25,6 +25,7 @@ if TYPE_CHECKING:
     from sqlalchemy.engine import Connection
     from sqlalchemy.ext.asyncio import AsyncEngine
 
+    from tallyho.engine.completer import FinalizeTrigger
     from tallyho.protocols.clock import Clock
     from tallyho.protocols.observer import Observer
     from tests.integration.engine.conftest import Env
@@ -172,7 +173,7 @@ async def open_completer(  # ruff: ignore[too-many-arguments]  # integration hel
     env: Env,
     *,
     clock: Clock | None = None,
-    finalizer: Finalized | None = None,
+    finalizer: FinalizeTrigger | None = None,
     relay: RecordingRelay | None = None,
     progress: RecordingProgress | None = None,
     observer: Observer | None = None,
