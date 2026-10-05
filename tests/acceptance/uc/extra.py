@@ -12,7 +12,7 @@ from sqlalchemy import func, select
 
 from tallyho.model.errors import DownstreamFinalized, SpawnTargetError
 from tallyho.model.states import BatchState, CancelReason
-from tests.acceptance.app.usecases import HOOK_MISSING_MARK, NEST_LEVELS, UC_KIND, UC_NOHOOK_KIND
+from tests.acceptance.app.usecases import HOOK_MISSING_MARK, UC_KIND, UC_NOHOOK_KIND
 from tests.acceptance.chaos.load import Root, audience_for
 from tests.acceptance.oracle import PurgedBatch
 from tests.acceptance.uc.helpers import (
@@ -100,8 +100,7 @@ async def uc07(ctx: UcContext) -> None:
             [th.call(ctx.app.uc.nest, run, 0, fanout).opts(key=f"n:{i}") for i in range(fanout)]
         )
 
-    # Путь A (итог фиксирует Completer): обход Fix-NEW-complete-in-sub-batch.
-    await ctx.set_flag(f"nest_path_a:{ctx.upcoming_run()}", 1)
+    # Каждая задача создаёт sub_batch и завершается путём B (complete_in, §3.1).
     _run, batch_id = await start_tree(ctx, build)
     view = await ctx.wait_terminal(batch_id)
     nodes = await tree(ctx, batch_id)
@@ -116,23 +115,11 @@ async def uc07(ctx: UcContext) -> None:
     ]
     expected_children = fanout + fanout**2 + fanout**3
     ctx.expect(
-        "дерево глубиной 3 создано задачами и финализировано целиком",
+        "дерево глубиной 3 создано задачами (complete_in) и финализировано целиком",
         view.state is BatchState.SUCCEEDED and len(nodes) == 1 + expected_children,
         f"state={view.state.name}, батчей={len(nodes)}, ожидалось={1 + expected_children}",
     )
     ctx.expect("родитель финализирован не раньше детей", not early, f"раньше детей: {early[:5]}")
-
-    async def single(root: BatchBuilder, run: int) -> None:
-        await root.add_calls([ctx.app.th.call(ctx.app.uc.nest, run, NEST_LEVELS - 1, 1)])
-
-    # Путь B: sub_batch и итог задачи - в транзакции пользователя через complete_in (§3.1).
-    _run, probe_id = await start_tree(ctx, single)
-    probe = await ctx.wait_terminal(probe_id)
-    ctx.expect(
-        "sub_batch из задачи, завершённой через complete_in, создаётся",
-        probe.state is BatchState.SUCCEEDED and len(probe.children) == 1,
-        f"state={probe.state.name}, детей={len(probe.children)}, метки={dict(probe.labels)}",
-    )
 
 
 # ---------------------------------------------------------------------- A-UC-08
