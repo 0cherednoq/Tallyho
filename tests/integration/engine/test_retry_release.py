@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
 import pytest
@@ -18,17 +18,28 @@ from tallyho.model.calls import TaskCall
 from tallyho.model.errors import InvalidStateError
 from tallyho.model.states import BatchState, ItemState, ResultClass
 from tallyho.protocols.clock import SystemClock
+from tallyho.testing import FakeClock
 from tests.integration.engine.completer_env import open_completer, schema_engine
 
 if TYPE_CHECKING:
     from uuid import UUID
 
     from tallyho.hooks.registry import HookRegistry
+    from tallyho.protocols.clock import Clock
     from tests.integration.engine.conftest import Env
 
 __all__: list[str] = []
 
 _WITH_ERRORS = {int(BatchState.COMPLETED_WITH_ERRORS), int(BatchState.FAILED)}
+_EXPIRED = timedelta(microseconds=1)
+_RETENTION = timedelta(hours=1)
+"""retention, который не истекает за время теста: ``retry_failed`` после ``release()``
+допустим только до его истечения (Fix-30)."""
+
+
+def after_retention() -> FakeClock:
+    """Часы sweeper-а, для которых ``_RETENTION`` деревьев теста уже истёк."""
+    return FakeClock(datetime.now(UTC) + 2 * _RETENTION)
 
 
 def operations(env: Env) -> Operations:
@@ -47,19 +58,23 @@ def finalizer(env: Env, registry: HookRegistry) -> Finalizer:
     )
 
 
-def sweeper(env: Env, registry: HookRegistry) -> Sweeper:
+def sweeper(env: Env, registry: HookRegistry, clock: Clock | None = None) -> Sweeper:
     """Sweeper над схемой теста: retention удаляет по одному дереву за проход."""
     return Sweeper(
         tables=env.tables,
         engine=schema_engine(env),
-        clock=SystemClock(),
+        clock=clock or SystemClock(),
         finalizer=finalizer(env, registry),
         settings=SweeperSettings(finalize_grace=timedelta(0)),
     )
 
 
-async def releasable_root(env: Env, *, with_child: bool) -> tuple[UUID, UUID]:
+async def releasable_root(
+    env: Env, *, with_child: bool, retention: timedelta = _EXPIRED
+) -> tuple[UUID, UUID]:
     """Запечатанное дерево с ``release_required`` и одним Item.
+
+    ``retention`` по умолчанию 1 мкс: после ``release()`` дерево сразу подлежит удалению.
 
     Returns:
         Корень и батч, в котором лежит Item (корень или его под-батч).
@@ -67,7 +82,7 @@ async def releasable_root(env: Env, *, with_child: bool) -> tuple[UUID, UUID]:
     async with env.transaction() as conn:
         root = await env.producer.create_root(
             conn,
-            RootSpec(kind="export", retention=timedelta(microseconds=1), release_required=True),
+            RootSpec(kind="export", retention=retention, release_required=True),
         )
         owner_id = root.id
         if with_child:
@@ -118,8 +133,8 @@ async def release(env: Env, root_id: UUID) -> None:
 async def test_retry_failed_revokes_release_until_released_again(
     env: Env, registry: HookRegistry
 ) -> None:
-    root_id, _ = await releasable_root(env, with_child=False)
-    retention = sweeper(env, registry)
+    root_id, _ = await releasable_root(env, with_child=False, retention=_RETENTION)
+    retention = sweeper(env, registry, after_retention())
 
     await run_item(env, root_id, ResultClass.ERROR)
     await finalize(env, registry, root_id)
@@ -154,8 +169,8 @@ async def test_retry_failed_revokes_release_until_released_again(
 async def test_retry_failed_on_sub_batch_resets_root_release(
     env: Env, registry: HookRegistry
 ) -> None:
-    root_id, child_id = await releasable_root(env, with_child=True)
-    retention = sweeper(env, registry)
+    root_id, child_id = await releasable_root(env, with_child=True, retention=_RETENTION)
+    retention = sweeper(env, registry, after_retention())
 
     await run_item(env, child_id, ResultClass.ERROR)
     await finalize(env, registry, child_id, root_id)
@@ -182,7 +197,7 @@ async def test_retry_failed_on_sub_batch_resets_root_release(
 
 
 async def test_rolled_back_retry_failed_keeps_release(env: Env, registry: HookRegistry) -> None:
-    root_id, _ = await releasable_root(env, with_child=False)
+    root_id, _ = await releasable_root(env, with_child=False, retention=_RETENTION)
     await run_item(env, root_id, ResultClass.ERROR)
     await finalize(env, registry, root_id)
     await release(env, root_id)
@@ -200,4 +215,4 @@ async def test_rolled_back_retry_failed_keeps_release(env: Env, registry: HookRe
     assert after["released_at"] == before["released_at"]
     assert after["state"] == before["state"]
     assert after["finished_at"] == before["finished_at"]
-    assert await sweeper(env, registry).retention() == 1
+    assert await sweeper(env, registry, after_retention()).retention() == 1

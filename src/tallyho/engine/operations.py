@@ -11,17 +11,19 @@ from typing import TYPE_CHECKING, Protocol, cast
 from sqlalchemy import (
     DateTime,
     SmallInteger,
+    and_,
     case,
     delete,
     func,
     insert,
     literal,
     literal_column,
+    or_,
     select,
     update,
 )
 
-from tallyho.model.errors import DownstreamFinalized, InvalidStateError, NotFoundError
+from tallyho.model.errors import BatchPurged, DownstreamFinalized, InvalidStateError
 from tallyho.model.states import TERMINAL_THRESHOLD, BatchState, CancelReason, ItemState, OutboxKind
 from tallyho.storage.counters import CounterDelta, insert_delta, upsert_metrics
 from tallyho.storage.now import sql_now
@@ -32,10 +34,11 @@ if TYPE_CHECKING:
     from datetime import datetime
     from uuid import UUID
 
+    from sqlalchemy import ColumnElement, Table
     from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession
 
     from tallyho.protocols.clock import Clock
-    from tallyho.storage.tables import Tables
+    from tallyho.storage.tables import BatchColumns, Tables
 
 __all__ = ["OperationTriggers", "Operations"]
 
@@ -46,7 +49,6 @@ _ERROR = literal_column(str(int(ItemState.ERROR)), SmallInteger())
 _ITEM = literal_column(str(int(OutboxKind.ITEM)), SmallInteger())
 _INFINITY = literal_column("'infinity'::timestamptz", DateTime(timezone=True))
 _CHUNK = 1000
-_NOT_FOUND = "батч не найден"
 _NOT_TERMINAL = "операция допустима только для терминального батча"
 _NO_DATABASE_TIME = "БД не вернула текущее время"
 
@@ -108,7 +110,12 @@ class OperationTriggers:
 
 @dataclass(eq=False, kw_only=True)
 class Operations:
-    """Изменить батч и его потомков внутри транзакции пользователя."""
+    """Изменить батч и его потомков внутри транзакции пользователя.
+
+    Все операции бросают ``BatchPurged``, если батча нет (удалён retention или
+    не существовал: tombstone не хранится) или если retention его дерева уже
+    истёк и sweeper может удалять дерево в любой момент (ARCHITECTURE §7.6).
+    """
 
     tables: Tables
     clock: Clock
@@ -143,6 +150,7 @@ class Operations:
         """Поставить батч и его активных потомков на паузу."""
         conn = await resolve_connection(target)
         ids = await self._lock_subtree(conn, batch_id)
+        await self._ensure_retained(conn, batch_id)
         now = await self._now(conn)
         batch = self.tables.batch
         _ = await conn.execute(
@@ -160,6 +168,7 @@ class Operations:
         """Снять паузу и вернуть припаркованные Items в очередь."""
         conn = await resolve_connection(target)
         ids = await self._lock_subtree(conn, batch_id)
+        await self._ensure_retained(conn, batch_id)
         now = await self._now(conn)
         batch = self.tables.batch
         outbox = self.tables.outbox
@@ -186,6 +195,7 @@ class Operations:
         """
         conn = await resolve_connection(target)
         ids = await self._lock_subtree(conn, batch_id)
+        await self._ensure_retained(conn, batch_id)
         now = await self._now(conn)
         batch = self.tables.batch
         outbox = self.tables.outbox
@@ -243,6 +253,7 @@ class Operations:
         """
         conn = await resolve_connection(target)
         ids = await self._lock_subtree(conn, batch_id)
+        await self._ensure_retained(conn, batch_id)
         now = await self._now(conn)
         batch = self.tables.batch
         _ = await conn.execute(
@@ -303,6 +314,7 @@ class Operations:
         """Сбросить backoff упавшего tx-хука и подтолкнуть финализацию."""
         conn = await resolve_connection(target)
         ids = await self._lock_subtree(conn, batch_id)
+        await self._ensure_retained(conn, batch_id)
         now = await self._now(conn)
         _ = await conn.execute(
             update(self.tables.batch)
@@ -318,7 +330,8 @@ class Operations:
             InvalidStateError: Батч ещё не терминален.
         """
         conn = await resolve_connection(target)
-        rows = await self._lock_rows(conn, [batch_id])
+        rows = await self._lock_rows(conn, [batch_id], batch_id=batch_id)
+        await self._ensure_retained(conn, batch_id)
         if not rows[0].state.is_terminal:
             raise InvalidStateError(_NOT_TERMINAL)
         now = await self._now(conn)
@@ -344,7 +357,8 @@ class Operations:
             Число поставленных на повтор Items.
 
         Raises:
-            NotFoundError: Батч не существует.
+            BatchPurged: Батча нет или retention его дерева уже истёк: sweeper
+                может удалять дерево, переоткрывать его нельзя (§7.6).
             InvalidStateError: Батч не завершён с ошибками.
             DownstreamFinalized: Получающий этап уже финализирован.
         """
@@ -353,7 +367,7 @@ class Operations:
             select(self.tables.batch.c.root_id).where(self.tables.batch.c.id == batch_id)
         )
         if root_id is None:
-            raise NotFoundError(_NOT_FOUND)
+            raise BatchPurged(batch_id)
         tree_ids: list[UUID] = list(
             await conn.scalars(
                 select(self.tables.batch.c.id)
@@ -361,7 +375,8 @@ class Operations:
                 .order_by(self.tables.batch.c.id)
             )
         )
-        tree = await self._lock_rows(conn, tree_ids)
+        tree = await self._lock_rows(conn, tree_ids, batch_id=batch_id)
+        await self._ensure_retained(conn, batch_id)
         selected = next(row for row in tree if row.id == batch_id)
         if selected.state not in {BatchState.COMPLETED_WITH_ERRORS, BatchState.FAILED}:
             raise InvalidStateError(_NOT_TERMINAL)
@@ -579,11 +594,13 @@ class Operations:
         root = root.union_all(select(batch.c.id).where(batch.c.parent_id == root.c.id))
         ids: list[UUID] = list(await conn.scalars(select(root.c.id).order_by(root.c.id)))
         if not ids:
-            raise NotFoundError(_NOT_FOUND)
-        _ = await self._lock_rows(conn, ids)
+            raise BatchPurged(batch_id)
+        _ = await self._lock_rows(conn, ids, batch_id=batch_id)
         return ids
 
-    async def _lock_rows(self, conn: AsyncConnection, ids: Sequence[UUID]) -> list[_BatchRow]:
+    async def _lock_rows(
+        self, conn: AsyncConnection, ids: Sequence[UUID], *, batch_id: UUID
+    ) -> list[_BatchRow]:
         raw_rows = list(
             await conn.execute(
                 select(
@@ -599,8 +616,36 @@ class Operations:
         )
         rows = [self._batch_row(row) for row in raw_rows]
         if not rows:
-            raise NotFoundError(_NOT_FOUND)
+            raise BatchPurged(batch_id)
         return rows
+
+    async def _ensure_retained(self, conn: AsyncConnection, batch_id: UUID) -> None:
+        """Бросить ``BatchPurged``, если retention дерева ``batch_id`` истёк.
+
+        Вызывается после блокировки строк батча: sweeper выбирает корень
+        ``FOR UPDATE SKIP LOCKED`` и удаляет дерево следующими транзакциями, не
+        перепроверяя условие. Время только растёт, поэтому истёкшее дерево не
+        перестаёт быть кандидатом, пока его не изменят, а изменять его операции
+        не дают. Так ``retry_failed`` не переоткроет дерево посреди удаления.
+
+        «Сейчас» здесь — время этого запроса, а не начала транзакции (``now()``):
+        транзакция пользователя могла начаться до истечения retention, а запрос
+        идёт после блокировки строк, то есть после commit выбора корня sweeper-ом.
+        Тестовые часы задают время сами.
+
+        Raises:
+            BatchPurged: Дерево удаляется или будет удалено retention.
+        """
+        batch = self.tables.batch
+        root_id = (
+            select(batch.c.root_id).where(batch.c.id == batch_id).scalar_subquery().correlate(None)
+        )
+        now = sql_now(self.clock) if self.clock.now() is not None else func.statement_timestamp()
+        expired = await conn.scalar(
+            select(batch.c.id).where(batch.c.id == root_id, _retention_expired(batch, now))
+        )
+        if expired is not None:
+            raise BatchPurged(batch_id)
 
     async def _now(self, conn: AsyncConnection) -> datetime:
         value: datetime | None = await conn.scalar(select(sql_now(self.clock)))
@@ -704,3 +749,20 @@ class Operations:
                 _ = await finalizer.try_finalize(batch_id)
             except Exception:  # ruff: ignore[blind-except]  # commit состоялся; финализацию повторит sweeper
                 _log.exception("try_finalize(%s) после операции упал", batch_id)
+
+
+def _retention_expired(
+    root: Table[BatchColumns], now: ColumnElement[datetime]
+) -> ColumnElement[bool]:
+    """Корень подлежит удалению retention: то же условие, что ``Sweeper._retention_candidate``.
+
+    Returns:
+        SQL-условие над строкой корня ``root``.
+    """
+    return and_(
+        root.c.state >= TERMINAL_THRESHOLD,
+        root.c.finished_at.is_not(None),
+        root.c.retention.is_not(None),
+        root.c.finished_at + root.c.retention <= now,
+        or_(~root.c.release_required, root.c.released_at.is_not(None)),
+    )
