@@ -88,9 +88,14 @@ dev = [
   "pre-commit>=4",
   "poethepoet>=0.48",
 ]
+# Бенчмарк оверхеда T11.6 (benchmarks/, poe bench-overhead): taskiq как точка сравнения.
+bench = [
+  "taskiq>=0.13.0",
+  "taskiq-redis>=1.2.4",
+]
 
 [tool.uv]
-default-groups = ["dev"]
+default-groups = ["dev", "bench"]
 
 # -----------------------------------------------------------------------------
 # Build
@@ -140,6 +145,15 @@ bench = { cmd = "python -m benchmarks --id ${ID} --profile ${PROFILE} --seed ${S
   { name = "ID", options = ["--id"], default = "all", help = "P-01[,P-04,...] или all" },
   { name = "PROFILE", options = ["--profile"], default = "smoke", help = "smoke — минуты локально; nightly — ACCEPTANCE §11; full — §9 на эталонном стенде" },
   { name = "SEED", options = ["--seed"], default = "1", help = "Seed нагрузки" },
+] }
+bench-overhead = { cmd = "python -m benchmarks.overhead_cli --tasks ${TASKS} --repeats ${REPEATS} --warmup ${WARMUP} --processes ${PROCESSES} --concurrency ${CONCURRENCY} --variants ${VARIANTS} --label ${LABEL}", help = "Оверхед T11.6: N задач print через taskiq InMemory/Redis, flexiq и tallyho; итог в .work-tmp/overhead/<label>/ (нужен Docker)", args = [
+  { name = "TASKS", options = ["--tasks"], default = "100000", help = "Задач в повторе" },
+  { name = "REPEATS", options = ["--repeats"], default = "3", help = "Повторов каждого варианта (на чистом состоянии)" },
+  { name = "WARMUP", options = ["--warmup"], default = "2000", help = "Задач прогрева перед каждым повтором" },
+  { name = "PROCESSES", options = ["--processes"], default = "2", help = "Процессов-воркеров" },
+  { name = "CONCURRENCY", options = ["--concurrency"], default = "20", help = "Параллельных задач в процессе" },
+  { name = "VARIANTS", options = ["--variants"], default = "all", help = "all или taskiq-memory,taskiq-redis,flexiq,tallyho" },
+  { name = "LABEL", options = ["--label"], default = "run", help = "Метка прогона (каталог результата)" },
 ] }
 mutation-cas ={ shell = "mutmut run --max-children 4 '*Tx*claim*' '*Tx*finish*' '*Finalizer*_cas*' '*Snapshotter*_attempt*' '*Operations*_retry_items*' && ! mutmut results | grep -Eq ': (survived|suspicious|no tests)'", help = "Mutation gate for critical CAS functions (Linux/WSL only)" }
 check = { sequence = ["lint", "types", "imports", "deps", "test"], help = "Everything CI runs, except integration" }
