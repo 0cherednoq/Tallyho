@@ -203,9 +203,27 @@ async def test_run_in_raises_when_factory_fails_in_foreign_loop(foreign: LoopThr
         await run_in(foreign.loop, make, patience=PATIENCE)
 
 
+def closing_loop() -> tuple[asyncio.AbstractEventLoop, threading.Thread]:
+    """Loop в потоке, который сам закрывает его сразу после остановки.
+
+    Так между остановкой и закрытием нет окна, в котором закрытие могло бы
+    начать докручивать loop.
+    """
+    loop = asyncio.new_event_loop()
+
+    def serve() -> None:
+        loop.run_forever()
+        loop.close()
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    return loop, thread
+
+
 async def test_run_in_tolerates_foreign_loop_closed_while_waiting(
-    foreign: LoopThread, caplog: pytest.LogCaptureFixture
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
+    loop, thread = closing_loop()
     started = threading.Event()
 
     async def stuck() -> None:
@@ -214,16 +232,46 @@ async def test_run_in_tolerates_foreign_loop_closed_while_waiting(
 
     async def close_when_started() -> None:
         assert await asyncio.to_thread(started.wait, PATIENCE)
-        foreign.close()
+        _ = loop.call_soon_threadsafe(loop.stop)
+        await asyncio.to_thread(thread.join, PATIENCE)
 
     # Брошенная задача закрытого loop пишет «Task was destroyed»: здесь это ожидаемо.
-    foreign.loop.set_exception_handler(lambda _loop, _context: None)
+    loop.set_exception_handler(lambda _loop, _context: None)
     closer = asyncio.create_task(close_when_started())
     with caplog.at_level(logging.WARNING, logger="tallyho.engine.shutdown"):
-        await run_in(foreign.loop, stuck, patience=0.5)
+        await run_in(loop, stuck, patience=PATIENCE)
     await closer
 
+    assert loop.is_closed()
+    assert "не дождаться" in caplog.text
     assert "задачу не отменить" in caplog.text
+
+
+async def test_run_in_drives_foreign_loop_stopped_during_handover(
+    foreign: LoopThread, caplog: pytest.LogCaptureFixture
+) -> None:
+    """flexiq остановил loop, пока переданная корутина закрытия ещё шла (Fix-25)."""
+    started = threading.Event()
+    threads: list[int] = []
+
+    async def closing() -> None:
+        started.set()
+        await asyncio.sleep(0.2)
+        threads.append(threading.get_ident())
+
+    async def stop_when_started() -> None:
+        assert await asyncio.to_thread(started.wait, PATIENCE)
+        foreign.stop()
+
+    stopper = asyncio.create_task(stop_when_started())
+    with caplog.at_level(logging.WARNING, logger="tallyho.engine.shutdown"):
+        async with asyncio.timeout(PATIENCE / 2):
+            await run_in(foreign.loop, closing, patience=PATIENCE)
+    await stopper
+
+    assert len(threads) == 1
+    assert not foreign.loop.is_running()
+    assert "не ответил" not in caplog.text
 
 
 class BusyLoop(asyncio.SelectorEventLoop):
