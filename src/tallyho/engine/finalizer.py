@@ -279,6 +279,10 @@ class Finalizer:
         totals = (await read_counters(conn, self.tables, [batch.id]))[batch.id]
         if totals.pending != 0 or not self._closable(batch):
             return None
+        if batch.state is BatchState.OPEN and not (await self._feeder_status(conn, batch.id))[0]:
+            # Отменяемый этап не опережает источник (§8.1 п.7, I-09): его финализирует
+            # каскад после финализации последнего источника.
+            return None
         counted = await read_labels_and_metrics(conn, self.tables, [batch.id])
         labels = counted.get(batch.id, LabelsAndMetrics()).labels
         child_errors = await self._child_errors(conn, batch.id)
