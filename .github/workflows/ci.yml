@@ -1,3 +1,7 @@
+# PR-уровень приёмки (ACCEPTANCE §11): бюджет ≤ 15 минут по времени на часах.
+# Полный набор тестов разбит на части, которые идут параллельно на каждой паре
+# «Python × PostgreSQL»; покрытие частей объединяет job `coverage` (≥ 95% на каждой паре).
+# Nightly-уровень — nightly.yml.
 name: CI
 
 on:
@@ -37,23 +41,42 @@ jobs:
         env:
           SKIP: no-commit-to-branch,ruff-format,ruff-check,mypy,basedpyright,import-linter,deptry
 
+  # Части набора (A-NF-10: Python 3.11/3.12/3.13, плюс 3.14 из classifiers). Последняя часть
+  # берёт всё, что не взяли остальные (`--ignore`), поэтому новый каталог тестов не потеряется.
+  # Тесты с маркером flexiq (контракты и эталонное приложение) — в job `flexiq`.
+  #
+  # Части подобраны по замеру `pytest --durations` (T12.2): engine — 312 интеграционных тестов
+  # движка; examples — исполняемые примеры (самый долгий тест — mailing, ~8 мин на загруженной
+  # машине); storage — storage + stress; rest — юнит, архитектура и прочая интеграция.
   test:
-    name: Tests (py${{ matrix.python }}, pg${{ matrix.postgres }})
+    name: Tests ${{ matrix.part }} (py${{ matrix.combo.python }}, pg${{ matrix.combo.postgres }})
     runs-on: ubuntu-latest
     timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
-        python: ["3.11", "3.12", "3.13", "3.14"]
-        postgres: ["16"]
+        combo:
+          - { python: "3.11", postgres: "16" }
+          - { python: "3.12", postgres: "16" }
+          - { python: "3.13", postgres: "16" }
+          - { python: "3.14", postgres: "16" }
+          - { python: "3.11", postgres: "14" }
+          - { python: "3.14", postgres: "17" }
+        part: [engine, examples, storage, rest]
         include:
-          - python: "3.11"
-            postgres: "14"
-          - python: "3.14"
-            postgres: "17"
+          - part: engine
+            paths: tests/integration/engine
+          - part: examples
+            paths: tests/examples
+          - part: storage
+            paths: tests/integration/storage tests/integration/stress
+          - part: rest
+            paths: >-
+              tests --ignore=tests/integration/engine --ignore=tests/examples
+              --ignore=tests/integration/storage --ignore=tests/integration/stress
     services:
       postgres:
-        image: postgres:${{ matrix.postgres }}-alpine
+        image: postgres:${{ matrix.combo.postgres }}-alpine
         env:
           POSTGRES_USER: tallyho
           POSTGRES_PASSWORD: tallyho
@@ -64,22 +87,64 @@ jobs:
           --health-interval 5s --health-timeout 5s --health-retries 10
     env:
       TALLYHO_TEST_DSN: postgresql+asyncpg://tallyho:tallyho@localhost:5432/tallyho
+      COVERAGE_ID: py${{ matrix.combo.python }}-pg${{ matrix.combo.postgres }}-${{ matrix.part }}
     steps:
       - uses: actions/checkout@v5
       - uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
-          python-version: ${{ matrix.python }}
+          python-version: ${{ matrix.combo.python }}
       - run: uv sync --all-extras
-      - run: uv run pytest -m "not flexiq" -n auto --cov-report=xml
+      # Порог покрытия проверяет job `coverage` по сумме частей.
+      - run: uv run pytest ${{ matrix.paths }} -m "not flexiq" -n auto --cov-fail-under=0 --cov-report=
+      - run: mv .coverage ".coverage.${COVERAGE_ID}"
       - uses: actions/upload-artifact@v4
-        if: matrix.python == '3.11' && matrix.postgres == '16'
+        with:
+          name: coverage-data-${{ env.COVERAGE_ID }}
+          path: .coverage.${{ env.COVERAGE_ID }}
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 3
+
+  coverage:
+    name: Coverage ≥ 95% (each Python × PostgreSQL)
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          python-version: "3.11"
+      - run: uv sync --all-extras
+      - uses: actions/download-artifact@v5
+        with:
+          pattern: coverage-data-*
+          path: coverage-data
+          merge-multiple: true
+      - name: Combine parts and enforce fail_under
+        run: |
+          status=0
+          combos="$(find coverage-data -name '.coverage.*' | sed -E 's/.*\.coverage\.(py[^-]+-pg[^-]+)-.*/\1/' | sort -u)"
+          for combo in ${combos}; do
+            echo "::group::${combo}"
+            uv run coverage combine --keep --data-file=".coverage.${combo}" coverage-data/.coverage."${combo}"-*
+            uv run coverage report --data-file=".coverage.${combo}" || status=1
+            echo "::endgroup::"
+          done
+          uv run coverage xml --data-file=.coverage.py3.11-pg16 -o coverage.xml
+          exit "${status}"
+      - uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() }}
         with:
           name: coverage
           path: coverage.xml
 
-  flexiq-contract:
-    name: Flexiq 2.0.x contracts (py3.11, pg16)
+  # A-FQ на flexiq 2.0.x из uv.lock, эталонное приложение S1/S2/S3 (малый объём) и юнит-тесты
+  # стенда приёмки. Контракты на последнем патче 2.0.x и на master — в nightly.yml.
+  flexiq:
+    name: Flexiq contracts and reference app (py3.11, pg16)
     runs-on: ubuntu-latest
     timeout-minutes: 15
     services:
@@ -102,12 +167,48 @@ jobs:
           enable-cache: true
           python-version: "3.11"
       - run: uv sync --all-extras
-      - run: uv run pytest tests/contract/flexiq/test_contract.py -m flexiq -n 0 --no-cov
+      - run: uv run poe test-flexiq
+      # Без -m chaos/usecase прогоны на compose-стенде не собираются (tests/acceptance/conftest.py).
+      - run: uv run pytest tests/acceptance -m flexiq -n 0 --no-cov
 
+  # ACCEPTANCE §11, PR: A-UC-01/02/04 и A-UC-21/22 на малом объёме без хаоса (compose-стенд).
+  # Замер T12.2 (Windows, seed 7): от подъёма стенда до затишья A-UC-02 ~600 с, A-UC-01 ~395 с,
+  # A-UC-04 ~180 с, A-UC-21 ~80 с, A-UC-22 ~60 с — поэтому три параллельные части.
+  usecases:
+    name: ${{ matrix.uc }} (scale 0.1)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        uc: [A-UC-02, A-UC-01, "A-UC-04,A-UC-21,A-UC-22"]
+    env:
+      SEED: ${{ github.run_number }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          python-version: "3.11"
+      - run: uv sync --all-extras
+      - name: Run A-UC on the compose stand
+        run: |
+          echo "Воспроизвести: uv run poe acceptance-uc --uc ${{ matrix.uc }} --seed ${SEED} --scale 0.1"
+          uv run poe acceptance-uc --uc "${{ matrix.uc }}" --seed "${SEED}" --scale 0.1 --jobs 0
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: a-uc-pr-${{ strategy.job-index }}-seed-${{ env.SEED }}
+          path: .work-tmp/acceptance/
+          include-hidden-files: true
+          retention-days: 7
+
+  # A-NF-06, D-037. Gate идёт ~20–30 минут, поэтому на PR — только если изменились функции
+  # gate, их тесты или зависимости; на main и каждую ночь (nightly.yml) — всегда.
   mutation-cas:
     name: Mutation tests (critical CAS)
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     services:
       postgres:
         image: postgres:16-alpine
@@ -123,12 +224,34 @@ jobs:
       TALLYHO_TEST_DSN: postgresql+asyncpg://tallyho:tallyho@localhost:5432/tallyho
     steps:
       - uses: actions/checkout@v5
-      - uses: astral-sh/setup-uv@v7
+        with:
+          fetch-depth: 0
+      - id: scope
+        name: Did the gated code change?
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          if [ "${{ github.event_name }}" != pull_request ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          changed="$(git diff --name-only "${BASE_SHA}...HEAD")"
+          echo "${changed}"
+          if echo "${changed}" | grep -Eq '^(src/tallyho/(engine|storage)/|tests/integration/engine/|tests/helpers/|tests/conftest\.py|pyproject\.toml|uv\.lock|\.github/workflows/ci\.yml)'; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::CAS-функции и их тесты не менялись — gate пропущен (идёт в nightly)"
+          fi
+      - if: steps.scope.outputs.run == 'true'
+        uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
           python-version: "3.11"
-      - run: uv sync --all-extras
-      - run: uv run poe mutation-cas
+      - if: steps.scope.outputs.run == 'true'
+        run: uv sync --all-extras
+      - if: steps.scope.outputs.run == 'true'
+        run: uv run poe mutation-cas
 
   build:
     name: Build distribution

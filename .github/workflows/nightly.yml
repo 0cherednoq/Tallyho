@@ -1,0 +1,310 @@
+# Nightly-уровень приёмки (ACCEPTANCE §11): A-CH по 10 минут на комбинацию «сценарий × отказ»,
+# все A-UC на функциональном объёме, контракты flexiq на 2.0.x и master, мутационный gate CAS,
+# заготовка бенчмарков P-01/P-04. Бюджет — 4 часа: тяжёлое разнесено по параллельным job,
+# ожидаемое время прогона — около часа (хаос-матрица 36 × ~15 мин при 12 параллельных стендах).
+#
+# Seed: по умолчанию дата запуска (UTC, YYYYMMDD), так ночи различаются. Seed и команда
+# воспроизведения печатаются в лог каждого job и в сводку запуска.
+name: Nightly
+
+on:
+  schedule:
+    - cron: "17 1 * * *"
+  workflow_dispatch:
+    inputs:
+      seed:
+        description: "Seed хаоса, данных и ошибок (пусто — дата запуска YYYYMMDD)"
+        required: false
+        default: ""
+      duration:
+        description: "Окно хаоса A-CH, секунды (nightly — 600)"
+        required: false
+        default: "600"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  UV_FROZEN: "1"
+  FORCE_COLOR: "1"
+  PYTHONUTF8: "1"
+
+jobs:
+  setup:
+    name: Seed and matrix guard
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      seed: ${{ steps.seed.outputs.seed }}
+      duration: ${{ steps.seed.outputs.duration }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          python-version: "3.11"
+      - id: seed
+        name: Choose seed
+        env:
+          INPUT_SEED: ${{ inputs.seed }}
+          INPUT_DURATION: ${{ inputs.duration }}
+        run: |
+          seed="${INPUT_SEED:-$(date -u +%Y%m%d)}"
+          duration="${INPUT_DURATION:-600}"
+          case "${seed}${duration}" in
+            *[!0-9]*) echo "::error::seed и duration должны быть целыми: ${seed} ${duration}"; exit 1 ;;
+          esac
+          echo "seed=${seed}" >> "$GITHUB_OUTPUT"
+          echo "duration=${duration}" >> "$GITHUB_OUTPUT"
+          echo "Nightly seed: ${seed}, окно хаоса: ${duration} с"
+          {
+            echo "### Nightly seed \`${seed}\`"
+            echo
+            echo "Воспроизвести ячейку A-CH: \`uv run poe acceptance --seed ${seed} --scenario S1 --chaos A-CH-01 --duration ${duration}\`"
+            echo
+            echo "Воспроизвести A-UC: \`uv run poe acceptance-uc --seed ${seed} --scale 0.1 --uc A-UC-01\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - run: uv sync --all-extras
+      # Матрицы ниже перечислены вручную: если в стенде появится новый отказ, сценарий или
+      # A-UC, этот шаг упадёт, а не молча пропустит их.
+      - name: Matrices cover every A-CH, scenario and A-UC
+        run: |
+          uv run python - <<'EOF'
+          from tests.acceptance.chaos.plan import CHAOS_IDS, SCENARIOS
+          from tests.acceptance.uc.context import UC_IDS
+
+          chaos = {f"A-CH-{index:02}" for index in range(1, 13)}
+          scenarios = {"S1", "S2", "S3"}
+          shards = [
+              "A-UC-09,A-UC-01,A-UC-05,A-UC-16,A-UC-18",
+              "A-UC-02,A-UC-03,A-UC-06,A-UC-17,A-UC-20",
+              "A-UC-04,A-UC-07,A-UC-08,A-UC-10,A-UC-15,A-UC-19",
+              "A-UC-11,A-UC-12,A-UC-13,A-UC-14,A-UC-21,A-UC-22",
+          ]
+          ucs = [uc for shard in shards for uc in shard.split(",")]
+          assert set(CHAOS_IDS) == chaos, sorted(set(CHAOS_IDS) ^ chaos)
+          assert set(SCENARIOS) == scenarios, sorted(set(SCENARIOS) ^ scenarios)
+          assert sorted(ucs) == sorted(UC_IDS), sorted(set(ucs) ^ set(UC_IDS))
+          print("matrices ok")
+          EOF
+
+  # ---------------------------------------------------------------------------
+  # A-CH (ACCEPTANCE §6): одна ячейка «отказ × сценарий» на runner, один compose-стенд.
+  # ~15 мин на ячейку (подъём стенда, 10 мин хаоса, доработка и T_rec). 36 ячеек при
+  # max-parallel 12 — три волны, около 45 минут.
+  # ---------------------------------------------------------------------------
+  chaos:
+    name: ${{ matrix.chaos }} × ${{ matrix.scenario }}
+    needs: setup
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      max-parallel: 12
+      matrix:
+        chaos: [A-CH-01, A-CH-02, A-CH-03, A-CH-04, A-CH-05, A-CH-06,
+                A-CH-07, A-CH-08, A-CH-09, A-CH-10, A-CH-11, A-CH-12]
+        scenario: [S1, S2, S3]
+    env:
+      SEED: ${{ needs.setup.outputs.seed }}
+      DURATION: ${{ needs.setup.outputs.duration }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          python-version: "3.11"
+      - run: uv sync --all-extras
+      - run: docker compose version
+      - name: Run ${{ matrix.chaos }} on ${{ matrix.scenario }}
+        run: |
+          echo "seed=${SEED} duration=${DURATION}"
+          echo "Воспроизвести: uv run poe acceptance --seed ${SEED} --scenario ${{ matrix.scenario }} --chaos ${{ matrix.chaos }} --duration ${DURATION}"
+          uv run poe acceptance --seed "${SEED}" --scenario "${{ matrix.scenario }}" \
+            --chaos "${{ matrix.chaos }}" --duration "${DURATION}" --jobs 0
+      # Журнал хаоса, oracle.json, containers.log — отчёт прогона (ACCEPTANCE §11).
+      - uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() }}
+        with:
+          name: a-ch-${{ matrix.chaos }}-${{ matrix.scenario }}-seed-${{ env.SEED }}
+          path: .work-tmp/acceptance/
+          include-hidden-files: true
+          if-no-files-found: warn
+          retention-days: 14
+
+  # ---------------------------------------------------------------------------
+  # A-UC (ACCEPTANCE §7) на функциональном объёме. Все 22 сценария при --jobs 4 на одном
+  # runner занимают 28–33 мин на 16 ядрах; на 4 vCPU runner четыре стенда сразу перегружают
+  # Docker (A-UC-12 при четырёх стендах не укладывался в 300 с), поэтому 4 части по 2 стенда.
+  # Состав частей сверяет job setup.
+  # ---------------------------------------------------------------------------
+  usecases:
+    name: A-UC part ${{ matrix.part }}
+    needs: setup
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - part: 1
+            uc: A-UC-09,A-UC-01,A-UC-05,A-UC-16,A-UC-18
+          - part: 2
+            uc: A-UC-02,A-UC-03,A-UC-06,A-UC-17,A-UC-20
+          - part: 3
+            uc: A-UC-04,A-UC-07,A-UC-08,A-UC-10,A-UC-15,A-UC-19
+          - part: 4
+            uc: A-UC-11,A-UC-12,A-UC-13,A-UC-14,A-UC-21,A-UC-22
+    env:
+      SEED: ${{ needs.setup.outputs.seed }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          python-version: "3.11"
+      - run: uv sync --all-extras
+      - name: Run ${{ matrix.uc }}
+        run: |
+          echo "seed=${SEED}"
+          echo "Воспроизвести: uv run poe acceptance-uc --uc ${{ matrix.uc }} --seed ${SEED} --scale 0.1 --jobs 2"
+          uv run poe acceptance-uc --uc "${{ matrix.uc }}" --seed "${SEED}" --scale 0.1 --jobs 2
+      - uses: actions/upload-artifact@v4
+        if: ${{ !cancelled() }}
+        with:
+          name: a-uc-part-${{ matrix.part }}-seed-${{ env.SEED }}
+          path: .work-tmp/acceptance/
+          include-hidden-files: true
+          if-no-files-found: warn
+          retention-days: 14
+
+  # ---------------------------------------------------------------------------
+  # A-FQ (ACCEPTANCE §8, A-FQ-17): контракты на последнем патче 2.0.x и на master flexiq.
+  # master — Python SDK монорепозитория flexiq (`sdks/python`, сборка maturin, нужен Rust).
+  # Источник и ветку можно переопределить переменными репозитория FLEXIQ_GIT_URL и
+  # FLEXIQ_GIT_REF (Settings → Secrets and variables → Actions → Variables).
+  # ---------------------------------------------------------------------------
+  flexiq-contract:
+    name: Flexiq contracts (${{ matrix.flexiq }}, py${{ matrix.python }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        flexiq: ["2.0.x", master]
+        python: ["3.11", "3.13"]
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: tallyho
+          POSTGRES_PASSWORD: tallyho
+          POSTGRES_DB: tallyho
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U tallyho"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      TALLYHO_TEST_DSN: postgresql+asyncpg://tallyho:tallyho@localhost:5432/tallyho
+      FLEXIQ_GIT_URL: ${{ vars.FLEXIQ_GIT_URL || 'https://github.com/ByteVeda/flexiq' }}
+      FLEXIQ_GIT_REF: ${{ vars.FLEXIQ_GIT_REF || 'master' }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          python-version: ${{ matrix.python }}
+      - run: uv sync --all-extras
+      - if: matrix.flexiq == 'master'
+        uses: dtolnay/rust-toolchain@stable
+      - name: Install flexiq ${{ matrix.flexiq }}
+        run: |
+          if [ "${{ matrix.flexiq }}" = master ]; then
+            uv pip install "flexiq @ git+${FLEXIQ_GIT_URL}@${FLEXIQ_GIT_REF}#subdirectory=sdks/python"
+          else
+            # Последний патч 2.0.x; остальные зависимости — как в uv.lock.
+            uv pip install --upgrade-package flexiq "flexiq>=2.0,<2.1"
+          fi
+          uv pip show flexiq
+      # UV_NO_SYNC: иначе `uv run` вернёт flexiq к версии из uv.lock.
+      - run: uv run poe test-flexiq
+        env:
+          UV_NO_SYNC: "1"
+
+  # ---------------------------------------------------------------------------
+  # A-NF-06: мутационный gate критичных CAS (D-037). Только Linux (mutmut 3 требует fork).
+  # ---------------------------------------------------------------------------
+  mutation-cas:
+    name: Mutation tests (critical CAS)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: tallyho
+          POSTGRES_PASSWORD: tallyho
+          POSTGRES_DB: tallyho
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U tallyho"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      TALLYHO_TEST_DSN: postgresql+asyncpg://tallyho:tallyho@localhost:5432/tallyho
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          python-version: "3.11"
+      - run: uv sync --all-extras
+      - run: uv run poe mutation-cas
+      - if: failure()
+        run: uv run mutmut results
+
+  # ---------------------------------------------------------------------------
+  # A-PERF P-01 и P-04 (1k×1k + история 5M). Харнесс — задача T11.5 (последняя волна).
+  # Пока задачи `poe bench` нет, job зелёный и пишет notice. Контракт для T11.5:
+  # `uv run poe bench --id <P-NN> --profile nightly` пишет отчёт в .work-tmp/bench/.
+  # ---------------------------------------------------------------------------
+  bench:
+    name: Bench ${{ matrix.id }}
+    needs: setup
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        id: [P-01, P-04]
+    steps:
+      - uses: actions/checkout@v5
+      - id: harness
+        name: Is the benchmark harness (T11.5) in place?
+        run: |
+          if python3 -c "import sys, tomllib; tasks = tomllib.load(open('pyproject.toml', 'rb'))['tool']['poe']['tasks']; sys.exit(0 if 'bench' in tasks else 1)"; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::poe bench ещё нет (T11.5) — ${{ matrix.id }} пропущен"
+          fi
+      - if: steps.harness.outputs.present == 'true'
+        uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          python-version: "3.13"
+      - if: steps.harness.outputs.present == 'true'
+        run: uv sync --all-extras
+      - if: steps.harness.outputs.present == 'true'
+        run: uv run poe bench --id "${{ matrix.id }}" --profile nightly
+      - if: steps.harness.outputs.present == 'true' && !cancelled()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-${{ matrix.id }}-seed-${{ needs.setup.outputs.seed }}
+          path: .work-tmp/bench/
+          include-hidden-files: true
+          if-no-files-found: warn
+          retention-days: 30
