@@ -32,6 +32,36 @@ uv run pre-commit install
 | integration (PG 14/16/17), покрытие ≥ 95% | | | ✓ |
 | сборка wheel/sdist, `twine check` | | | ✓ |
 
+## CI (ACCEPTANCE §11)
+
+**PR** — `.github/workflows/ci.yml`, бюджет ≤ 15 минут:
+
+* lint, типы, import-linter, deptry, pre-commit;
+* тесты на Python 3.11/3.12/3.13/3.14 × PostgreSQL 16 (и 3.11 × PG 14, 3.14 × PG 17), каждая пара
+  разбита на четыре параллельные части (`engine`, `examples`, `storage` = storage + stress,
+  `rest` — всё остальное); job `coverage` объединяет данные частей (`coverage combine`) и
+  проверяет ≥ 95% на каждой паре;
+* `poe test-flexiq` (flexiq из `uv.lock`) и `tests/acceptance -m flexiq` — эталонное приложение
+  и юнит-тесты стенда;
+* A-UC-01/02/04/21/22 на compose-стенде (`--scale 0.1`), три параллельных job;
+* `poe mutation-cas` — только если PR меняет `engine/`, `storage/`, их тесты или зависимости
+  (идёт 20–30 минут; на `main` и в nightly — всегда).
+
+**Nightly** — `.github/workflows/nightly.yml`, по расписанию и вручную (`workflow_dispatch` с
+`seed` и `duration`), бюджет ≤ 4 часа:
+
+* A-CH: 12 отказов × S1/S2/S3, по ячейке на runner, окно хаоса 600 с;
+* A-UC-01…22 на функциональном объёме — четыре части по два стенда;
+* контракты flexiq на последнем патче 2.0.x и на master (Python 3.11 и 3.13); источник master —
+  переменные репозитория `FLEXIQ_GIT_URL` / `FLEXIQ_GIT_REF`, по умолчанию
+  `https://github.com/ByteVeda/flexiq` @ `master`, Python SDK в `sdks/python`;
+* мутационный gate `poe mutation-cas`;
+* P-01 и P-04 — `poe bench --id P-NN --profile nightly`, если задача `bench` уже есть (T11.5).
+
+Seed nightly по умолчанию — дата запуска `YYYYMMDD`; он и команда воспроизведения печатаются
+в лог и в сводку запуска. `.work-tmp/acceptance/**` (журнал хаоса, `oracle.json`,
+`containers.log`) прикладывается к запуску артефактом.
+
 ## Структура
 
 ```
