@@ -261,7 +261,7 @@ class PolicyEnforcer:
     ) -> tuple[UUID, ...]:
         batch = self.tables.batch
         item = self.tables.item
-        lease = self.tables.lease
+        outbox = self.tables.outbox
         ids = select(batch.c.id).where(batch.c.root_id == root_id)
         # Первая причина выигрывает (§6.1): узлы, уже отменённые по своей причине, её сохраняют.
         _ = await conn.execute(
@@ -273,14 +273,26 @@ class PolicyEnforcer:
             )
             .values(cancel_requested_at=now, cancel_reason=reason.value, updated_at=now)
         )
+        # Сразу отменяются только неотправленные Items, как в cancel() (§6.1, UC-12):
+        # у виртуальных Items под-батчей записи outbox нет, их завершает финализация
+        # под-батча, иначе родитель финализируется раньше детей (§8.1 п.7, I-09).
+        # Отправленные отменяет claim, выполняющиеся доделываются.
         cancellable = (
             select(item.c.id)
-            .outerjoin(lease, lease.c.item_id == item.c.id)
-            .where(item.c.batch_id.in_(ids), item.c.state == _ACTIVE, lease.c.item_id.is_(None))
+            .join(outbox, outbox.c.item_id == item.c.id)
+            .where(
+                item.c.batch_id.in_(ids),
+                item.c.state == _ACTIVE,
+                item.c.child_batch_id.is_(None),
+                outbox.c.kind == _ITEM_OUTBOX,
+            )
+            .order_by(item.c.id)
+            .with_for_update(of=item)
         )
+        locked = list(await conn.scalars(cancellable))
         changed = await conn.execute(
             update(item)
-            .where(item.c.id.in_(cancellable))
+            .where(item.c.id.in_(locked), item.c.state == _ACTIVE)
             .values(state=int(ItemState.CANCELLED), label="cancelled", finished_at=now)
             .returning(item.c.id, item.c.batch_id, item.c.weight)
         )
