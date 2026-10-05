@@ -1,11 +1,14 @@
 """Completer: групповой коммит операций воркера (ARCHITECTURE UC-03, UC-04, §9.2).
 
 Обёртка задачи не пишет в БД сама: она отдаёт операцию (claim, heartbeat,
-release, позже finish) в буфер процесса и ждёт future. Completer раз в тик
-(20 мс) или при наборе ``max_batch`` (500) операций выполняет **одну** короткую
-транзакцию (:func:`~tallyho.storage.tx.run_transaction`, повтор на дедлоке и
-``lock_timeout``) и резолвит futures только после commit. Когда в буфере
-``backpressure`` операций (10 000), новые ждут места (как River).
+release, позже finish) в буфер процесса и ждёт future. Completer не позже чем
+через тик (20 мс) после первой операции в буфере или при наборе ``max_batch``
+(500) операций выполняет **одну** короткую транзакцию
+(:func:`~tallyho.storage.tx.run_transaction`, повтор на дедлоке и
+``lock_timeout``) и резолвит futures только после commit. Операции, пришедшие,
+пока шла предыдущая транзакция, уже прождали тик и уходят следующей пачкой
+сразу. Когда в буфере ``backpressure`` операций (10 000), новые ждут места
+(как River).
 
 После commit работа с БД — подсказка ``watch``, оценка политик и
 ``try_finalize`` — идёт в одной фоновой задаче и не задерживает следующую
@@ -212,7 +215,9 @@ class CompleterSettings:
     Attributes:
         worker_id: Идентификатор процесса-воркера в ``th_lease.worker_id``.
         slot: Слот ``th_counter`` процесса.
-        tick: Сколько ждать новые операции после первой в буфере.
+        tick: Сколько самое большее ждать новые операции после первой в буфере
+            (от её прихода: операция, прождавшая тик за предыдущей транзакцией,
+            уходит сразу).
         max_batch: Операций в одной транзакции.
         backpressure: Операций в буфере, после которого новые ждут места.
         lease_ttl: Срок lease от claim и от каждого heartbeat.
@@ -1503,6 +1508,8 @@ class Completer:
         self._flushing = False
         self._idle = asyncio.Event()
         self._idle.set()
+        self._oldest = 0.0
+        """``clock.monotonic()`` прихода первой операции в пустой буфер."""
         self._deferred_progress: set[UUID] = set()
         self._deferred_finalize: set[UUID] = set()
         self._after_task: asyncio.Task[None] | None = None
@@ -1954,6 +1961,8 @@ class Completer:
         if self._closing:
             future.cancel()
             raise ClosedError(_CLOSED)
+        if not self._buffer:
+            self._oldest = self.clock.monotonic()
         self._buffer.append(op)
         self._idle.clear()
         self._notify_buffer()
@@ -1973,10 +1982,13 @@ class Completer:
                 self._wakeup.clear()
                 _ = await self._wakeup.wait()
                 continue
-            if len(self._buffer) < self.settings.max_batch and not self._closing:
+            # Тик отсчитывается от прихода первой операции пачки: если она
+            # прождала его за предыдущей транзакцией, пачка уходит сразу.
+            remaining = self._oldest + tick - self.clock.monotonic()
+            if len(self._buffer) < self.settings.max_batch and not self._closing and remaining > 0:
                 self._full.clear()
                 with contextlib.suppress(TimeoutError):
-                    async with asyncio.timeout(tick):
+                    async with asyncio.timeout(remaining):
                         _ = await self._full.wait()
             self._flushing = True
             ops = self._buffer[: self.settings.max_batch]
