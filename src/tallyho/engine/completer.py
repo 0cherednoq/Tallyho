@@ -44,6 +44,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import threading
 from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import timedelta
@@ -146,6 +147,7 @@ _CLOSED = "Completer закрыт: новые операции не приним
 _OTHER_LOOP = "Completer привязан к другому event loop: создайте свой экземпляр на loop"
 _FLUSH_FAILED = "групповая транзакция Completer не прошла"
 _ABORTED = "Completer остановлен до commit операции: закрытие не уложилось в срок"
+_SETTLE_RETHREADED = "транзакция после complete_in прервана остановкой event loop, повтор"
 _SPAWN_SERVICES = "Completer не настроен для spawn: передайте Producer в CompleterTriggers"
 _SPAWN_ROUTE = "маршрут spawn не соответствует завершаемому Item или дереву"
 _SPAWN_TARGET_CLOSED = "целевой этап spawn уже закрыт"
@@ -1855,18 +1857,41 @@ class Completer:
 
     async def _after_external_commit(self, applied: _Applied, done: _UserCommit) -> None:
         try:
-            await run_transaction(
-                self.engine,
-                lambda conn: self._settle_external(conn, done),
-                settings=self.settings.tx,
-                policy=self.settings.retry,
-            )
+            await self._settle_in_this_thread(done)
             self._notify(len(applied.finished), 0.0, applied)
             await self._after_commit(applied)
         except Exception:  # ruff: ignore[blind-except]  # commit уже состоялся; sweeper повторит fold/finalize и удалит lease
             _log.exception("обработка complete_in после commit упала")
         finally:
             self._forget(done.item_id, done.attempt)
+
+    async def _settle_in_this_thread(self, done: _UserCommit) -> None:
+        """Транзакция :meth:`_settle_external`, доведённая в потоке, где идёт loop.
+
+        Loop исполнителя flexiq останавливают, не дожидаясь этой задачи, и его
+        поток завершается; ``aclose`` докручивает loop в служебном потоке
+        (ARCHITECTURE §11.1). Запрос SQLAlchemy, прерванный остановкой,
+        привязан к greenlet прежнего потока и падает (``greenlet.error``), а
+        транзакция откатывается. Если за попытку сменился поток, транзакция
+        повторяется в текущем: она идемпотентна (lease терминального Item,
+        дельты и строки слота забираются по id), поэтому повтор безопасен и
+        тогда, когда прерван был сам COMMIT.
+        """
+        while True:
+            thread = threading.get_ident()
+            try:
+                await run_transaction(
+                    self.engine,
+                    lambda conn: self._settle_external(conn, done),
+                    settings=self.settings.tx,
+                    policy=self.settings.retry,
+                )
+            except Exception:
+                if threading.get_ident() == thread:
+                    raise
+                _log.warning(_SETTLE_RETHREADED, exc_info=True)
+            else:
+                return
 
     async def _settle_external(self, conn: AsyncConnection, done: _UserCommit) -> None:
         """Транзакция после commit пути B: lease, дельты, метрики (UC-08).

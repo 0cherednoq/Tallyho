@@ -31,6 +31,9 @@ _log = logging.getLogger(__name__)
 _HANDOVER_GRACE: Final = 5.0
 """Запас сверх срока закрытия на ответ чужого event loop, секунды."""
 
+_STOP_POLL: Final = 0.05
+"""Как часто, ожидая чужой работающий loop, проверять, не остановили ли его, секунды."""
+
 
 class _Completer(Protocol):
     @property
@@ -85,7 +88,9 @@ async def run_in(
 
     Свой loop — напрямую. Чужой работающий — передачей фабрики в этот loop
     (:class:`_Handover`): корутина создаётся там, а если loop не ответил за
-    ``patience``, не создаётся вовсе или отменяется. Чужой остановленный, но
+    ``patience``, не создаётся вовсе или отменяется; если loop остановили, пока
+    передача или корутина ещё не завершились, он докручивается, как
+    остановленный. Чужой остановленный, но
     не закрытый (flexiq останавливает loop исполнителя при выходе из
     ``run_worker``) — этот loop
     докручивается в служебном потоке, пока корутина не завершится. Закрытый
@@ -93,8 +98,10 @@ async def run_in(
 
     Докрутить можно не всё: запрос SQLAlchemy, прерванный остановкой loop,
     привязан (greenlet) к потоку, который этот loop крутил, и в другом потоке
-    завершится ошибкой. Библиотека такие ошибки фоновой работы логирует, а
-    недоделанное подбирает sweeper; новые запросы закрытия выполняются штатно.
+    завершится ошибкой. Идемпотентную после-коммитную транзакцию
+    ``complete_in`` Completer повторяет в текущем потоке; прочие такие ошибки
+    фоновой работы библиотека логирует, а недоделанное подбирает sweeper;
+    новые запросы закрытия выполняются штатно.
 
     Args:
         owner: Loop владельца; ``None`` — компонент ни к чему не привязан.
@@ -117,11 +124,30 @@ async def run_in(
     handover = _Handover(owner, make)
     try:
         async with asyncio.timeout(patience):
-            await asyncio.wrap_future(handover.result)
+            await _await_handover(owner, handover)
     except TimeoutError:
         _log.warning("закрытие: чужой event loop не ответил за %.1f с", patience)
     finally:
         handover.abandon()
+
+
+async def _await_handover(owner: asyncio.AbstractEventLoop, handover: _Handover) -> None:
+    """Дождаться переданной корутины; loop, остановленный посреди неё, докрутить самим.
+
+    flexiq останавливает loop исполнителя, не дожидаясь задач библиотеки: если
+    это случилось после передачи, корутина (или ещё не выполненная передача)
+    осталась в остановленном loop, и ждать её без докрутки бесполезно.
+    """
+    result = asyncio.wrap_future(handover.result)
+    while True:
+        done, _ = await asyncio.wait({result}, timeout=_STOP_POLL)
+        if done:
+            return result.result()
+        if owner.is_closed():
+            _log.warning("закрытие: event loop владельца закрыт, его задачу не дождаться")
+            return None
+        if not owner.is_running():
+            await asyncio.to_thread(_drive, owner, handover.waiter)
 
 
 @final
@@ -164,6 +190,14 @@ class _Handover:
             self.result.set_exception(error)
         else:
             self.result.set_result(None)
+
+    async def waiter(self) -> None:
+        """Корутина для loop владельца: завершается вместе с переданной корутиной.
+
+        Её докручивают в остановленном loop: очередь loop выполнит и ещё не
+        начатую передачу. Исход корутины читает тот, кто ждёт :attr:`result`.
+        """
+        _ = await asyncio.wait({asyncio.wrap_future(self.result)})
 
     def abandon(self) -> None:
         """Перестать ждать: не начатую корутину не создавать, начатую — отменить."""
