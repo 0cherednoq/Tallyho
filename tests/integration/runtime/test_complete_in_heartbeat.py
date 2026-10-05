@@ -10,14 +10,13 @@ from __future__ import annotations
 
 import asyncio
 import functools
-import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import timedelta
 from itertools import starmap
 from typing import TYPE_CHECKING, ParamSpec, TypeVar
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import create_async_engine
 from typing_extensions import override
@@ -28,6 +27,7 @@ from tallyho.engine.sweeper import Sweeper, SweeperSettings
 from tallyho.model.states import ItemState, ResultClass
 from tallyho.protocols.broker import DeadLetters, Runtime, Verdict
 from tallyho.runtime import TaskRuntime, item
+from tests.helpers.db import backend_pid, blocked_by
 from tests.helpers.probe import committed_ids, create_probe, insert_id
 from tests.helpers.relay import RecordingDispatcher
 from tests.integration.engine.completer_env import (
@@ -46,7 +46,7 @@ if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Awaitable, Callable
     from uuid import UUID
 
-    from sqlalchemy import Table
+    from sqlalchemy import RowMapping, Table
 
     from tallyho.engine.completer import Completer, ItemRef
     from tests.helpers.probe import ProbeColumns
@@ -62,8 +62,8 @@ LATER = NOW + SETTINGS.lease_ttl + timedelta(seconds=1)
 OTHER = CompleterSettings(worker_id="worker-2", slot=COMPLETER_SLOT + 1)
 BEAT = timedelta(milliseconds=40)
 """Малый ``heartbeat_every``: за секунду задача успевает продлить lease десятки раз."""
-HOLD = 3.0
-"""Сколько секунд транзакция пользователя держится открытой после ``complete_in``."""
+STUCK = 30.0
+"""Страховка от зависшего теста, а не порог скорости: столько ждать события не нужно."""
 
 
 @dataclass
@@ -206,63 +206,205 @@ async def test_held_forgets_item_whose_path_a_attempt_lost_lease(env: Env) -> No
 # --- (2) heartbeat против долгой транзакции пути B --------------------------------------
 
 
+@dataclass(eq=False)
+class SlowBeats:
+    """Подтверждённые heartbeat медленного Item после ``complete_in``.
+
+    Обёртка над ``Completer.heartbeat``: считает только вызовы, начатые после
+    ``complete_in`` и завершённые ``True``, то есть закоммиченные групповой
+    транзакцией, пока транзакция пользователя открыта.
+    """
+
+    completer: Completer
+    item_id: UUID
+    completed: asyncio.Event
+    need: int = 2
+    count: int = 0
+    enough: asyncio.Event = field(default_factory=asyncio.Event)
+
+    async def __call__(
+        self,
+        ref: ItemRef,
+        *,
+        attempt: int | None = None,
+        progress_done: int | None = None,
+        progress_total: int | None = None,
+    ) -> bool:
+        counted = ref.id == self.item_id and self.completed.is_set()
+        alive = await type(self.completer).heartbeat(
+            self.completer,
+            ref,
+            attempt=attempt,
+            progress_done=progress_done,
+            progress_total=progress_total,
+        )
+        if counted and alive:
+            self.count += 1
+            if self.count >= self.need:
+                self.enough.set()
+        return alive
+
+
+@dataclass(frozen=True, slots=True)
+class Observed:
+    """Что видно, пока транзакция пути B открыта."""
+
+    waiting: int
+    """Сколько блокировок ждут транзакцию пользователя (``pg_locks``)."""
+    finished: bool
+    """Пачка завершилась раньше, чем кто-то встал в очередь за транзакцией."""
+    open_tx: bool
+    """Транзакция пользователя в этот момент ещё открыта (``pg_stat_activity``)."""
+
+
+async def _watch_blocked(env: Env, pid: int, stop: asyncio.Event) -> int:
+    """Опрашивать ``pg_locks``, пока кто-нибудь не встанет в очередь за ``pid``.
+
+    Возвращает число ожидающих блокировок (``0`` — остановлен через ``stop``).
+    """
+    async with env.connection() as conn:
+        while not stop.is_set():
+            if waiting := await blocked_by(conn, pid):
+                return waiting
+            await asyncio.sleep(BEAT.total_seconds() / 4)
+    return 0
+
+
+async def _in_transaction(env: Env, pid: int) -> bool:
+    """Backend ``pid`` всё ещё внутри транзакции (``pg_stat_activity.xact_start``)."""
+    async with env.connection() as conn:
+        _ = await conn.execute(text("SELECT pg_stat_clear_snapshot()"))
+        started = await conn.scalar(
+            text("SELECT xact_start IS NOT NULL FROM pg_stat_activity WHERE pid = :pid"),
+            {"pid": pid},
+        )
+    return started is True
+
+
+async def _observe(env: Env, pid: int, done_run: asyncio.Task[object]) -> Observed:
+    """Ждать первого из событий: пачка завершилась или кто-то ждёт блокировку ``pid``.
+
+    ``STUCK`` — страховка от зависания, а не порог: при исправном пути B первое
+    событие наступает, как только групповые транзакции закоммичены.
+    """
+    stop = asyncio.Event()
+    watch_run = asyncio.create_task(_watch_blocked(env, pid, stop))
+    try:
+        _ = await asyncio.wait(
+            {done_run, watch_run}, timeout=STUCK, return_when=asyncio.FIRST_COMPLETED
+        )
+        waiting = watch_run.result() if watch_run.done() else 0
+        finished = done_run.done() and not waiting
+        open_tx = await _in_transaction(env, pid)
+    finally:
+        stop.set()
+        _ = await watch_run
+    return Observed(waiting=waiting, finished=finished, open_tx=open_tx)
+
+
+async def _outcome(fast_run: Awaitable[list[None]], done_run: asyncio.Task[R]) -> R | None:
+    """Дождаться быстрых задач после release и забрать итог ``done_run``.
+
+    Если групповая транзакция ждала транзакцию пользователя, быстрые Items
+    завершаются после её commit, а heartbeat медленного Item уже не будет:
+    ``done_run`` тогда отменяется, итога нет.
+    """
+    _ = await fast_run
+    if not done_run.done():
+        _ = done_run.cancel()
+    _ = await asyncio.wait({done_run})
+    return None if done_run.cancelled() else done_run.result()
+
+
+async def _assert_settled(
+    env: Env, probe: Table[ProbeColumns], *, batch_id: UUID, slow_id: UUID, total: int
+) -> None:
+    """Итог после commit пути B и ``settled()``.
+
+    Lease медленного Item удалён после commit, метрики перенесены в слот
+    процесса, домен и счётчики закоммичены.
+    """
+    assert await lease_row(env, slow_id) is None
+    metric = env.tables.metric
+    async with env.connection() as conn:
+        slots = set(await conn.scalars(select(metric.c.slot).distinct()))
+    assert slots == {COMPLETER_SLOT}
+    assert await committed_ids(env.engine, probe) == [0]
+    counters = await env.counters(batch_id)
+    assert (counters.ok, counters.pending) == (total, 0)
+
+
 @pytest.mark.parametrize("label", ["shared", "distinct"])
 async def test_long_user_transaction_does_not_delay_heartbeat_and_finish_of_batch(
-    env: Env, probe: Table[ProbeColumns], *, label: str
+    env: Env, probe: Table[ProbeColumns], monkeypatch: pytest.MonkeyPatch, *, label: str
 ) -> None:
-    """Транзакция пути B открыта ``HOLD`` с после ``complete_in``.
+    """Транзакция пути B открыта после ``complete_in``, пока остальная пачка не завершится.
 
     Остальные Items пачки в это время продлевают lease и завершаются путём A
-    (с тем же label, что у медленного Item, и с разными).
+    (с тем же label, что у медленного Item, и с разными), а медленный Item
+    продлевает свой lease. Секунды не меряются: проверяется порядок событий —
+    всё это закоммичено, пока транзакция пользователя ещё открыта, — и то, что
+    ни один backend не встал в очередь за её блокировками (``pg_locks``). Если
+    путь B снова возьмёт ``th_lease`` или горячий слот ``th_metric`` (label
+    ``shared``), групповая транзакция Completer будет ждать транзакцию
+    пользователя, а та — завершения пачки: наблюдатель увидит ожидание, и тест
+    упадёт сразу.
     """
     others = 4
     seeded = await seed(env, 1 + others)
     slow, fast = seeded.refs[0], seeded.refs[1:]
     completed = asyncio.Event()
+    released = asyncio.Event()
+    slow_pid: list[int] = []
     async with open_completer(env) as completer:
         runtime = _runtime(completer)
+        beats = SlowBeats(completer, slow.id, completed)
+        monkeypatch.setattr(completer, "heartbeat", beats)
 
         async def slow_task(**_kwargs: object) -> None:
             async with env.transaction() as conn:
+                slow_pid.append(await backend_pid(conn))
                 await insert_id(conn, probe, 0)
                 item.ok("ok" if label == "shared" else "slow")
                 await item.complete_in(conn)
                 completed.set()
-                await asyncio.sleep(HOLD)
+                await released.wait()
 
         async def fast_task(index: int, **_kwargs: object) -> None:
             # Задача живёт несколько интервалов heartbeat, затем завершается путём A.
             await asyncio.sleep(BEAT.total_seconds() * 5)
             item.ok("ok" if label == "shared" else f"fast-{index}")
 
-        async def run_fast(index: int, ref: ItemRef) -> float:
-            await completed.wait()
-            started = time.monotonic()
+        async def run_fast(index: int, ref: ItemRef) -> None:
             await runtime.wrap(fast_task)(index, _th=_marker(ref))
-            return time.monotonic() - started
+
+        async def batch_done(fast_run: Awaitable[list[None]]) -> list[RowMapping | None]:
+            _ = await fast_run
+            _ = await beats.enough.wait()
+            # Читается до release: транзакция пользователя ещё открыта.
+            return [await lease_row(env, ref.id) for ref in fast]
 
         async def run_slow() -> None:
             await runtime.wrap(slow_task)(_th=_marker(slow))
 
         slow_run = asyncio.create_task(run_slow())
         try:
-            elapsed = await asyncio.gather(*starmap(run_fast, enumerate(fast)))
-            leases_left = [await lease_row(env, ref.id) for ref in fast]
+            async with asyncio.timeout(STUCK):
+                _ = await completed.wait()
+            fast_run = asyncio.gather(*starmap(run_fast, enumerate(fast)))
+            done_run = asyncio.create_task(batch_done(fast_run))
+            observed = await _observe(env, slow_pid[0], done_run)
         finally:
+            released.set()
             await slow_run
+        leases_left = await _outcome(fast_run, done_run)
+        assert not observed.waiting, f"за транзакцией пути B ждут {observed.waiting} блокировок"
+        assert observed.finished, "пачка не завершилась, пока транзакция пользователя открыта"
+        assert observed.open_tx
         await completer.settled()
-        # Lease медленного Item удалён после commit, метрики перенесены в слот процесса.
-        assert await lease_row(env, slow.id) is None
-        metric = env.tables.metric
-        async with env.connection() as conn:
-            slots = set(await conn.scalars(select(metric.c.slot).distinct()))
-        assert slots == {COMPLETER_SLOT}
-    # Без ожидания блокировок путь A укладывается в доли секунды, а не в HOLD.
-    assert max(elapsed) < HOLD / 3, elapsed
+    assert beats.count >= beats.need
     assert leases_left == [None] * others
-    assert await committed_ids(env.engine, probe) == [0]
-    counters = await env.counters(seeded.batch_id)
-    assert (counters.ok, counters.pending) == (1 + others, 0)
+    await _assert_settled(env, probe, batch_id=seeded.batch_id, slow_id=slow.id, total=1 + others)
 
 
 @pytest.mark.parametrize("isolation", ["REPEATABLE READ", "SERIALIZABLE"])

@@ -227,6 +227,7 @@ async def test_next_transaction_delivers_previous_commit(engine: AsyncEngine, pr
 
 async def test_commit_in_flight_is_still_pending(engine: AsyncEngine, probe: Probe) -> None:
     states: list[bool] = []
+    checked = 0
     async with engine.connect() as conn:
         await insert_id(conn, probe, 1)
 
@@ -235,13 +236,21 @@ async def test_commit_in_flight_is_still_pending(engine: AsyncEngine, probe: Pro
 
         await after_commit(conn, callback)
         commit = asyncio.ensure_future(conn.commit())
-        # Пока COMMIT в пути, колбэк ещё ждёт его исхода.
+        # Пока COMMIT в пути, колбэк ещё ждёт его исхода. Первая проверка идёт
+        # всегда: шаг commit, отправивший COMMIT, ждёт ответа сервера.
         while not commit.done():
             await asyncio.sleep(0)
             if not commit.done() and not states:
                 assert await after_commit_pending(conn, callback)
+                checked += 1
         await commit
+        # Опрос event loop доставляет колбэк с паузами (D-057), и под нагрузкой
+        # он мог ещё не сработать. Обращение к соединению доставляет сразу: после
+        # ``await conn.commit()`` колбэк вызван к моменту ответа, ровно один раз.
+        assert not await after_commit_pending(conn, callback)
+        assert states == [True]
 
+    assert checked >= 1
     assert states == [True]
 
 
