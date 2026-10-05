@@ -589,10 +589,15 @@ async def after_commit(target: AsyncSession | AsyncConnection, callback: AfterCo
     * Соединение своей транзакции (:func:`begin_transaction`,
       :func:`own_transaction`) — сразу по выходе из неё.
     * ``AsyncConnection`` пользователя — событие ``commit`` соединения
-      срабатывает до отправки COMMIT, поэтому колбэк ждёт его исхода и
-      вызывается в ближайшем проходе event loop после COMMIT или при
-      следующем обращении к соединению, но не внутри ``await conn.commit()``.
-      Ошибку COMMIT библиотека узнаёт событием ``handle_error`` движка.
+      срабатывает до отправки COMMIT, поэтому колбэк ждёт его исхода (D-057).
+      Доставляет его опрос из event loop (:func:`_deliver_later`): первые
+      :data:`_SPIN_SECONDS` (5 мс) — на каждом проходе цикла, затем с растущей
+      паузой до :data:`_MAX_POLL_SECONDS` (50 мс). Раньше опроса колбэк
+      доставят начало следующей транзакции соединения, вызов
+      :func:`after_commit` или :func:`after_commit_pending` на нём и
+      :func:`deliver_committed`. Внутри ``await conn.commit()`` колбэк не
+      вызывается. Вне event loop опроса нет — только эти обращения. Ошибку
+      COMMIT библиотека узнаёт событием ``handle_error`` движка.
 
     Args:
         target: Сессия или соединение.
