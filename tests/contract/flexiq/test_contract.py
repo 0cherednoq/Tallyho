@@ -24,6 +24,7 @@ from tallyho.protocols.broker import Message
 from tallyho.storage.tables import build_metadata
 from tests.contract.flexiq.contract_app import DataClassPayload, ModelPayload
 from tests.helpers.db import schema_connection
+from tests.helpers.flexiq_version import installed_flexiq_supported
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Awaitable, Callable
@@ -812,7 +813,8 @@ async def test_a_fq_16_plain_flexiq_tasks_coexist(flexiq_contract: FlexiqContrac
 
 
 async def test_a_fq_17_version_guard_is_explicit(flexiq_contract: FlexiqContract) -> None:
-    assert version("flexiq").startswith("2.0.")
+    # Диапазон pyproject `>=2.0,<3`: nightly-ячейка master может нести 2.1+ (Fix-32).
+    assert installed_flexiq_supported(), version("flexiq")
     app = flexiq_contract.app
     invalid = FlexiqAdapter(cast("Queue", object()))
     client = Tallyho(app.engine, schema="bad_api_not_migrated")
