@@ -12,7 +12,7 @@ from tests.acceptance.app.site import CatalogGenerator, FakeCatalogSite
 __all__ = ["main"]
 
 
-async def _run(seed: int, pages: int) -> None:
+async def _run(seed: int, pages: int, *, empty_pdfs: bool) -> None:
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
     for candidate in (signal.SIGINT, signal.SIGTERM):
@@ -20,7 +20,7 @@ async def _run(seed: int, pages: int) -> None:
             loop.add_signal_handler(candidate, stop.set)
         except (NotImplementedError, RuntimeError):
             continue
-    site = FakeCatalogSite(CatalogGenerator.build(seed, page_count=pages))
+    site = FakeCatalogSite(CatalogGenerator.build(seed, page_count=pages, empty_pdfs=empty_pdfs))
     mail = FakeMailProvider()
     await site.start(
         host="0.0.0.0",  # ruff: ignore[hardcoded-bind-all-interfaces]  # container service must be reachable
@@ -42,8 +42,9 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--pages", type=int, default=50)
+    parser.add_argument("--empty-pdfs", type=int, default=0, help="1: каталог без PDF (A-UC-05)")
     values = parser.parse_args()
-    asyncio.run(_run(values.seed, values.pages))
+    asyncio.run(_run(values.seed, values.pages, empty_pdfs=bool(values.empty_pdfs)))
 
 
 if __name__ == "__main__":

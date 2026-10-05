@@ -63,6 +63,38 @@ class StandError(Exception):
     """Стенд не поднялся или команда docker завершилась неожиданно."""
 
 
+_STALE_LOCK = 1500.0
+
+
+def _try_lock(path: Path) -> bool:
+    """Создать файл-маркер; ``False`` - он уже есть (устаревший при этом снимается)."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.close(os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY))
+    except FileExistsError:
+        try:
+            if time.time() - path.stat().st_mtime > _STALE_LOCK:
+                path.unlink(missing_ok=True)
+        except FileNotFoundError:
+            pass
+        return False
+    return True
+
+
+@asynccontextmanager
+async def _exclusive(path: Path) -> AsyncGenerator[None]:
+    """Межпроцессная блокировка файлом-маркером (стенды xdist - разные процессы).
+
+    Маркер старше ``_STALE_LOCK`` секунд оставил упавший процесс: его снимают.
+    """
+    while not await asyncio.to_thread(_try_lock, path):  # ruff: ignore[async-busy-wait]  # блокировка между процессами: asyncio.Event их не связывает
+        await asyncio.sleep(1)
+    try:
+        yield
+    finally:
+        await asyncio.to_thread(path.unlink, missing_ok=True)
+
+
 @dataclass(frozen=True, slots=True)
 class CommandResult:
     """Код возврата и объединённый вывод внешней команды."""
@@ -117,6 +149,7 @@ class StandSettings:
 
     seed: int
     pages: int = 1
+    empty_pdfs: bool = False
     threads: int = 8
     lease_ttl: float = 60.0
     heartbeat_every: float = 20.0
@@ -144,6 +177,7 @@ class StandSettings:
             "APP_IMAGE": self.image,
             "SEED": str(self.seed),
             "PAGES": str(self.pages),
+            "EMPTY_PDFS": str(int(self.empty_pdfs)),
             "THREADS_PER_WORKER": str(self.threads),
             "LEASE_TTL": str(self.lease_ttl),
             "HEARTBEAT_EVERY": str(self.heartbeat_every),
@@ -154,7 +188,7 @@ class StandSettings:
         }
 
 
-@dataclass(slots=True)
+@dataclass(slots=True)  # ruff: ignore[too-many-public-methods]  # фасад стенда: контейнеры, SQL, toxiproxy
 class Stand:
     """Один compose-проект приёмочного стенда."""
 
@@ -177,17 +211,20 @@ class Stand:
             StandError: Образ не собрался, compose не поднялся или воркеры не вышли на связь.
         """
         await self.down()
-        build = await run_command(
-            "docker",
-            "build",
-            "-q",
-            "-t",
-            self.settings.image,
-            "-f",
-            str(HERE.parent / "Dockerfile"),
-            str(ROOT),
-            timeout_seconds=1200,
-        )
+        # Параллельные `docker build` одного тега роняют BuildKit («content digest … not
+        # found», «parent snapshot … does not exist»): стенды одного дерева собирают по очереди.
+        async with _exclusive(ROOT / ".work-tmp" / "acceptance" / "build.lock"):
+            build = await run_command(
+                "docker",
+                "build",
+                "-q",
+                "-t",
+                self.settings.image,
+                "-f",
+                str(HERE.parent / "Dockerfile"),
+                str(ROOT),
+                timeout_seconds=1200,
+            )
         if not build.ok:
             message = f"образ {self.settings.image} не собрался:\n{build.output}"
             raise StandError(message)
@@ -223,10 +260,15 @@ class Stand:
 
     async def save_logs(self, path: Path) -> None:
         """Сохранить логи всех контейнеров стенда."""
-        logs = await self._compose("logs", "--no-color", "--timestamps", timeout_seconds=300)
-        _ = await asyncio.to_thread(
-            path.write_text, logs.output + "\n", encoding="utf-8", newline="\n"
+        logs = await self.logs()
+        _ = await asyncio.to_thread(path.write_text, logs + "\n", encoding="utf-8", newline="\n")
+
+    async def logs(self, *services: str) -> str:
+        """Логи контейнеров стенда (всех или перечисленных сервисов)."""
+        result = await self._compose(
+            "logs", "--no-color", "--timestamps", *services, timeout_seconds=300
         )
+        return result.output
 
     async def _compose(self, *args: str, timeout_seconds: float) -> CommandResult:
         environment = {**self.settings.environment(), **self.extra_environment}

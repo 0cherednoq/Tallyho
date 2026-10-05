@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import time
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, cast
 from uuid import UUID
 
@@ -14,7 +14,7 @@ from sqlalchemy import select, text
 from tallyho.model.states import ItemState
 from tallyho.storage.tables import build_metadata
 from tests.acceptance import oracle
-from tests.acceptance.app.application import AUDIENCE_ID_SPAN, PAGE
+from tests.acceptance.app.application import AUDIENCE_ID_SPAN
 from tests.acceptance.chaos.plan import WORKERS
 from tests.acceptance.chaos.stand import CONNECTION_ERRORS
 from tests.acceptance.oracle import InvariantReport
@@ -31,7 +31,10 @@ if TYPE_CHECKING:
     from tests.acceptance.app.site import CatalogGenerator
     from tests.acceptance.chaos.journal import ChaosJournal
     from tests.acceptance.chaos.load import LoadDriver, Root
+
+    Comparisons = Mapping[str, tuple[int, int]]
     from tests.acceptance.chaos.stand import Stand
+    from tests.acceptance.oracle import PurgedBatch
 
 __all__ = [
     "Expectation",
@@ -41,6 +44,7 @@ __all__ = [
     "check_expectations",
     "disruption_budget",
     "run_oracle",
+    "wait_quiescent",
     "wait_recovery",
 ]
 
@@ -128,13 +132,25 @@ class Expectation:
 
 @dataclass(frozen=True, slots=True)
 class OracleInput:
-    """Всё, что оракулу нужно знать о прогоне."""
+    """Всё, что оракулу нужно знать о прогоне.
+
+    Attributes:
+        roots: Корни прогона и их сценарий (``S1``/``S2``/``S3`` или ``UC``).
+        retry_failed: Сколько раз батч финализировался повторно после ``retry_failed`` (I-03).
+        purged: Наблюдаемые исходы retention (I-14).
+        frozen: Итоговые снимки корней, удалённых retention до запуска оракула (I-06, I-12).
+        truth: Эталон I-07 для корней ``UC``: имя сравнения -> (факт, эталон).
+    """
 
     stand: Stand
     app: AcceptanceApp
-    driver: LoadDriver
+    roots: Sequence[Root]
     generated: CatalogGenerator
     journal: ChaosJournal
+    retry_failed: Mapping[UUID, int] = field(default_factory=dict[UUID, int])
+    purged: Sequence[PurgedBatch] = ()
+    frozen: Mapping[UUID, BatchView] = field(default_factory=dict[UUID, "BatchView"])
+    truth: Mapping[UUID, Comparisons] = field(default_factory=dict[UUID, "Comparisons"])
 
 
 @dataclass(frozen=True, slots=True)
@@ -208,6 +224,43 @@ async def wait_recovery(
     return Recovery(quiescent, round(longest, 3), limit, round(waited, 3))
 
 
+async def wait_quiescent(stand: Stand, journal: ChaosJournal, *, hard_cap: float) -> Recovery:
+    """Дождаться, пока все батчи терминальны, а outbox, lease и дельты пусты (без хаоса).
+
+    Прогресс не должен стоять дольше ``T_rec``; после затишья оракул запускается сразу:
+    отказов не было, ждать восстановления нечего. Батчей может не остаться вовсе: retention
+    удаляет деревья (A-UC-14, A-UC-21/22).
+    """
+    limit = stand.settings.recovery.total_seconds()
+    started = time.monotonic()
+    last_change = started
+    last: tuple[int, ...] | None = None
+    longest = 0.0
+    quiescent: float | None = None
+    while time.monotonic() - started < hard_cap:
+        current = await _progress(stand)
+        now = time.monotonic()
+        if current is not None and current != last:
+            last = current
+            last_change = now
+        longest = max(longest, now - last_change)
+        if current is not None and sum(current[3:]) == 0:
+            quiescent = now - started
+            break
+        if now - last_change > limit:
+            break
+        await asyncio.sleep(1)
+    journal.record(
+        "quiescent",
+        quiescent_after=None if quiescent is None else round(quiescent, 3),
+        longest_stall=round(longest, 3),
+        t_rec=limit,
+        last_progress=last,
+    )
+    waited = time.monotonic() - started
+    return Recovery(quiescent, round(longest, 3), limit, round(waited, 3))
+
+
 # ---------------------------------------------------------------------- оракул
 
 
@@ -220,6 +273,7 @@ def _domain_table(app: AcceptanceApp, scenario: str) -> DomainTable:
         "S1": app.domain.invoices,
         "S2": app.domain.campaigns,
         "S3": app.domain.catalog_runs,
+        "UC": app.domain.uc_runs,
     }
     return tables[scenario]
 
@@ -245,7 +299,7 @@ def _s2_comparisons(
             continue
         after = int(key.removeprefix("page:"))
         start = 0 if after == 0 else after - base
-        covered.extend(root.addresses[start : start + PAGE])
+        covered.extend(root.addresses[start : start + root.page])
     unique = {address.strip().casefold() for address in covered}
     send = view.children["send"].progress
     return {
@@ -304,7 +358,9 @@ async def _s3_comparisons(probe: _Probe, view: BatchView) -> dict[str, tuple[int
 
 
 async def _check_i07(
-    probe: _Probe, roots: Mapping[UUID, tuple[Root, BatchView]], invoices: int
+    probe: _Probe,
+    roots: Mapping[UUID, tuple[Root, BatchView]],
+    truth: Mapping[UUID, Comparisons],
 ) -> InvariantReport:
     """I-07 под отказами: эталон считается от фактически развернувшихся источников.
 
@@ -316,8 +372,11 @@ async def _check_i07(
     evidence: list[str] = []
     checked = 0
     for batch_id, (root, view) in roots.items():
-        if root.scenario == "S1":
-            comparisons = {"s1.found": (view.progress.found, invoices)}
+        comparisons: Comparisons
+        if root.scenario == "UC":
+            comparisons = truth.get(batch_id, {})
+        elif root.scenario == "S1":
+            comparisons = {"s1.found": (view.progress.found, root.size)}
         elif root.scenario == "S2":
             expand = await _items(probe, view.children["expand"].id)
             comparisons = _s2_comparisons(root, view, expand)
@@ -453,9 +512,12 @@ async def run_oracle(run: OracleInput) -> tuple[list[InvariantReport], dict[str,
     Returns:
         Отчёты по всем четырнадцати инвариантам и числа для отчёта прогона.
     """
-    app, stand, roots = run.app, run.stand, run.driver.roots
+    app, stand, roots = run.app, run.stand, run.roots
     tables = build_metadata()
-    views = {root.batch_id: await app.th.handle(root.batch_id).view() for root in roots}
+    views = {
+        root.batch_id: run.frozen.get(root.batch_id) or await app.th.handle(root.batch_id).view()
+        for root in roots
+    }
     by_root = {root.batch_id: (root, views[root.batch_id]) for root in roots}
     domain_views = {
         root.batch_id: (_domain_table(app, root.scenario), views[root.batch_id]) for root in roots
@@ -469,11 +531,13 @@ async def run_oracle(run: OracleInput) -> tuple[list[InvariantReport], dict[str,
         reports = [
             await oracle.check_i01_terminal_batches(connection, tables),
             await oracle.check_i02_no_tails(connection, tables),
-            await oracle.check_i03_single_finalization(connection, tables, app.domain),
+            await oracle.check_i03_single_finalization(
+                connection, tables, app.domain, retry_failed=run.retry_failed
+            ),
             await oracle.check_i04_exact_domain_effects(connection, tables, app.domain),
             await oracle.check_i05_counter_truth(connection, tables),
             await oracle.check_i06_domain_matches_tallyho(connection, domain_views),
-            await _check_i07(probe, by_root, run.driver.profile.size),
+            await _check_i07(probe, by_root, run.truth),
             await oracle.check_i08_monotonic_snapshots(connection, app.domain),
             await oracle.check_i09_tree_order(connection, tables, app.domain),
             await oracle.check_i10_broker_alignment(
@@ -482,7 +546,7 @@ async def run_oracle(run: OracleInput) -> tuple[list[InvariantReport], dict[str,
             i11,
             oracle.check_i12_exact_after_seal(flat),
             await oracle.check_i13_tree_consistency(connection, tables),
-            oracle.check_i14_retention(()),
+            oracle.check_i14_retention(run.purged),
         ]
         stats.update(await _item_stats(probe))
     stats["batches"] = len(flat)

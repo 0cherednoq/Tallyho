@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, cast
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
+from tests.acceptance.app.application import PAGE
 from tests.acceptance.app.common import rng_for
 from tests.acceptance.app.site import CatalogGenerator
 from tests.acceptance.chaos.stand import CONNECTION_ERRORS
@@ -55,6 +56,10 @@ class Root:
     scenario: str
     index: int
     addresses: tuple[str, ...] = ()
+    page: int = PAGE
+    """S2: сколько контактов читает одна страница ``expand_audience``."""
+    size: int = 0
+    """S1: сколько счетов в батче."""
 
 
 def plan_load(
@@ -151,7 +156,7 @@ class LoadDriver:
                 )
                 await asyncio.sleep(1)
                 continue
-            return Root(batch_id, self.profile.scenario, index, addresses)
+            return Root(batch_id, self.profile.scenario, index, addresses, size=self.profile.size)
 
     async def _start(self, index: int, addresses: tuple[str, ...]) -> UUID:
         if self.profile.scenario == "S1":

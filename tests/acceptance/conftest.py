@@ -46,14 +46,19 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
     Chaos runs (marker ``chaos``) need Docker Compose and minutes per case, so they are
     deselected unless the marker expression names them (``poe acceptance`` passes ``-m chaos``).
     """
-    chaos_requested = "chaos" in str(config.getoption("markexpr"))
+    expression = str(config.getoption("markexpr"))
     deselected: list[pytest.Item] = []
     for collected in items:
         if not collected.path.is_relative_to(HERE):
             continue
         collected.add_marker(pytest.mark.integration)
         collected.add_marker(pytest.mark.flexiq)
-        if not chaos_requested and collected.get_closest_marker("chaos") is not None:
+        # Прогоны на compose-стенде (хаос A-CH и сценарии A-UC) собираются, только если
+        # выражение маркеров называет их: ``poe acceptance`` и ``poe acceptance-uc``.
+        if any(
+            marker not in expression and collected.get_closest_marker(marker) is not None
+            for marker in ("chaos", "usecase")
+        ):
             deselected.append(collected)
     if deselected:
         items[:] = [collected for collected in items if collected not in deselected]
