@@ -74,25 +74,9 @@ class _Defect:
 # Fix-6, Fix-7, Fix-18, Fix-19 исправили осиротевшие Items, а I-10 приведён к D-056 (Item
 # ok/skip с джобой текущего поколения в DLQ допустим, если I-04 для него выполнен).
 _INVARIANT_DEFECTS: Mapping[tuple[str, str], _Defect] = {}
-# Невыполненные ожидания A-CH.
-#
-# A-CH-08 на S1, seed 2: после третьего SIGTERM остался 1 lease. Путь B (complete_in)
-# закоммитил Item перед самой остановкой; после-коммитная транзакция Completer
-# (`_after_external_commit`: удалить lease, свернуть дельты и временный слот метрик) начата
-# в loop потока flexiq, а после остановки flexiq `aclose` докручивает её в служебном потоке
-# (D-054). SQLAlchemy падает посреди транзакции: «greenlet.error: cannot switch to a
-# different thread (which happens to have exited)», транзакция откатывается, lease остаётся
-# до sweeper. Инварианты зелёные (хвосты убирает sweeper), но SIGTERM не освободил lease
-# сразу. Проявляется, только если commit пути B попал в последние доли секунды перед
-# остановкой: seed 1 зелёный во всех трёх сценариях.
-_SHUTDOWN_SETTLE_LOST = _Defect(
-    "Fix-NEW-close-path-b-thread",
-    "после-коммитная транзакция пути B, докрученная aclose в чужом потоке, падает на greenlet",
-    strict=False,
-)
-_EXPECTATION_DEFECTS: Mapping[tuple[str, str], _Defect] = {
-    ("A-CH-08", scenario): _SHUTDOWN_SETTLE_LOST for scenario in SCENARIOS
-}
+# Невыполненные ожидания A-CH. Метка A-CH-08 снята в Fix-25: после-коммитную транзакцию
+# пути B, прерванную остановкой loop flexiq, Completer повторяет в потоке закрытия.
+_EXPECTATION_DEFECTS: Mapping[tuple[str, str], _Defect] = {}
 
 
 def _cases(defect_of: Mapping[tuple[str, str], _Defect]) -> list[ParameterSet]:
