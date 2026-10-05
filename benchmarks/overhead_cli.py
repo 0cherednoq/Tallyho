@@ -67,6 +67,7 @@ class OverheadArgs(argparse.Namespace):
     processes: int = 2
     concurrency: int = 20
     scheduler_batch: int = 1
+    completer_tick_ms: float = 20.0
     variants: str = "all"
     timeout: float = 7_200.0
     label: str = "run"
@@ -112,6 +113,12 @@ def parse_args(argv: Sequence[str] | None = None) -> tuple[list[str], OverheadAr
         type=int,
         default=1,
         help="scheduler_batch_size flexiq (1 — умолчание flexiq)",
+    )
+    _ = parser.add_argument(
+        "--completer-tick-ms",
+        type=float,
+        default=20.0,
+        help="completer_tick tallyho, мс (20 — умолчание)",
     )
     _ = parser.add_argument("--variants", default="all", help=f"all или {','.join(VARIANTS)}")
     _ = parser.add_argument("--timeout", type=float, default=7_200.0, help="предел повтора, с")
@@ -371,6 +378,7 @@ async def _run(variants: list[str], args: OverheadArgs) -> dict[str, JsonValue]:
         timeout=args.timeout,
         print_output=True,
         scheduler_batch=args.scheduler_batch,
+        completer_tick_ms=args.completer_tick_ms,
     )
     results = _Results(runs={name: [] for name in variants})
     out = args.out / args.label
@@ -406,6 +414,7 @@ async def _run(variants: list[str], args: OverheadArgs) -> dict[str, JsonValue]:
             "processes": args.processes,
             "concurrency": args.concurrency,
             "scheduler_batch": args.scheduler_batch,
+            "completer_tick_ms": args.completer_tick_ms,
             "variants": cast("list[JsonValue]", variants),
         },
         "environment": environment,
