@@ -122,7 +122,6 @@ async def _execute(
             await SCENARIOS[config.uc](context)
         journal.record("scenario_done")
         recovery = await wait_quiescent(stand, journal, hard_cap=_QUIESCENCE_CAP)
-        await app.engine.dispose()
         invariants, stats = await run_oracle(
             OracleInput(
                 stand,
