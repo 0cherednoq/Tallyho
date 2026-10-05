@@ -82,7 +82,6 @@ from tallyho.protocols.observer import NullObserver
 from tallyho.storage.counters import (
     CounterDelta,
     fold_delta_ids,
-    fold_deltas,
     insert_delta,
     read_counters,
     take_metric_slot,
@@ -1733,26 +1732,6 @@ class Completer:
         await after_commit(target, lambda: self._schedule_external(tx.applied, done))
         return True
 
-    async def fold(self, batch_id: UUID) -> bool:
-        """Свернуть закоммиченные дельты батча и проверить финализацию.
-
-        Args:
-            batch_id: Батч, чьи append-only дельты надо перенести в слот
-                процесса Completer.
-
-        Returns:
-            ``True``, если была перенесена хотя бы одна ненулевая дельта.
-        """
-        folded = await run_transaction(
-            self.engine,
-            lambda conn: self._fold_in(conn, [batch_id]),
-            settings=self.settings.tx,
-            policy=self.settings.retry,
-        )
-        if self.triggers.finalizer is not None:
-            await self.triggers.finalizer.try_finalize(batch_id)
-        return batch_id in folded
-
     async def close(self, *, requeue_held: bool = False) -> None:
         """Мягкая остановка: дослать буфер и остановить задачу сброса.
 
@@ -1840,17 +1819,6 @@ class Completer:
         tx = _Tx(self, conn)
         await tx.requeue(refs)
         await tx.write_counters()
-
-    async def _fold_in(
-        self, conn: AsyncConnection, batch_ids: Iterable[UUID]
-    ) -> dict[UUID, CounterDelta]:
-        folded = await fold_deltas(conn, self.tables, batch_ids)
-        await upsert_slots(
-            conn,
-            self.tables,
-            {(batch_id, self.settings.slot): delta for batch_id, delta in folded.items()},
-        )
-        return folded
 
     def _forget(self, item_id: UUID, attempt: int | None) -> None:
         """Убрать Item из удерживаемых, если его держит попытка ``attempt``.

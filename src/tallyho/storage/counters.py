@@ -26,7 +26,6 @@ from sqlalchemy import (
     BigInteger,
     SmallInteger,
     Uuid,
-    any_,
     cast,
     delete,
     func,
@@ -59,7 +58,6 @@ __all__ = [
     "MetricKey",
     "SlotKey",
     "fold_delta_ids",
-    "fold_deltas",
     "insert_delta",
     "read_counters",
     "reconcile",
@@ -569,15 +567,21 @@ def _sum_metric_rows(rows: Iterable[tuple[UUID, str, int]]) -> dict[tuple[UUID, 
     return dict(values)
 
 
-async def fold_deltas(
-    conn: AsyncConnection, tables: Tables, batch_ids: Iterable[UUID]
+async def fold_delta_ids(
+    conn: AsyncConnection, tables: Tables, delta_ids: Iterable[int]
 ) -> dict[UUID, CounterDelta]:
-    """Забрать закоммиченные дельты батчей: ``DELETE … RETURNING`` с суммой по батчу.
+    """Забрать закоммиченные дельты по id: ``DELETE … RETURNING`` с суммой по батчу.
 
     Удаляются только строки, видимые снимку запроса, то есть закоммиченные:
-    дельты незавершённой транзакции пользователя остаются до следующего
+    дельта незавершённой транзакции пользователя остаётся до следующего
     прохода. Параллельная свёртка тех же строк ждёт блокировку и после commit
     первой их уже не находит, поэтому дельта сворачивается ровно один раз.
+
+    Условие по первичному ключу не ставит predicate-lock на диапазон
+    ``batch_id`` и поэтому не конфликтует с последующими append-only INSERT
+    транзакций ``SERIALIZABLE`` того же батча. Свёртка по батчу целиком не
+    нужна: дельта указывает на свой отрицательный слот ``th_metric``, и
+    вызывающий забирает его вместе с ней (D-067).
 
     Вызывающий обязан в **той же** транзакции прибавить результат к слоту
     (:func:`upsert_slots`, вместе с остальными дельтами — одним вызовом, чтобы
@@ -587,47 +591,18 @@ async def fold_deltas(
     Args:
         conn: Соединение в открытой транзакции.
         tables: Таблицы установки.
-        batch_ids: Батчи, дельты которых сворачиваются.
+        delta_ids: Id строк ``th_counter_delta``.
 
     Returns:
-        Сумма удалённых дельт по батчам; батчи без дельт не попадают.
-    """
-    ids = sorted(set(batch_ids))
-    if not ids:
-        return {}
-    return await _fold_where(
-        conn,
-        tables,
-        tables.counter_delta.c.batch_id == any_(literal(ids, ARRAY(Uuid()))),
-    )
-
-
-async def fold_delta_ids(
-    conn: AsyncConnection, tables: Tables, delta_ids: Iterable[int]
-) -> dict[UUID, CounterDelta]:
-    """Свернуть точно известные дельты после ``complete_in``.
-
-    Условие по первичному ключу не ставит predicate-lock на диапазон
-    ``batch_id`` и поэтому не конфликтует с последующими append-only INSERT
-    транзакций ``SERIALIZABLE`` того же батча. Sweeper использует более общий
-    :func:`fold_deltas` как страховку.
-
-    Returns:
-        Суммы удалённых дельт по батчам.
+        Суммы удалённых дельт по батчам; батчи без дельт не попадают.
     """
     ids = sorted(set(delta_ids))
     if not ids:
         return {}
-    return await _fold_where(conn, tables, tables.counter_delta.c.id.in_(ids))
-
-
-async def _fold_where(
-    conn: AsyncConnection, tables: Tables, where: ColumnElement[bool]
-) -> dict[UUID, CounterDelta]:
     delta = tables.counter_delta
     returned: list[ColumnElement[UUID] | ColumnElement[int]] = [delta.c.batch_id]
     returned.extend(delta.c[f"d_{name}"] for name in DELTA_FIELDS)
-    gone = delete(delta).where(where).returning(*returned).cte("gone")
+    gone = delete(delta).where(delta.c.id.in_(ids)).returning(*returned).cte("gone")
     sums = [_sum(gone.c[f"d_{name}"]).label(name) for name in DELTA_FIELDS]
     columns: list[ColumnElement[UUID] | ColumnElement[int]] = [gone.c.batch_id, *sums]
     stmt = select(*columns).group_by(gone.c.batch_id)

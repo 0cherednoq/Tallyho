@@ -13,7 +13,7 @@ from tallyho.storage.counters import (
     COUNTER_FIELDS,
     CounterDelta,
     CounterTotals,
-    fold_deltas,
+    fold_delta_ids,
     insert_delta,
     read_counters,
     upsert_slots,
@@ -122,14 +122,14 @@ async def test_delta_adds_to_read(engine: AsyncEngine, schema: str, tables: Tabl
 async def test_each_delta_field_round_trip(
     engine: AsyncEngine, schema: str, tables: Tables, *, name: str
 ) -> None:
-    # insert_delta -> read_counters -> fold_deltas -> слот: поле не теряется ни на одном шаге.
+    # insert_delta -> read_counters -> fold_delta_ids -> слот: поле не теряется ни на одном шаге.
     delta = CounterDelta(**{name: 7})
     async with schema_transaction(engine, schema) as conn:
-        await insert_delta(conn, tables, {A: delta}, created_at=func.now())
+        ids = (await insert_delta(conn, tables, {A: delta}, created_at=func.now()))[A]
     expected = CounterTotals(**delta.as_dict())
     assert await read(engine, schema, tables, A) == {A: expected}
     async with schema_transaction(engine, schema) as conn:
-        folded = await fold_deltas(conn, tables, [A])
+        folded = await fold_delta_ids(conn, tables, ids)
         assert folded == {A: delta}
         await upsert_slots(conn, tables, {(A, 1): folded[A]})
     assert await read(engine, schema, tables, A) == {A: expected}
@@ -142,13 +142,14 @@ async def test_all_delta_fields_at_once(engine: AsyncEngine, schema: str, tables
     delta = CounterDelta(**{name: n for n, name in enumerate(COUNTER_FIELDS, start=1)})
     async with schema_transaction(engine, schema) as conn:
         await upsert_slots(conn, tables, {(A, 0): delta})
-        await insert_delta(conn, tables, {A: delta, B: -delta}, created_at=func.now())
+        inserted = await insert_delta(conn, tables, {A: delta, B: -delta}, created_at=func.now())
     assert await read(engine, schema, tables, A, B) == {
         A: CounterTotals(**(delta + delta).as_dict()),
         B: CounterTotals(**(-delta).as_dict()),
     }
     async with schema_transaction(engine, schema) as conn:
-        assert await fold_deltas(conn, tables, [A, B]) == {A: delta, B: -delta}
+        ids = [*inserted[A], *inserted[B]]
+        assert await fold_delta_ids(conn, tables, ids) == {A: delta, B: -delta}
 
 
 async def test_upsert_locks_slots_in_key_order(
