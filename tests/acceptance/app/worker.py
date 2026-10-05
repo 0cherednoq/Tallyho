@@ -107,6 +107,7 @@ def main() -> None:
         permanent_rate=values.permanent_rate,
         worker_count=values.workers,
         tuning=tuning_from(values),
+        worker=True,
     )
     _serve(app, drain_timeout=float(values.drain_timeout), ready=values.ready)
 

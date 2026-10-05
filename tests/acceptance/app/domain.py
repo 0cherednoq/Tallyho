@@ -13,11 +13,13 @@ from sqlalchemy import (
     Integer,
     LargeBinary,
     MetaData,
+    PrimaryKeyConstraint,
     String,
     Table,
     UniqueConstraint,
     Uuid,
     func,
+    text,
 )
 
 if TYPE_CHECKING:
@@ -40,6 +42,12 @@ __all__ = [
     "metadata",
     "pdf_files",
     "task_log",
+    "uc_delivery",
+    "uc_effects",
+    "uc_events",
+    "uc_flags",
+    "uc_plan",
+    "uc_runs",
 ]
 
 metadata = MetaData()
@@ -146,7 +154,80 @@ hook_log = Table(
     Column("progress_found", BigInteger, nullable=False),
     Column("txid", BigInteger, nullable=False),
     Column("at", DateTime(timezone=True), nullable=False, server_default=func.now()),
+    # Какой процесс выполнил хук: A-UC-17 проверяет, что финализировал maintenance.
+    Column(
+        "app_name",
+        String,
+        nullable=False,
+        server_default=text("current_setting('application_name')"),
+    ),
     UniqueConstraint("batch_id", "hook", "seq", name="uq_hook_log_event"),
+)
+
+# ---------------------------------------------------------------- сценарии A-UC (§7)
+
+uc_runs = Table(
+    "uc_runs",
+    metadata,
+    Column("id", Integer, primary_key=True),
+    Column("kind", String, nullable=False),
+    Column("status", String, nullable=False, server_default="running"),
+    Column("batch_status", String, nullable=False, server_default="running"),
+    Column("batch_id", Uuid()),
+    Column("progress_done", Integer, nullable=False, server_default="0"),
+    Column("progress_found", Integer, nullable=False, server_default="0"),
+    Column("progress_ratio", Integer, nullable=False, server_default="0"),
+    Column("snapshots_with_eta", Integer, nullable=False, server_default="0"),
+    Column("policy_breaches", Integer, nullable=False, server_default="0"),
+    Column("pause_reason", String),
+    Column("outcome", String),
+)
+
+uc_plan = Table(
+    "uc_plan",
+    metadata,
+    Column("run_id", Integer, nullable=False),
+    Column("n", Integer, nullable=False),
+    Column("mode", String, nullable=False),
+    PrimaryKeyConstraint("run_id", "n", name="pk_uc_plan"),
+)
+
+uc_effects = Table(
+    "uc_effects",
+    metadata,
+    Column("item_id", Uuid(), primary_key=True),
+    Column("run_id", Integer, nullable=False),
+    Column("n", Integer, nullable=False),
+    Column("task", String, nullable=False),
+    Column("started_at", DateTime(timezone=True), nullable=False),
+    Column("at", DateTime(timezone=True), nullable=False, server_default=func.now()),
+)
+
+uc_events = Table(
+    "uc_events",
+    metadata,
+    Column("id", BigInteger, primary_key=True, autoincrement=True),
+    Column("run_id", Integer, nullable=False),
+    Column("event", String, nullable=False),
+    Column("detail", String, nullable=False, server_default=""),
+    Column("at", DateTime(timezone=True), nullable=False, server_default=func.clock_timestamp()),
+)
+
+uc_delivery = Table(
+    "uc_delivery",
+    metadata,
+    Column("run_id", Integer, nullable=False),
+    Column("email", String, nullable=False),
+    Column("status", String, nullable=False, server_default="pending"),
+    Column("reason", String),
+    PrimaryKeyConstraint("run_id", "email", name="pk_uc_delivery"),
+)
+
+uc_flags = Table(
+    "uc_flags",
+    metadata,
+    Column("name", String, primary_key=True),
+    Column("value", Integer, nullable=False),
 )
 
 
@@ -165,6 +246,12 @@ class DomainTables:
     pdf_files: DomainTable
     task_log: DomainTable
     hook_log: DomainTable
+    uc_runs: DomainTable
+    uc_plan: DomainTable
+    uc_effects: DomainTable
+    uc_events: DomainTable
+    uc_delivery: DomainTable
+    uc_flags: DomainTable
 
 
 def build_domain(schema: str) -> DomainTables:
@@ -185,4 +272,10 @@ def build_domain(schema: str) -> DomainTables:
         pdf_files=by_name[pdf_files.name],
         task_log=by_name[task_log.name],
         hook_log=by_name[hook_log.name],
+        uc_runs=by_name[uc_runs.name],
+        uc_plan=by_name[uc_plan.name],
+        uc_effects=by_name[uc_effects.name],
+        uc_events=by_name[uc_events.name],
+        uc_delivery=by_name[uc_delivery.name],
+        uc_flags=by_name[uc_flags.name],
     )

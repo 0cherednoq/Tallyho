@@ -25,6 +25,7 @@ from tests.acceptance.app.common import (
     network,
 )
 from tests.acceptance.app.domain import build_domain
+from tests.acceptance.app.usecases import HookMissingPrinter, register_usecases
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Sequence
@@ -35,6 +36,7 @@ if TYPE_CHECKING:
     from tallyho.model.policy import PolicyBreach
     from tallyho.model.views import BatchSummary
     from tests.acceptance.app.domain import DomainTable, DomainTables
+    from tests.acceptance.app.usecases import UcTasks
 
 __all__ = [
     "AUDIENCE_ID_SPAN",
@@ -92,7 +94,7 @@ class AcceptanceTasks:
     """Registered task functions shared by producer and subprocess workers."""
 
     render_invoice: Callable[[int], Awaitable[None]]
-    expand_audience: Callable[[int, int], Awaitable[None]]
+    expand_audience: Callable[[int, int, int], Awaitable[None]]
     send_email: Callable[[int, int], Awaitable[None]]
     parse_page: Callable[[int, int], Awaitable[None]]
     parse_card: Callable[[int, str], Awaitable[None]]
@@ -116,6 +118,7 @@ class AcceptanceApp:
     seed: int
     site_url: str
     mail_url: str
+    uc: UcTasks
 
     async def migrate(self) -> None:
         """Create domain and tallyho tables; FlexIQ initializes its own schema."""
@@ -161,8 +164,19 @@ class AcceptanceApp:
             )
         return batch.handle.id
 
-    async def start_s2(self, campaign_id: int, addresses: Sequence[str]) -> UUID:
-        """Create the unknown-size expand -> send campaign."""
+    async def start_s2(
+        self,
+        campaign_id: int,
+        addresses: Sequence[str],
+        *,
+        expected_total: int | None = None,
+        page: int = PAGE,
+    ) -> UUID:
+        """Create the unknown-size expand -> send campaign.
+
+        ``expected_total`` is the audience size announced to the ``send`` stage (A-UC-02);
+        ``page`` is how many contacts one ``expand_audience`` Item reads.
+        """
         engine = self.engine.execution_options(schema_translate_map={None: self.tallyho_schema})
         campaigns = self.domain.campaigns
         audience = self.domain.audience
@@ -183,10 +197,10 @@ class AcceptanceApp:
                 S2_KIND, key=f"campaign:{campaign_id}", session=session
             ) as root:
                 expand = root.sub_batch("expand")
-                _ = root.sub_batch("send", fed_by=[expand])
+                _ = root.sub_batch("send", fed_by=[expand], expected_total=expected_total)
                 await expand.add_calls(
                     [
-                        self.th.call(self.tasks.expand_audience, campaign_id, 0).opts(
+                        self.th.call(self.tasks.expand_audience, campaign_id, 0, page).opts(
                             key="page:0", max_retries=3
                         )
                     ]
@@ -248,8 +262,13 @@ def build_app(  # ruff: ignore[complex-structure, too-many-statements, too-many-
     permanent_rate: float = 0.01,
     worker_count: int = 4,
     tuning: StandTuning | None = None,
+    worker: bool = False,
 ) -> AcceptanceApp:
-    """Build one producer/worker process with identical task registrations."""
+    """Build one producer/worker process with identical task registrations.
+
+    ``worker=True`` marks a FlexIQ worker process: it does not register the hooks of
+    ``UC_NOHOOK_KIND``, so those batches are finalized by maintenance (A-UC-17).
+    """
     knobs = tuning or StandTuning()
     engine = (
         create_async_engine(dsn)
@@ -292,6 +311,7 @@ def build_app(  # ruff: ignore[complex-structure, too-many-statements, too-many-
         heartbeat_every=knobs.heartbeat_every,
         snapshot_tick=timedelta(milliseconds=50),
         watch_throttle=timedelta(milliseconds=10),
+        observer=HookMissingPrinter(),
     )
     th.install(adapter)
     faults = FaultPlan(seed, transient_rate, permanent_rate)
@@ -360,7 +380,7 @@ def build_app(  # ruff: ignore[complex-structure, too-many-statements, too-many-
         retry_on=[TransientError],
         dont_retry_on=[PermanentError],
     )
-    async def expand_audience(campaign_id: int, after_id: int) -> None:
+    async def expand_audience(campaign_id: int, after_id: int, page: int = PAGE) -> None:
         item_id = await prepare("expand_audience")
         async with domain_engine.connect() as connection:
             rows = (
@@ -368,7 +388,7 @@ def build_app(  # ruff: ignore[complex-structure, too-many-statements, too-many-
                     select(audience.c.id, audience.c.email)
                     .where(audience.c.campaign_id == campaign_id, audience.c.id > after_id)
                     .order_by(audience.c.id)
-                    .limit(PAGE)
+                    .limit(page)
                 )
             ).all()
         for raw_contact_id, raw_address in rows:
@@ -380,9 +400,9 @@ def build_app(  # ruff: ignore[complex-structure, too-many-statements, too-many-
                 ),
                 into="send",
             )
-        if len(rows) == PAGE:
+        if len(rows) == page:
             item.spawn_call(
-                th.call(expand_audience, campaign_id, rows[-1].id).opts(
+                th.call(expand_audience, campaign_id, rows[-1].id, page).opts(
                     key=f"page:{rows[-1].id}", max_retries=3
                 )
             )
@@ -630,6 +650,16 @@ def build_app(  # ruff: ignore[complex-structure, too-many-statements, too-many-
     register_hooks(S1_KIND, invoices)
     register_hooks(S2_KIND, campaigns)
     register_hooks(S3_KIND, catalog_runs)
+    uc = register_usecases(
+        th,
+        adapter,
+        engine=domain_engine,
+        domain=domain,
+        seed=seed,
+        network_scale=network_scale,
+        job_timeout=job_timeout,
+        worker=worker,
+    )
     tasks = AcceptanceTasks(
         render_invoice=render_invoice,
         expand_audience=expand_audience,
@@ -652,4 +682,5 @@ def build_app(  # ruff: ignore[complex-structure, too-many-statements, too-many-
         seed=seed,
         site_url=site_url,
         mail_url=mail_url,
+        uc=uc,
     )

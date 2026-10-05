@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import TYPE_CHECKING, cast
@@ -19,6 +20,7 @@ if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncConnection
 
     from tallyho.model.views import BatchView
+    from tallyho.storage.counters import CounterTotals
     from tallyho.storage.tables import Tables
     from tests.acceptance.app.domain import DomainTable, DomainTables
     from tests.acceptance.app.site import CatalogTruth
@@ -152,6 +154,10 @@ async def _domain_effects(
         ("send_email", domain.deliveries),
         ("parse_card", domain.cards),
         ("download_pdf", domain.pdf_files),
+        ("uc_work", domain.uc_effects),
+        ("uc_nest", domain.uc_effects),
+        ("uc_crawl", domain.uc_effects),
+        ("uc_probe", domain.uc_effects),
     ):
         values = list(await connection.scalars(select(table.c.item_id)))
         effects[task_name] = {cast("UUID", value) for value in values}
@@ -240,7 +246,83 @@ async def check_i05_counter_truth(connection: AsyncConnection, tables: Tables) -
         checked += 1
         if metric != int(count):
             evidence.append(f"{batch_id}:{label}:metric={metric}:items={count}")
+    class_reports = await _label_class_mismatches(connection, tables, counters)
+    checked += len(batch_ids)
+    evidence.extend(class_reports)
     return _report("I-05", checked, evidence)
+
+
+_CLASS_OF_STATE = {
+    int(ItemState.OK): "ok",
+    int(ItemState.SKIP): "skip",
+    int(ItemState.ERROR): "error",
+    int(ItemState.CANCELLED): "cancelled",
+}
+
+
+async def _label_class_mismatches(
+    connection: AsyncConnection, tables: Tables, counters: Mapping[UUID, CounterTotals]
+) -> list[str]:
+    """Сумма меток каждого класса итога равна счётчику класса батча (Fix-22).
+
+    Метка относится к классу по Items, которые её несут; значение метки берётся из
+    ``th_metric``, а не из ``th_item``, поэтому проверка ловит метку, которую путь
+    завершения не досчитал. Items без метки (``label IS NULL``) добавляются к своему классу
+    по числу строк. Метка, встречающаяся в нескольких классах, делится по числу Items.
+    """
+    item = tables.item
+    rows = (
+        await connection.execute(
+            select(item.c.batch_id, item.c.state, item.c.label, func.count())
+            .where(item.c.state >= TERMINAL_THRESHOLD)
+            .group_by(item.c.batch_id, item.c.state, item.c.label)
+        )
+    ).all()
+    metric = tables.metric
+    metric_rows = (
+        await connection.execute(
+            select(metric.c.batch_id, metric.c.name, func.sum(metric.c.value)).group_by(
+                metric.c.batch_id, metric.c.name
+            )
+        )
+    ).all()
+    metrics = {(batch, str(name)): int(value) for batch, name, value in metric_rows}
+    classes_of: dict[tuple[UUID, str], dict[str, int]] = {}
+    sums: dict[UUID, dict[str, int]] = {}
+    for batch_id, state, raw_label, count in rows:
+        name = _CLASS_OF_STATE.get(int(state))
+        label = cast("str | None", raw_label)
+        if name is None:
+            continue
+        per_class = sums.setdefault(batch_id, dict.fromkeys(_CLASS_OF_STATE.values(), 0))
+        if label is None:
+            per_class[name] += int(count)
+            continue
+        by_class = classes_of.setdefault((batch_id, label), {})
+        by_class[name] = by_class.get(name, 0) + int(count)
+    for (batch_id, label), by_class in classes_of.items():
+        per_class = sums[batch_id]
+        value = metrics.get((batch_id, label), 0)
+        if len(by_class) == 1:
+            per_class[next(iter(by_class))] += value
+        else:
+            per_class.update({name: per_class[name] + count for name, count in by_class.items()})
+    evidence: list[str] = []
+    for batch_id, per_class in sums.items():
+        seen = counters.get(batch_id)
+        expected = (
+            dict.fromkeys(per_class, 0)
+            if seen is None
+            else {
+                "ok": seen.ok,
+                "skip": seen.skip,
+                "error": seen.error,
+                "cancelled": seen.cancelled,
+            }
+        )
+        if per_class != expected:
+            evidence.append(f"{batch_id}:label-classes={per_class}:counters={expected}")
+    return evidence
 
 
 async def check_i06_domain_matches_tallyho(
@@ -326,9 +408,13 @@ async def check_i08_monotonic_snapshots(
     else:
         statement = statement.order_by(hook.c.batch_id, hook.c.at, hook.c.txid)
     rows = (await connection.execute(statement)).all()
+    # retry_failed переоткрывает батч (I-03 допускает лишний on_finalized): снимки между
+    # финализациями законны, а done после повтора начинается заново - ошибки вернулись в
+    # active. Запрещён снимок после ПОСЛЕДНЕЙ финализации; seq растёт через все эпохи.
+    finals_total = Counter(cast("UUID", row[0]) for row in rows if row[1] == "on_finalized")
     evidence: list[str] = []
     previous: dict[UUID, tuple[int, int, int]] = {}
-    finalized: set[UUID] = set()
+    finals_seen: Counter[UUID] = Counter()
     for raw_batch_id, name, raw_seq, raw_done, raw_found, _at, _txid in rows:
         batch_id = cast("UUID", raw_batch_id)
         seq = int(cast("int", raw_seq))
@@ -336,13 +422,16 @@ async def check_i08_monotonic_snapshots(
         found = int(cast("int", raw_found))
         if name == "on_progress":
             old = previous.get(batch_id)
-            if batch_id in finalized:
+            if finals_seen[batch_id] and finals_seen[batch_id] == finals_total[batch_id]:
                 evidence.append(f"{batch_id}:progress-after-finalized")
             if old is not None and (seq <= old[0] or done < old[1] or found < old[2]):
                 evidence.append(f"{batch_id}:non-monotonic={old}->{(seq, done, found)}")
             previous[batch_id] = (seq, done, found)
         elif name == "on_finalized":
-            finalized.add(batch_id)
+            finals_seen[batch_id] += 1
+            old = previous.get(batch_id)
+            if old is not None:
+                previous[batch_id] = (max(old[0], seq), 0, 0)
     return _report("I-08", len(rows), evidence)
 
 

@@ -33,7 +33,7 @@ if TYPE_CHECKING:
     from tests.acceptance.chaos.verdict import Expectation, Recovery
     from tests.acceptance.oracle import InvariantReport
 
-__all__ = ["ARTIFACTS", "RunConfig", "RunReport", "run_chaos"]
+__all__ = ["ARTIFACTS", "RunConfig", "RunReport", "host_app", "run_chaos"]
 
 ARTIFACTS = ROOT / ".work-tmp" / "acceptance"
 
@@ -148,7 +148,7 @@ def _settings(config: RunConfig) -> StandSettings:
     )
 
 
-def _host_app(stand: Stand) -> AcceptanceApp:
+def host_app(stand: Stand) -> AcceptanceApp:
     """Процесс нагрузки на хосте: тот же граф задач, PostgreSQL через прокси control."""
     settings = stand.settings
     return build_app(
@@ -206,7 +206,7 @@ async def _execute(run: _Run) -> RunReport:
     config, stand, journal = run.config, run.stand, run.journal
     profile = plan_load(config.scenario, config.seed, config.duration, settings=stand.settings)
     generated = CatalogGenerator.build(config.seed, page_count=stand.settings.pages)
-    app = _host_app(stand)
+    app = host_app(stand)
     try:
         skew = await _clock_skew(stand)
         journal.record("stand_ready", project=stand.project, load=asdict(profile), clock_skew=skew)
@@ -217,7 +217,9 @@ async def _execute(run: _Run) -> RunReport:
         recovery = await wait_recovery(stand, driver, journal, hard_cap=hard_cap)
         # После отказов PostgreSQL в пуле хоста остаются мёртвые соединения.
         await app.engine.dispose()
-        invariants, stats = await run_oracle(OracleInput(stand, app, driver, generated, journal))
+        invariants, stats = await run_oracle(
+            OracleInput(stand, app, driver.roots, generated, journal)
+        )
         facts = Facts(
             restarts=await stand.restart_counts(),
             running={service: await stand.is_running(service) for service in PROCESSES},

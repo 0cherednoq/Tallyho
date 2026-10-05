@@ -173,6 +173,19 @@ async def test_oracle_is_green_then_each_invariant_detects_corruption(  # ruff: 
         _assert_detects(await check_i05_counter_truth(connection, tables))
         await savepoint.rollback()
 
+        # Сумма меток класса = счётчику класса (Fix-22): метка, которую путь завершения
+        # не досчитал в th_metric, расходится со счётчиком ok.
+        savepoint = await connection.begin_nested()
+        _ = await connection.execute(
+            delete(tables.metric).where(
+                tables.metric.c.batch_id == s1_id, tables.metric.c.name == "rendered"
+            )
+        )
+        report = await check_i05_counter_truth(connection, tables)
+        _assert_detects(report)
+        assert any("label-classes" in line for line in report.evidence), report.evidence
+        await savepoint.rollback()
+
         savepoint = await connection.begin_nested()
         _ = await connection.execute(
             update(harness.app.domain.invoices)
