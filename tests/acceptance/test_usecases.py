@@ -70,21 +70,12 @@ _SUB_BATCH_PATH_B = _Defect(
     "Fix-NEW-complete-in-sub-batch",
     "complete_in задачи с sub_batch без spawn падает KeyError: батч Item не заблокирован",
 )
-# A-UC-10: провал дерева политикой (`fail_fast`, `threshold(action="fail")`) в
-# `PolicyEnforcer._fail_tree` отменяет все active Items без lease, включая виртуальные Items
-# под-батчей (`child_batch_id IS NOT NULL`); `Operations.cancel` их исключает. Корень
-# финализируется раньше детей, этап с `fed_by` - раньше своего источника (I-09).
-_FAIL_TREE_ORDER = _Defect(
-    "Fix-NEW-fail-tree-virtual-items",
-    "провал дерева политикой отменяет виртуальные Items под-батчей: корень раньше детей",
-)
 # A-UC-19: `ProgressWatcher` читает `Reads.view` без скоростей, ETA в `watch()` всегда None,
 # хотя ARCHITECTURE §9.4 обещает её «в Snapshotter и в watch()»; в снимках on_progress ETA есть.
 _WATCH_ETA = _Defect("Fix-NEW-watch-eta", "watch() не считает ETA: скорости не передаются")
-_INVARIANT_DEFECTS: Mapping[str, _Defect] = {"A-UC-10": _FAIL_TREE_ORDER}
+_INVARIANT_DEFECTS: Mapping[str, _Defect] = {}
 _EXPECTATION_DEFECTS: Mapping[str, _Defect] = {
     "A-UC-07": _SUB_BATCH_PATH_B,
-    "A-UC-10": _FAIL_TREE_ORDER,
     "A-UC-19": _WATCH_ETA,
 }
 
