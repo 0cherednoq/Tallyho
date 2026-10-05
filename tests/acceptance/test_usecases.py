@@ -78,14 +78,10 @@ _FAIL_TREE_ORDER = _Defect(
     "Fix-NEW-fail-tree-virtual-items",
     "провал дерева политикой отменяет виртуальные Items под-батчей: корень раньше детей",
 )
-# A-UC-19: `ProgressWatcher` читает `Reads.view` без скоростей, ETA в `watch()` всегда None,
-# хотя ARCHITECTURE §9.4 обещает её «в Snapshotter и в watch()»; в снимках on_progress ETA есть.
-_WATCH_ETA = _Defect("Fix-NEW-watch-eta", "watch() не считает ETA: скорости не передаются")
 _INVARIANT_DEFECTS: Mapping[str, _Defect] = {"A-UC-10": _FAIL_TREE_ORDER}
 _EXPECTATION_DEFECTS: Mapping[str, _Defect] = {
     "A-UC-07": _SUB_BATCH_PATH_B,
     "A-UC-10": _FAIL_TREE_ORDER,
-    "A-UC-19": _WATCH_ETA,
 }
 
 

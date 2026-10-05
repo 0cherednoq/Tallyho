@@ -16,6 +16,7 @@ from tallyho.model.progress import (
     DEFAULT_ETA_WINDOW,
     NodeCounters,
     ProgressSettings,
+    RateTracker,
     compute_progress,
     ema_rate,
     estimate_eta,
@@ -69,6 +70,38 @@ def test_ema_stays_between_previous_and_instant(
     instant = delta / timedelta(seconds=seconds).total_seconds()
     low, high = min(previous, instant), max(previous, instant)
     assert low - 1e-6 * max(1.0, high) <= rate <= high + 1e-6 * max(1.0, high)
+
+
+# --- RateTracker ---------------------------------------------------------------------
+
+
+def test_tracker_first_sample_has_no_rate() -> None:
+    assert RateTracker().observe({ROOT: 10}, now=5.0) == {}
+
+
+def test_tracker_rate_follows_samples_and_waits_for_time() -> None:
+    tracker = RateTracker()
+    _ = tracker.observe({ROOT: 0, PAGES: 3}, now=0.0)
+    # Без прошедшего времени замер копится: прирост учтётся следующим чтением.
+    assert tracker.observe({ROOT: 4, PAGES: 3}, now=0.0) == {}
+    rates = tracker.observe({ROOT: 10, PAGES: 3}, now=2.0)
+    assert rates == {ROOT: pytest.approx(5.0)}
+
+
+def test_tracker_forgets_batches_missing_from_sample() -> None:
+    tracker = RateTracker()
+    _ = tracker.observe({ROOT: 0}, now=0.0)
+    _ = tracker.observe({PAGES: 0}, now=1.0)
+    # ROOT пропал и вернулся: это снова первый замер, скорости нет.
+    assert tracker.observe({ROOT: 50, PAGES: 2}, now=2.0) == {PAGES: pytest.approx(2.0)}
+
+
+def test_tracker_uses_window() -> None:
+    tracker = RateTracker()
+    _ = tracker.observe({ROOT: 0}, now=0.0)
+    _ = tracker.observe({ROOT: 10}, now=1.0)
+    rates = tracker.observe({ROOT: 10}, now=2.0, window=timedelta(seconds=1))
+    assert rates == {ROOT: pytest.approx(10.0 * math.exp(-1))}
 
 
 # --- estimate_eta --------------------------------------------------------------------

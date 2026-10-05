@@ -46,6 +46,7 @@ if TYPE_CHECKING:
     from sqlalchemy.sql import ColumnElement, Select
 
     from tallyho.model.attributes import AttributeValue
+    from tallyho.model.progress import RateTracker
     from tallyho.protocols.clock import Clock
     from tallyho.storage.tables import Tables
 
@@ -175,15 +176,31 @@ class Reads:
         self.items_scan_window = items_scan_window
         self.lease_duration = lease_duration
 
-    async def view(self, batch_id: UUID) -> BatchView:
+    async def view(self, batch_id: UUID, *, rates: RateTracker | None = None) -> BatchView:
         """Read a batch subtree with one SQL statement, independent of tree size.
+
+        ``rates`` keeps the EMA of completions across reads of one stream
+        (``watch()``): this read is recorded in it at ``clock.monotonic()`` and
+        the resulting rates give ``Progress.eta``. Without it there is no ETA,
+        and no extra statement is issued either way (ARCHITECTURE §9.4).
 
         Returns:
             The requested batch and its descendants.
         """
         async with self.engine.connect() as conn:
             nodes = await self._tree(conn, batch_id)
-        progress = compute_progress((node.counters for node in nodes), settings=self.progress)
+        known = (
+            None
+            if rates is None
+            else rates.observe(
+                {node.id: node.counters.done for node in nodes},
+                now=self.clock.monotonic(),
+                window=self.progress.eta_window,
+            )
+        )
+        progress = compute_progress(
+            (node.counters for node in nodes), settings=self.progress, rates=known
+        )
         children = _children(nodes)
         roots = _roots(nodes)
 

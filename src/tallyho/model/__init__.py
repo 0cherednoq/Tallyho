@@ -38,6 +38,7 @@ from tallyho.model.policy import (
 from tallyho.model.progress import (
     NodeCounters,
     ProgressSettings,
+    RateTracker,
     compute_progress,
     ema_rate,
     estimate_eta,
@@ -96,6 +97,7 @@ __all__ = [
     "PolicyVerdict",
     "Progress",
     "ProgressSettings",
+    "RateTracker",
     "ResultClass",
     "SealError",
     "SpawnTargetError",

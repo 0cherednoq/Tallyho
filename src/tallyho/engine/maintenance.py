@@ -7,7 +7,7 @@ import contextlib
 import hashlib
 import logging
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import timedelta
 from typing import TYPE_CHECKING, Final, Protocol, cast, runtime_checkable
 
@@ -15,6 +15,7 @@ from sqlalchemy import func, literal, select
 from sqlalchemy.exc import DBAPIError
 
 from tallyho.model.errors import ConfigurationError
+from tallyho.model.progress import RateTracker
 from tallyho.protocols.clock import SystemClock
 
 if TYPE_CHECKING:
@@ -434,10 +435,13 @@ class ProgressWatcher:
         queue: asyncio.Event,
         output: asyncio.Queue[BatchView | None],
     ) -> None:
-        previous = await self.reads.view(batch_id)
-        await output.put(previous)
-        if previous.state.is_terminal:
+        # Скорость для ETA копится по чтениям этого потока: лишних запросов нет (§9.4).
+        rates = RateTracker()
+        initial = await self.reads.view(batch_id, rates=rates)
+        await output.put(initial)
+        if initial.state.is_terminal:
             return
+        seen = _without_eta(initial)
         delay = self.throttle.total_seconds()
         loop = asyncio.get_running_loop()
         last_yield = loop.time()
@@ -449,13 +453,24 @@ class ProgressWatcher:
             if remaining > 0:
                 await asyncio.sleep(remaining)
             queue.clear()
-            current = await self.reads.view(batch_id)
-            if current != previous:
+            current = await self.reads.view(batch_id, rates=rates)
+            # ETA меняется с каждым чтением, даже когда работа стоит; обновление
+            # отдаётся только при изменении остального содержимого.
+            if (stripped := _without_eta(current)) != seen:
                 await output.put(current)
-                previous = current
+                seen = stripped
                 last_yield = loop.time()
             if current.state.is_terminal:
                 return
+
+
+def _without_eta(view: BatchView) -> BatchView:
+    # Вид без ETA по всему дереву: сравнить, изменилось ли что-то, кроме ETA.
+    return replace(
+        view,
+        progress=replace(view.progress, eta=None),
+        children={key: _without_eta(child) for key, child in view.children.items()},
+    )
 
 
 class _Subscription(Protocol):

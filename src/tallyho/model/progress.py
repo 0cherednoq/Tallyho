@@ -27,6 +27,7 @@ __all__ = [
     "DEFAULT_ETA_WINDOW",
     "NodeCounters",
     "ProgressSettings",
+    "RateTracker",
     "compute_progress",
     "ema_rate",
     "estimate_eta",
@@ -120,6 +121,57 @@ def estimate_eta(*, expected: int | None, done: int, rate: float | None) -> time
     if rate is None or rate <= 0:
         return None
     return timedelta(seconds=remaining / rate)
+
+
+@dataclass(slots=True)
+class _RatePoint:
+    done: int
+    observed_at: float
+    value: float | None = None
+
+
+@dataclass(eq=False, slots=True)
+class RateTracker:
+    """Состояние EMA скорости по замерам одного потока чтений (§9.4, D-024).
+
+    Замер — ``done`` каждого батча дерева и монотонное время чтения; скорость
+    узла — :func:`ema_rate` по разнице с прошлым замером. Батчи, которых нет в
+    очередном замере, забываются. Запросов к БД нет: состояние держит вызывающий
+    (``watch()``), по одному трекеру на поток.
+    """
+
+    _points: dict[UUID, _RatePoint] = field(default_factory=dict, init=False)
+
+    def observe(
+        self,
+        done: Mapping[UUID, int],
+        *,
+        now: float,
+        window: timedelta = DEFAULT_ETA_WINDOW,
+    ) -> Mapping[UUID, float]:
+        """Учесть замер ``done`` по батчам на момент ``now`` (секунды монотонных часов).
+
+        Returns:
+            Положительные скорости (завершённых Items в секунду) по id батча.
+        """
+        points: dict[UUID, _RatePoint] = {}
+        for batch_id, value in done.items():
+            point = self._points.get(batch_id)
+            if point is None:
+                point = _RatePoint(value, now)
+            elif now > point.observed_at:
+                # Без прошедшего времени замер копится до следующего чтения.
+                point.value = ema_rate(
+                    point.value,
+                    done_delta=value - point.done,
+                    elapsed=timedelta(seconds=now - point.observed_at),
+                    window=window,
+                )
+                point.done = value
+                point.observed_at = now
+            points[batch_id] = point
+        self._points = points
+        return {batch_id: point.value for batch_id, point in points.items() if point.value}
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)

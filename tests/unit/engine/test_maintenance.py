@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import timedelta
 from typing import TYPE_CHECKING, Final, cast
 from uuid import uuid4
@@ -25,6 +25,7 @@ if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncEngine
 
     from tallyho.engine.reads import Reads
+    from tallyho.model.progress import RateTracker
 
 __all__: list[str] = []
 
@@ -183,7 +184,9 @@ class SequenceReads:
         self.values = values
         self.index = 0
 
-    async def view(self, _batch_id: UUID) -> BatchView:
+    async def view(self, _batch_id: UUID, *, rates: RateTracker | None = None) -> BatchView:
+        # watch() ведёт скорость по своему потоку: трекер передаётся в каждое чтение.
+        assert rates is not None
         value = self.values[min(self.index, len(self.values) - 1)]
         self.index += 1
         return value
@@ -245,6 +248,27 @@ async def test_watch_skips_unchanged_poll_and_finishes_without_notification() ->
         SequenceReads([opened, opened, view(batch_id, BatchState.SUCCEEDED)]),
     )
 
+    assert [item.state async for item in subject.watch(batch_id)] == [
+        BatchState.OPEN,
+        BatchState.SUCCEEDED,
+    ]
+
+
+async def test_watch_does_not_emit_eta_only_changes() -> None:
+    batch_id = uuid4()
+    child = view(uuid4(), BatchState.OPEN)
+    opened = replace(view(batch_id, BatchState.OPEN), children={"stage": child})
+    drifted = replace(
+        opened,
+        progress=replace(opened.progress, eta=timedelta(seconds=5)),
+        children={"stage": replace(child, progress=Progress(eta=timedelta(seconds=7)))},
+    )
+    subject = watcher(
+        Engine(PsycopgDriver([])),
+        SequenceReads([opened, drifted, view(batch_id, BatchState.SUCCEEDED)]),
+    )
+
+    # ETA при простое растёт с каждым чтением; без других изменений это не обновление.
     assert [item.state async for item in subject.watch(batch_id)] == [
         BatchState.OPEN,
         BatchState.SUCCEEDED,
