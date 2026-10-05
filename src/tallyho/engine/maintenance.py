@@ -333,11 +333,20 @@ class ProgressNotifier:
         Final notifications bypass the time gate once, ensuring a terminal state
         is never hidden behind a recently published intermediate update.
 
+        Nothing eligible (every id is inside its throttle window) opens no
+        transaction: the Completer calls this after every group commit, and an
+        empty ``BEGIN``/``COMMIT`` round trip per flush is pure overhead (T11.6).
+
         Returns:
             Number of notifications queued for commit.
         """
+        async with self._guard:
+            due = self._due(batch_ids, final=final)
+        if not due:
+            return 0
         async with self.engine.begin() as conn:
-            return await self.notify_in(conn, batch_ids, final=final)
+            await _publish(conn, due)
+        return len(due)
 
     async def notify_in(
         self,
@@ -352,21 +361,34 @@ class ProgressNotifier:
             Number of notifications queued for commit.
         """
         async with self._guard:
-            now = self.clock.monotonic()
-            due: list[UUID] = []
-            threshold = self.throttle.total_seconds()
-            for batch_id in sorted(set(batch_ids)):
-                if batch_id in self._final:
-                    continue
-                last = self._sent_at.get(batch_id)
-                if final or last is None or now - last >= threshold:
-                    due.append(batch_id)
-                    self._sent_at[batch_id] = now
-                    if final:
-                        self._final.add(batch_id)
-            for batch_id in due:
-                _ = await conn.scalar(select(func.pg_notify(_CHANNEL, str(batch_id))))
+            due = self._due(batch_ids, final=final)
+            await _publish(conn, due)
             return len(due)
+
+    def _due(self, batch_ids: Iterable[UUID], *, final: bool) -> list[UUID]:
+        """Pick ids outside their throttle window and mark them as sent.
+
+        Returns:
+            Ids to publish, sorted.
+        """
+        now = self.clock.monotonic()
+        due: list[UUID] = []
+        threshold = self.throttle.total_seconds()
+        for batch_id in sorted(set(batch_ids)):
+            if batch_id in self._final:
+                continue
+            last = self._sent_at.get(batch_id)
+            if final or last is None or now - last >= threshold:
+                due.append(batch_id)
+                self._sent_at[batch_id] = now
+                if final:
+                    self._final.add(batch_id)
+        return due
+
+
+async def _publish(conn: AsyncConnection, batch_ids: list[UUID]) -> None:
+    for batch_id in batch_ids:
+        _ = await conn.scalar(select(func.pg_notify(_CHANNEL, str(batch_id))))
 
 
 @dataclass(eq=False, kw_only=True)

@@ -163,9 +163,11 @@ class Connection:
 
 class Engine:
     connection: Connection
+    begins: int
 
     def __init__(self, driver: object) -> None:
         self.connection = Connection(driver)
+        self.begins = 0
 
     @contextlib.asynccontextmanager
     async def connect(self) -> AsyncGenerator[Connection]:
@@ -173,6 +175,7 @@ class Engine:
 
     @contextlib.asynccontextmanager
     async def begin(self) -> AsyncGenerator[Connection]:
+        self.begins += 1
         yield self.connection
 
 
@@ -302,6 +305,28 @@ async def test_notifier_throttles_reopens_and_sends_final_once() -> None:
     assert await subject.notify([first], final=True) == 1
     assert await subject.notify([first], final=True) == 0
     assert len(engine.connection.notifications) == 4
+
+
+async def test_notifier_opens_no_transaction_when_everything_is_throttled() -> None:
+    # Completer зовёт notify после каждой групповой транзакции: пустой BEGIN/COMMIT
+    # на каждый flush — лишний round-trip (T11.6, Perf-1).
+    clock = ManualClock()
+    engine = Engine(object())
+    subject = ProgressNotifier(
+        engine=cast("AsyncEngine", cast("object", engine)),
+        throttle=timedelta(seconds=1),
+        clock=clock,
+    )
+    batch_id = uuid4()
+
+    assert await subject.notify([batch_id]) == 1
+    assert engine.begins == 1
+    assert await subject.notify([batch_id]) == 0
+    assert await subject.notify([]) == 0
+    assert engine.begins == 1
+    clock.value = 1.0
+    assert await subject.notify([batch_id]) == 1
+    assert engine.begins == 2
 
 
 @pytest.mark.parametrize("kind", ["notifier", "watcher"])
