@@ -136,6 +136,11 @@ acceptance-uc = { cmd = "pytest tests/acceptance/test_usecases.py -m usecase -n 
   { name = "THREADS", options = ["--threads"], default = "32", help = "async_concurrency одного воркера стенда" },
   { name = "JOBS", options = ["--jobs"], default = "0", help = "Сколько стендов гонять параллельно (pytest-xdist)" },
 ] }
+bench = { cmd = "python -m benchmarks --id ${ID} --profile ${PROFILE} --seed ${SEED}", help = "Бенчмарки A-PERF P-01…P-11 (ACCEPTANCE §9): отчёт в .work-tmp/bench/<id>-<profile>/ (нужен Docker или TALLYHO_BENCH_DSN)", args = [
+  { name = "ID", options = ["--id"], default = "all", help = "P-01[,P-04,...] или all" },
+  { name = "PROFILE", options = ["--profile"], default = "smoke", help = "smoke — минуты локально; nightly — ACCEPTANCE §11; full — §9 на эталонном стенде" },
+  { name = "SEED", options = ["--seed"], default = "1", help = "Seed нагрузки" },
+] }
 mutation-cas ={ shell = "mutmut run --max-children 4 '*Tx*claim*' '*Tx*finish*' '*Finalizer*_cas*' '*Snapshotter*_attempt*' '*Operations*_retry_items*' && ! mutmut results | grep -Eq ': (survived|suspicious|no tests)'", help = "Mutation gate for critical CAS functions (Linux/WSL only)" }
 check = { sequence = ["lint", "types", "imports", "deps", "test"], help = "Everything CI runs, except integration" }
 check-all = { sequence = ["lint", "types", "imports", "deps", "test-all"], help = "Всё, включая PostgreSQL и покрытие ≥ 95%" }
@@ -146,7 +151,7 @@ check-all = { sequence = ["lint", "types", "imports", "deps", "test-all"], help 
 [tool.ruff]
 target-version = "py311"
 line-length = 100
-src = ["src", "tests"]
+src = ["src", "tests", "benchmarks"]
 extend-exclude = ["docs"]
 
 [tool.ruff.format]
@@ -234,7 +239,7 @@ parametrize-names-type = "tuple"
 extend-immutable-calls = []
 
 [tool.ruff.lint.isort]
-known-first-party = ["tallyho", "tests"]
+known-first-party = ["tallyho", "tests", "benchmarks"]
 required-imports = ["from __future__ import annotations"]
 force-sort-within-sections = false
 split-on-trailing-comma = true
@@ -257,7 +262,7 @@ max-locals = 15
 # -----------------------------------------------------------------------------
 [tool.mypy]
 python_version = "3.11"
-files = ["src", "tests"]
+files = ["src", "tests", "benchmarks"]
 mypy_path = ["src", "."]
 explicit_package_bases = true
 strict = true
@@ -304,7 +309,7 @@ disallow_any_decorated = false
 # -----------------------------------------------------------------------------
 [tool.basedpyright]
 pythonVersion = "3.11"
-include = ["src", "tests"]
+include = ["src", "tests", "benchmarks"]
 typeCheckingMode = "all"
 failOnWarnings = true
 enableTypeIgnoreComments = false   # подавление — только `# pyright: ignore[rule]`
