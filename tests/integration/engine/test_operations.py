@@ -19,6 +19,7 @@ from tallyho.model.errors import DownstreamFinalized, InvalidStateError, NotFoun
 from tallyho.model.states import BatchState, ItemState
 from tallyho.protocols.clock import SystemClock
 from tallyho.storage.counters import CounterDelta, read_counters, upsert_metrics, upsert_slots
+from tests.helpers.after_commit import pause_commit_polling
 from tests.helpers.probe import create_probe, insert_id
 from tests.integration.engine.completer_env import WORKER, RecordingProgress, schema_engine
 
@@ -770,6 +771,26 @@ async def test_shut_operations_start_no_post_commit_tasks(env: Env) -> None:
     assert finalizer.tried == []
     assert progress.calls == []
     assert [task for task in asyncio.all_tasks() if "operation" in task.get_name()] == []
+
+
+async def test_close_right_after_commit_still_finalizes(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pause_commit_polling(monkeypatch)
+    root_id, child_id = await tree(env)
+    relay = _RelaySpy()
+    finalizer = _FinalizerSpy()
+    subject = Operations(
+        tables=env.tables,
+        clock=SystemClock(),
+        triggers=OperationTriggers(relay=relay, finalizer=finalizer),
+    )
+    async with env.transaction() as conn:
+        await subject.retry_finalize(conn, root_id)
+    # Опрос COMMIT в паузе: колбэк ещё не доставлен, когда установку закрывают.
+    await subject.close()
+
+    assert set(finalizer.tried) == {root_id, child_id}
 
 
 async def test_failed_post_commit_finalize_is_logged_and_does_not_stop_the_rest(

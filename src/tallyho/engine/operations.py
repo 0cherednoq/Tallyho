@@ -25,7 +25,7 @@ from tallyho.model.errors import DownstreamFinalized, InvalidStateError, NotFoun
 from tallyho.model.states import TERMINAL_THRESHOLD, BatchState, CancelReason, ItemState, OutboxKind
 from tallyho.storage.counters import CounterDelta, insert_delta, upsert_metrics
 from tallyho.storage.now import sql_now
-from tallyho.storage.tx import after_commit, resolve_connection
+from tallyho.storage.tx import after_commit, deliver_committed, resolve_connection
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Sequence
@@ -123,6 +123,9 @@ class Operations:
         Returns:
             Ещё не завершённые задачи: их дожидается тот, кто закрывает установку.
         """
+        # Как в Completer.close: колбэки уже закоммиченных операций доставляются
+        # до флага закрытия, иначе их финализацию молча оставили бы sweeper-у.
+        deliver_committed()
         self._closed = True
         return tuple(self._background)
 
