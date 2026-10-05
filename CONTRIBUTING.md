@@ -20,6 +20,7 @@ uv run pre-commit install
 | `test-all` | всё, включая PostgreSQL (Docker или `TALLYHO_TEST_DSN`) |
 | `check` | `lint` → `types` → `imports` → `deps` → `test` |
 | `check-all` | то же, но с `test-all`: PostgreSQL и покрытие ≥ 95% |
+| `bench` | бенчмарки A-PERF: `--id P-01[,P-04,...]` или `all`, `--profile smoke\|nightly\|full`; отчёт в `.work-tmp/bench/` ([docs/benchmarks](docs/benchmarks/README.md)) |
 
 ## Что проверяется и где
 
@@ -56,7 +57,8 @@ uv run pre-commit install
   переменные репозитория `FLEXIQ_GIT_URL` / `FLEXIQ_GIT_REF`, по умолчанию
   `https://github.com/ByteVeda/flexiq` @ `master`, Python SDK в `sdks/python`;
 * мутационный gate `poe mutation-cas`;
-* P-01 и P-04 — `poe bench --id P-NN --profile nightly`, если задача `bench` уже есть (T11.5).
+* P-01 и P-04 — `poe bench --id P-NN --profile nightly` (см. [docs/benchmarks](docs/benchmarks/README.md)),
+  отчёт `.work-tmp/bench/` — артефакт запуска.
 
 Seed nightly по умолчанию — дата запуска `YYYYMMDD`; он и команда воспроизведения печатаются
 в лог и в сводку запуска. `.work-tmp/acceptance/**` (журнал хаоса, `oracle.json`,
@@ -76,6 +78,7 @@ src/tallyho/
   adapters/    адаптеры брокеров (flexiq)
   testing/     InlineBroker, FakeClock — для тестов пользователей
   cli/         командная строка
+benchmarks/      харнесс A-PERF P-01…P-11 (`poe bench`, docs/benchmarks)
 tests/
   unit/          быстрые тесты без БД
   architecture/  AST-проверки соглашений
