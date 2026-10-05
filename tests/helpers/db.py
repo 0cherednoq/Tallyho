@@ -28,6 +28,7 @@ __all__ = [
     "DbError",
     "LockRow",
     "backend_pid",
+    "blocked_by",
     "deadlock_count",
     "deadlocks",
     "held_locks",
@@ -155,6 +156,11 @@ _BLOCKED_SQL = text("""
 """)
 
 
+async def blocked_by(conn: AsyncConnection, pid: int) -> int:
+    """Сколько ожидающих блокировок стоит в очереди за backend'ом ``pid`` прямо сейчас."""
+    return int(await conn.scalar(_BLOCKED_SQL, {"pid": pid}) or 0)
+
+
 async def wait_blocked_by(conn: AsyncConnection, pid: int, *, attempts: int = 1000) -> None:
     """Дождаться, пока какой-нибудь backend встанет в очередь за блокировкой ``pid``.
 
@@ -163,7 +169,7 @@ async def wait_blocked_by(conn: AsyncConnection, pid: int, *, attempts: int = 10
     в 10 мс, не дольше ``attempts`` раз.
     """
     for _ in range(attempts):
-        if await conn.scalar(_BLOCKED_SQL, {"pid": pid}):
+        if await blocked_by(conn, pid):
             return
         await asyncio.sleep(0.01)
     message = f"никто не ждёт блокировку backend'а {pid}"
