@@ -7,6 +7,7 @@ import contextlib
 from typing import TYPE_CHECKING
 
 import pytest
+from sqlalchemy import event
 
 from tallyho.engine.completer import (
     Completer,
@@ -228,3 +229,27 @@ async def test_hook_failure_rolls_back_domain_and_pause(env: Env, registry: Hook
     assert row["paused_at"] is None
     assert row["hook_attempts"] == 1
     assert row["hook_error"] == "hook failed"
+
+
+async def test_batch_without_policy_is_read_once(env: Env, registry: HookRegistry) -> None:
+    # Оценка политики зовётся после каждого flush Completer; опции батча
+    # неизменны, поэтому батч без failure_policy читается один раз (T11.6).
+    async with env.transaction() as conn:
+        plain = await env.producer.create_root(conn, RootSpec(kind="mail"))
+    policy_id, _ = await seeded(env, policy=FailurePolicy.fail_fast(), count=1)
+    subject = enforcer(env, registry)
+    begins: list[object] = []
+
+    def on_begin(conn: object) -> None:
+        begins.append(conn)
+
+    event.listen(subject.engine.sync_engine, "begin", on_begin)
+    try:
+        assert await subject.evaluate([plain.id, policy_id]) == ()
+        assert len(begins) == 2
+        assert await subject.evaluate([plain.id, policy_id]) == ()
+        assert await subject.evaluate([plain.id]) == ()
+    finally:
+        event.remove(subject.engine.sync_engine, "begin", on_begin)
+    # Батч с политикой читается каждый раз, без политики — только первый.
+    assert len(begins) == 3

@@ -55,10 +55,16 @@ _ACTIVE = literal_column(str(int(ItemState.ACTIVE)), SmallInteger())
 _ITEM_OUTBOX = literal_column(str(int(OutboxKind.ITEM)), SmallInteger())
 _INFINITY = literal_column("'infinity'::timestamptz", DateTime(timezone=True))
 _HOOK = "on_policy_breach"
+_NO_POLICY_CACHE = 4096
+"""Сколько батчей без политики помнить: оценка зовётся после каждого flush Completer (T11.6)."""
 
 
 class _NoBreachError(TallyhoError):
     """Политика не сработала или уже была применена."""
+
+
+class _NoPolicyError(_NoBreachError):
+    """Политики ошибок у батча нет: опции неизменны, повторно читать незачем."""
 
 
 class _HookCallError(TallyhoError):
@@ -128,9 +134,15 @@ class PolicyEnforcer:
     hooks: HookRegistry
     settings: PolicyEnforcerSettings = field(default_factory=PolicyEnforcerSettings)
     observer: Observer = field(default_factory=NullObserver)
+    _without_policy: dict[UUID, None] = field(default_factory=dict["UUID", None], init=False)
+    """Батчи без ``failure_policy`` (порядок вставки — для вытеснения старых)."""
 
     async def evaluate(self, batch_ids: Iterable[UUID]) -> tuple[UUID, ...]:
         """Применить политики.
+
+        Батч без ``failure_policy`` транзакцию открывает один раз: опции батча
+        задаются при создании и не меняются, поэтому ответ запоминается (до
+        ``_NO_POLICY_CACHE`` батчей).
 
         Returns:
             Батчи, которым после отмены Items нужна финализация.
@@ -138,6 +150,8 @@ class PolicyEnforcer:
         finalize: set[UUID] = set()
         settings = TxSettings(statement_timeout=self.settings.hook_timeout)
         for batch_id in sorted(set(batch_ids)):
+            if batch_id in self._without_policy:
+                continue
             try:
                 applied = await run_transaction(
                     self.engine,
@@ -145,6 +159,9 @@ class PolicyEnforcer:
                     settings=settings,
                     policy=self.settings.retry,
                 )
+            except _NoPolicyError:
+                self._remember_without_policy(batch_id)
+                continue
             except (_NoBreachError, HookMissingError):
                 continue
             except _HookCallError as exc:
@@ -154,13 +171,18 @@ class PolicyEnforcer:
             finalize.update(applied.finalize)
         return tuple(sorted(finalize))
 
+    def _remember_without_policy(self, batch_id: UUID) -> None:
+        self._without_policy[batch_id] = None
+        if len(self._without_policy) > _NO_POLICY_CACHE:
+            del self._without_policy[next(iter(self._without_policy))]
+
     async def _attempt(self, conn: AsyncConnection, batch_id: UUID) -> _Applied:
         target = await self._read_batch(conn, batch_id)
         if target is None or target.state.is_terminal:
             raise _NoBreachError
         policy_data = _string_mapping(target.options.get("failure_policy"))
         if not policy_data:
-            raise _NoBreachError
+            raise _NoPolicyError
         policy = FailurePolicy.from_json(policy_data)
         totals = (await read_counters(conn, self.tables, [batch_id]))[batch_id]
         counted = await read_labels_and_metrics(conn, self.tables, [batch_id])
