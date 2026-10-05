@@ -1374,17 +1374,26 @@ def _expansion_batches(finish_ops: Sequence[_Finish], batch_ids: list[UUID]) -> 
     """
     writes_structure = False
     for op in finish_ops:
-        value = op.value
-        for spawn_request in value.spawns:
-            route = spawn_request.route
-            batch_ids.extend([route.source_id, route.target_id, route.root_id])
-        for expect_request in value.expects:
-            route = expect_request.route
-            batch_ids.extend([route.source_id, route.target_id, route.root_id])
-        for sub_batch in value.sub_batches:
-            writes_structure = True
-            batch_ids.extend(sub_batch.spec.fed_by)
+        writes_structure = _value_batches(op.value, batch_ids) or writes_structure
     return writes_structure
+
+
+def _value_batches(value: FinishResult, batch_ids: list[UUID]) -> bool:
+    """Добавить в ``batch_ids`` батчи маршрутов spawn/expect и ``fed_by`` под-батчей.
+
+    Батч самого Item не добавляется: путь A блокирует его всегда, путь B —
+    только при под-батчах.
+
+    Returns:
+        ``True``, если ``value`` создаёт под-батчи.
+    """
+    routes = [request.route for request in value.spawns]
+    routes.extend(request.route for request in value.expects)
+    for route in routes:
+        batch_ids.extend([route.source_id, route.target_id, route.root_id])
+    for sub_batch in value.sub_batches:
+        batch_ids.extend(sub_batch.spec.fed_by)
+    return bool(value.sub_batches)
 
 
 _Owned = TypeVar("_Owned", _Release, _Finish)
@@ -1671,25 +1680,12 @@ class Completer:
         conn = await resolve_connection(target)
         tx = _Tx(self, conn, user_tx=True)
         batch_ids: list[UUID] = []
-        writes_structure = bool(value.sub_batches)
-        for spawn_request in value.spawns:
-            batch_ids.extend(
-                [
-                    spawn_request.route.source_id,
-                    spawn_request.route.target_id,
-                    spawn_request.route.root_id,
-                ]
-            )
-        for expect_request in value.expects:
-            batch_ids.extend(
-                [
-                    expect_request.route.source_id,
-                    expect_request.route.target_id,
-                    expect_request.route.root_id,
-                ]
-            )
-        for sub_batch in value.sub_batches:
-            batch_ids.extend(sub_batch.spec.fed_by)
+        writes_structure = _value_batches(value, batch_ids)
+        if writes_structure:
+            # Под-батч создаётся в батче Item: его строка нужна _Tx и Producer
+            # блокирует её FOR UPDATE. Берём её здесь, до th_item (§9.2), как
+            # путь A. Без под-батчей путь B строку батча Item не блокирует.
+            batch_ids.append(item.batch_id)
         if batch_ids:
             await tx.lock_batches(batch_ids, write=writes_structure)
         if attempt is not None:

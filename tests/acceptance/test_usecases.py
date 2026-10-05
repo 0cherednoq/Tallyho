@@ -61,15 +61,6 @@ class _Defect:
 
 # Нарушения инвариантов и невыполненные ожидания A-UC, ждущие задачи Fix-N.
 #
-# A-UC-07: путь B (`item.complete_in`) задачи, создавшей `item.sub_batch` без spawn, падает
-# KeyError в `_Tx._sub_batches`: `Completer.complete_in` блокирует (и кладёт в `tx.batches`)
-# только батчи маршрутов spawn/expect и `fed_by`, но не батч самого Item. Попытки
-# исчерпываются, Item - `error("exhausted")`, под-батч не создаётся. Путь A тот же
-# под-батч создаёт; поэтому глубина 3 проверяется через путь A, а путь B - отдельной пробой.
-_SUB_BATCH_PATH_B = _Defect(
-    "Fix-NEW-complete-in-sub-batch",
-    "complete_in задачи с sub_batch без spawn падает KeyError: батч Item не заблокирован",
-)
 # A-UC-10: провал дерева политикой (`fail_fast`, `threshold(action="fail")`) в
 # `PolicyEnforcer._fail_tree` отменяет все active Items без lease, включая виртуальные Items
 # под-батчей (`child_batch_id IS NOT NULL`); `Operations.cancel` их исключает. Корень
@@ -83,7 +74,6 @@ _FAIL_TREE_ORDER = _Defect(
 _WATCH_ETA = _Defect("Fix-NEW-watch-eta", "watch() не считает ETA: скорости не передаются")
 _INVARIANT_DEFECTS: Mapping[str, _Defect] = {"A-UC-10": _FAIL_TREE_ORDER}
 _EXPECTATION_DEFECTS: Mapping[str, _Defect] = {
-    "A-UC-07": _SUB_BATCH_PATH_B,
     "A-UC-10": _FAIL_TREE_ORDER,
     "A-UC-19": _WATCH_ETA,
 }

@@ -12,12 +12,19 @@ from sqlalchemy import column, func, select, table, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from typing_extensions import override
 
-from tallyho.engine.completer import CompleterSettings, FinishResult, ItemRef, SpawnRequest
+from tallyho.engine.completer import (
+    CompleterSettings,
+    FinishResult,
+    ItemRef,
+    SpawnRequest,
+    SubBatchRequest,
+)
 from tallyho.engine.completion import complete_in
+from tallyho.engine.producer import SubBatchSpec
 from tallyho.engine.spawn import SpawnRoute
 from tallyho.engine.sweeper import Sweeper, SweeperSettings
 from tallyho.model.calls import TaskCall
-from tallyho.model.states import ItemState, ResultClass
+from tallyho.model.states import BatchState, ItemState, ResultClass
 from tallyho.protocols.observer import NullObserver
 from tallyho.storage.metric_names import METRIC_PREFIX
 from tallyho.storage.tx import resolve_connection
@@ -266,6 +273,57 @@ async def test_complete_in_connection_spawns_atomically_and_folds_all_deltas(env
     assert (counters.total, counters.error, counters.pending, counters.tree_total) == (2, 1, 1, 2)
     assert await env.count(env.tables.counter_delta) == 0
     assert await env.count(env.tables.item_mark) == 1
+
+
+async def test_complete_in_creates_sub_batch_without_spawn(env: Env) -> None:
+    """Под-батч из задачи без spawn, завершённой путём B (Fix-27).
+
+    Раньше батч самого Item блокировался только в маршрутах spawn/expect, и
+    ``_sub_batches`` падал ``KeyError`` по id батча Item.
+    """
+    seeded = await seed(env, 1)
+    ref = seeded.refs[0]
+    request = SubBatchRequest(
+        spec=SubBatchSpec(key="parts"),
+        calls=(
+            TaskCall(task_name="part", args=(1,), key="p:1"),
+            TaskCall(task_name="part", args=(2,), key="p:2", weight=3),
+        ),
+    )
+    value = FinishResult(result_class=ResultClass.OK, sub_batches=(request,))
+    finalizer = Finalized()
+    async with open_completer(env, finalizer=finalizer) as completer:
+        assert (await completer.claim(ref)).run
+        async with AsyncSession(schema_engine(env)) as session:
+            assert await complete_in(session, ref, value, completer=completer, attempt=0)
+            await session.commit()
+
+    assert await _state(env, ref.id) is ItemState.OK
+    assert await lease_row(env, ref.id) is None
+    assert await env.count(env.tables.counter_delta) == 0
+    batch = env.tables.batch
+    item = env.tables.item
+    async with env.connection() as conn:
+        child_id = await conn.scalar(
+            select(batch.c.id).where(batch.c.root_id == seeded.batch_id, batch.c.key == "parts")
+        )
+        assert child_id is not None
+        virtual = (
+            await conn.execute(
+                select(item.c.state).where(
+                    item.c.batch_id == seeded.batch_id, item.c.child_batch_id == child_id
+                )
+            )
+        ).all()
+    child = await env.batch(child_id)
+    assert (child["parent_id"], child["state"]) == (seeded.batch_id, BatchState.SEALED)
+    assert virtual == [(ItemState.ACTIVE,)]
+    parent = await env.counters(seeded.batch_id)
+    parts = await env.counters(child_id)
+    assert (parent.total, parent.ok, parent.pending, parent.w_done) == (2, 1, 1, 1)
+    assert (parts.total, parts.w_total, parts.pending) == (2, 4, 2)
+    assert parent.tree_total == 3
+    assert child_id in finalizer.calls
 
 
 @pytest.mark.parametrize("isolation", ["REPEATABLE READ", "SERIALIZABLE"])

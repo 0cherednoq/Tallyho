@@ -205,14 +205,11 @@ def register_usecases(  # ruff: ignore[complex-structure, too-many-statements, t
                     child.add_call(
                         th.call(uc_nest, run_id, level + 1, fanout).opts(key=f"n:{index}")
                     )
-        path_a = level < NEST_LEVELS and await _flag(env, f"nest_path_a:{run_id}")
+        # Путь B: под-батч, итог и эффект - одна транзакция пользователя (A-UC-07).
         async with engine.begin() as connection:
             await _effect(connection, env, run_id=run_id, n=level, task="uc_nest")
             item.ok("done")
-            if not path_a:
-                await item.complete_in(connection)
-        # path_a: итог и под-батч фиксирует Completer после возврата задачи (путь A).
-        # Обход Fix-NEW-complete-in-sub-batch: путь B с sub_batch без spawn падает KeyError.
+            await item.complete_in(connection)
 
     @adapter.task(max_retries=3, timeout=job_timeout, retry_delays=[0.01, 0.02, 0.03])
     async def uc_crawl(run_id: int, n: int) -> None:
@@ -251,10 +248,8 @@ def register_usecases(  # ruff: ignore[complex-structure, too-many-statements, t
                 await _event(connection, env, run_id, event=event, detail=detail)
             await _effect(connection, env, run_id=run_id, n=n, task="uc_probe")
             item.ok("done")
-            # sub_batch без spawn в пути B падает (Fix-NEW-complete-in-sub-batch, A-UC-07):
-            # такой итог фиксирует Completer после возврата задачи (путь A).
-            if role != "shared_stage":
-                await item.complete_in(connection)
+            # shared_stage: sub_batch без spawn - тоже путь B (A-UC-16).
+            await item.complete_in(connection)
 
     @adapter.task(
         max_retries=2,
