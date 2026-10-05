@@ -629,6 +629,30 @@
 * **Сделать:** Под нагрузкой хаос-стенда нестабильны `tests/integration/runtime/test_complete_in_heartbeat.py::test_long_user_transaction_does_not_delay_heartbeat_and_finish_of_batch` (порог fast > 1 с, на базе da59be0 — 3 из 4 прогонов) и `tests/integration/storage/test_after_commit_order.py::test_commit_in_flight_is_still_pending` (отчёт Fix-23); в полном прогоне без нагрузки оба зелёные. Заменить абсолютные пороги времени на детерминированные условия (события, управляемые часы, относительные сравнения) без ослабления проверяемого свойства.
 * **DoD:** каждый тест 50 прогонов подряд под параллельной нагрузкой (`-n 8`) без падений.
 
+#### Fix-27 — `sub_batch` из задачи, завершённой через `complete_in`
+* **Зависит:** —
+* **Док:** ARCHITECTURE UC-08, §8 (под-батчи); ACCEPTANCE A-UC-07, A-UC-16
+* **Сделать:** по отчёту T11.4 задача создаёт `item.sub_batch(...)` без spawn и завершается `item.complete_in(conn)`; каждая попытка падает `KeyError(<id батча Item>)`, Item — `error("exhausted")`, под-батч не создаётся. `Completer.complete_in` собирает `batch_ids` для `tx.lock_batches` только из маршрутов spawn/expect и `fed_by`; батч самого Item в `tx.batches` не попадает, и `_Tx._sub_batches` → `self.batches[parent_id]` падает. Путь A всегда блокирует `op.item.batch_id`. Исправить сбор батчей пути B (порядок блокировок D-043), не трогая функции gate D-037 без необходимости.
+* **DoD:** интеграционный тест, красный на старом коде; `poe acceptance-uc --uc A-UC-07` без xfail; A-UC-07 и A-UC-16 проверяют путь B с `sub_batch` (вернуть обход на путь A, введённый T11.4).
+
+#### Fix-28 — Отказ дерева по политике не отменяет виртуальные Items
+* **Зависит:** —
+* **Док:** ARCHITECTURE §8 (финализация дерева, I-09), политика `fail_fast`; ACCEPTANCE A-UC-10
+* **Сделать:** `PolicyEnforcer._fail_tree` (engine/policy.py) отменяет все active Items без lease, включая виртуальные Items под-батчей; фильтра `child_batch_id IS NULL`, как в `Operations.cancel`, нет. Корень финализируется раньше детей, этап может финализироваться раньше своего источника (I-09 «feed» красный не в каждом прогоне). Исправить, сверить остальные пути массовой отмены/отказа.
+* **DoD:** интеграционный тест порядка финализации при отказе дерева; `poe acceptance-uc --uc A-UC-10` без xfail, I-09 зелёный в 5 прогонах подряд.
+
+#### Fix-29 — ETA в `watch()`
+* **Зависит:** —
+* **Док:** ARCHITECTURE §9.4; ACCEPTANCE A-UC-19
+* **Сделать:** `ProgressWatcher._poll` (engine/maintenance.py) вызывает `reads.view(batch_id)` без `rates`, поэтому `Progress.eta` в `watch()` всегда `None`, хотя §9.4 обещает ETA «в Snapshotter и в watch()». В снимках `on_progress` ETA есть. Передать скорости в `watch()`; для `view()` решить — дать ETA или уточнить документ (что дешевле без лишних запросов на горячем пути), записать решение.
+* **DoD:** тест: `watch()` отдаёт ETA после накопления скорости; `poe acceptance-uc --uc A-UC-19` без xfail.
+
+#### Fix-30 — `retry_failed` на удалённом retention корне
+* **Зависит:** —
+* **Док:** ARCHITECTURE (ошибки `BatchPurged`, retention); ACCEPTANCE A-UC-14, A-UC-22
+* **Сделать:** по наблюдению T11.4 `retry_failed()` на корне, уже удалённом retention, не бросает исключение — `BatchPurged` приходит только из следующего `view()`. Проверить отдельно; если подтвердится — операции над удалённым батчем бросают `BatchPurged` сразу (как описано в ARCHITECTURE), иначе закрыть задачу с объяснением.
+* **DoD:** интеграционный тест: `retry_failed`/`cancel`/`pause` на удалённом батче → `BatchPurged`.
+
 ### Ф12. Документация и релиз
 
 #### T12.1 — Пользовательская документация
