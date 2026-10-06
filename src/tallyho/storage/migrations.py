@@ -13,14 +13,9 @@
 расставляет диалект. Префикс проверяется регулярным выражением, схема — по
 ограничениям PostgreSQL на идентификаторы.
 
-Схема версии 1 заморожена без ``th_counter_delta.created_at``. Версия 2
-добавляет timestamp и индекс для ограниченной по возрасту свёртки Sweeper;
-Версия 3 создаёт ``th_batch_attr`` с GIN-индексом по ``attributes`` и индекс
-листинга корней ``th_batch (kind, id)``; в операции версии 1 эти объекты не
-попадают. Версия 4 добавляет ``th_lease.redelivered`` — отметку подтверждённого
-дубля доставки. Версия 5 добавляет ``th_item.generation`` — поколение отправки
-Item для сверки с DLQ брокера. ``build_metadata`` всегда описывает итоговую
-актуальную схему.
+Версия 1 создаёт всю схему, которую описывает
+:func:`~tallyho.storage.tables.build_metadata`. Следующие версии добавляются
+новыми записями в ``_MIGRATIONS``; операции уже выпущенной версии не меняются.
 """
 
 from __future__ import annotations
@@ -29,12 +24,11 @@ import hashlib
 import re
 from dataclasses import dataclass
 from datetime import timedelta
-from typing import TYPE_CHECKING, Final, cast
+from typing import TYPE_CHECKING, Final
 
 from sqlalchemy import MetaData, Text, func, literal_column, select, text
 from sqlalchemy.dialects.postgresql import insert
-from sqlalchemy.ext.compiler import compiles
-from sqlalchemy.schema import CreateIndex, CreateSchema, CreateTable, ExecutableDDLElement
+from sqlalchemy.schema import CreateIndex, CreateSchema, CreateTable
 
 from tallyho.model.errors import ConfigurationError
 from tallyho.storage.tables import DEFAULT_PREFIX, build_metadata
@@ -45,7 +39,6 @@ if TYPE_CHECKING:
     from sqlalchemy import Index, Table, TypedColumns
     from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
     from sqlalchemy.sql.base import Executable
-    from sqlalchemy.sql.compiler import DDLCompiler
 
     from tallyho.storage.tables import MetaColumns
 
@@ -59,7 +52,7 @@ __all__ = [
     "validate_schema",
 ]
 
-SCHEMA_VERSION: Final = 5
+SCHEMA_VERSION: Final = 1
 """Версия схемы, которую знает эта версия библиотеки."""
 
 VERSION_KEY: Final = "schema_version"
@@ -72,9 +65,6 @@ _PREFIX_RE: Final = re.compile(r"[a-z_][a-z0-9_]{0,15}")
 # PostgreSQL молча обрезает идентификаторы длиннее NAMEDATALEN - 1 байт.
 _MAX_IDENTIFIER_BYTES: Final = 63
 _LOCK_NAMESPACE: Final = "tallyho.migrate"
-_DELTA_TIMESTAMP_VERSION: Final = 2
-_LEASE_REDELIVERY_VERSION: Final = 4
-_ITEM_GENERATION_VERSION: Final = 5
 
 _PREFIX_ERROR: Final = "Префикс должен соответствовать ^[a-z_][a-z0-9_]{0,15}$"
 _SCHEMA_ERROR: Final = "Имя схемы должно быть непустым, без NUL и не длиннее 63 байт в UTF-8"
@@ -125,49 +115,31 @@ def validate_schema(schema: str | None) -> str | None:
 class _Installation:
     """Таблицы одной установки в её схеме.
 
-    ``tables`` — таблицы версии 1 в порядке имён, как ``sorted_tables``;
-    объекты следующих версий лежат в отдельных полях.
+    ``tables`` — все таблицы в порядке имён, как ``sorted_tables``.
     """
 
     schema: str | None
     tables: list[Table[TypedColumns]]
     meta: Table[MetaColumns]
-    counter_delta: Table[TypedColumns]
-    batch_attr: Table[TypedColumns]
-    batch_kind_index: Index
-    lease: Table[TypedColumns]
-    item: Table[TypedColumns]
 
 
-def _installation(
-    schema: str | None,
-    prefix: str,
-    *,
-    delta_timestamps: bool = True,
-    lease_redelivery: bool = True,
-    item_generation: bool = True,
-) -> _Installation:
+def _installation(schema: str | None, prefix: str) -> _Installation:
     """Таблицы ``build_metadata(prefix)`` в схеме ``schema``.
 
     Returns:
         Таблицы установки; при ``schema=None`` — без квалификатора схемы.
     """
-    source = build_metadata(
-        prefix,
-        _delta_timestamps=delta_timestamps,
-        _lease_redelivery=lease_redelivery,
-        _item_generation=item_generation,
-    )
+    source = build_metadata(prefix)
     meta = source.meta
-    batch: Table[TypedColumns] = source.batch
-    batch_attr: Table[TypedColumns] = source.batch_attr
-    counter_delta: Table[TypedColumns] = source.counter_delta
-    lease: Table[TypedColumns] = source.lease
-    item: Table[TypedColumns] = source.item
     tables: list[Table[TypedColumns]] = [
+        source.batch,
+        source.batch_attr,
+        source.item,
         source.outbox,
+        source.lease,
         source.feed,
         source.counter,
+        source.counter_delta,
         source.metric,
         source.item_mark,
         source.expiry,
@@ -176,26 +148,12 @@ def _installation(
     if schema is not None:
         target = MetaData()
         meta = meta.to_metadata(target, schema=schema)
-        batch = batch.to_metadata(target, schema=schema)
-        batch_attr = batch_attr.to_metadata(target, schema=schema)
-        counter_delta = counter_delta.to_metadata(target, schema=schema)
-        lease = lease.to_metadata(target, schema=schema)
-        item = item.to_metadata(target, schema=schema)
         tables = [table.to_metadata(target, schema=schema) for table in tables]
     return _Installation(
         schema=schema,
-        tables=sorted([*tables, batch, counter_delta, item, lease, meta], key=lambda t: t.name),
+        tables=sorted([*tables, meta], key=lambda t: t.name),
         meta=meta,
-        counter_delta=counter_delta,
-        batch_attr=batch_attr,
-        batch_kind_index=_index(batch, "_kind_idx"),
-        lease=lease,
-        item=item,
     )
-
-
-def _index(table: Table[TypedColumns], suffix: str) -> Index:
-    return next(index for index in table.indexes if str(index.name) == f"{table.name}{suffix}")
 
 
 def _sorted_indexes(table: Table[TypedColumns]) -> list[Index]:
@@ -208,126 +166,11 @@ def _v1(installation: _Installation) -> list[Executable]:
         statements.append(CreateSchema(installation.schema, if_not_exists=True))
     for table in installation.tables:
         statements.append(CreateTable(table))
-        statements.extend(
-            CreateIndex(index)
-            for index in _sorted_indexes(table)
-            # Индекс листинга корней появился в версии 3.
-            if index is not installation.batch_kind_index
-        )
+        statements.extend(CreateIndex(index) for index in _sorted_indexes(table))
     return statements
 
 
-class _AddCounterDeltaTimestamp(ExecutableDDLElement):
-    """Добавить timestamp с безопасно скомпилированным именем таблицы."""
-
-    table: Table[TypedColumns]
-
-    def __init__(self, table: Table[TypedColumns]) -> None:
-        self.table = table
-
-
-class _DropCounterDeltaTimestampDefault(ExecutableDDLElement):
-    """Убрать временный DEFAULT после заполнения исторических строк."""
-
-    table: Table[TypedColumns]
-
-    def __init__(self, table: Table[TypedColumns]) -> None:
-        self.table = table
-
-
-@compiles(_AddCounterDeltaTimestamp, "postgresql")
-def _compile_add_counter_delta_timestamp(
-    element: _AddCounterDeltaTimestamp, compiler: object, **_: object
-) -> str:
-    preparer = cast("DDLCompiler", compiler).preparer
-    table = preparer.format_table(element.table)
-    return (
-        f"ALTER TABLE {table} ADD COLUMN created_at TIMESTAMP WITH TIME ZONE "
-        "NOT NULL DEFAULT CURRENT_TIMESTAMP"
-    )
-
-
-@compiles(_DropCounterDeltaTimestampDefault, "postgresql")
-def _compile_drop_counter_delta_timestamp_default(
-    element: _DropCounterDeltaTimestampDefault, compiler: object, **_: object
-) -> str:
-    preparer = cast("DDLCompiler", compiler).preparer
-    table = preparer.format_table(element.table)
-    return f"ALTER TABLE {table} ALTER COLUMN created_at DROP DEFAULT"
-
-
-def _v2(installation: _Installation) -> list[Executable]:
-    return [
-        _AddCounterDeltaTimestamp(installation.counter_delta),
-        _DropCounterDeltaTimestampDefault(installation.counter_delta),
-        CreateIndex(_index(installation.counter_delta, "_created_idx")),
-    ]
-
-
-def _v3(installation: _Installation) -> list[Executable]:
-    # Обычный CREATE INDEX, не CONCURRENTLY: миграция идёт одной транзакцией.
-    # Пока индекс th_batch строится, запись в th_batch ждёт; таблица растёт с
-    # числом батчей, а не Items, а ожидание чужих блокировок ограничивает
-    # lock_timeout.
-    return [
-        CreateTable(installation.batch_attr),
-        *(CreateIndex(index) for index in _sorted_indexes(installation.batch_attr)),
-        CreateIndex(installation.batch_kind_index),
-    ]
-
-
-class _AddLeaseRedelivered(ExecutableDDLElement):
-    """Добавить ``th_lease.redelivered`` с безопасно скомпилированным именем таблицы."""
-
-    table: Table[TypedColumns]
-
-    def __init__(self, table: Table[TypedColumns]) -> None:
-        self.table = table
-
-
-@compiles(_AddLeaseRedelivered, "postgresql")
-def _compile_add_lease_redelivered(
-    element: _AddLeaseRedelivered, compiler: object, **_: object
-) -> str:
-    preparer = cast("DDLCompiler", compiler).preparer
-    table = preparer.format_table(element.table)
-    # Константный DEFAULT не переписывает таблицу; он остаётся и в итоговой схеме.
-    return f"ALTER TABLE {table} ADD COLUMN redelivered BOOLEAN DEFAULT false NOT NULL"
-
-
-def _v4(installation: _Installation) -> list[Executable]:
-    return [_AddLeaseRedelivered(installation.lease)]
-
-
-class _AddItemGeneration(ExecutableDDLElement):
-    """Добавить ``th_item.generation`` с безопасно скомпилированным именем таблицы."""
-
-    table: Table[TypedColumns]
-
-    def __init__(self, table: Table[TypedColumns]) -> None:
-        self.table = table
-
-
-@compiles(_AddItemGeneration, "postgresql")
-def _compile_add_item_generation(element: _AddItemGeneration, compiler: object, **_: object) -> str:
-    preparer = cast("DDLCompiler", compiler).preparer
-    table = preparer.format_table(element.table)
-    # Константный DEFAULT не переписывает таблицу; он остаётся и в итоговой схеме.
-    # Индекса на колонке нет: её обновление, как и finish, остаётся HOT.
-    return f"ALTER TABLE {table} ADD COLUMN generation INTEGER DEFAULT 0 NOT NULL"
-
-
-def _v5(installation: _Installation) -> list[Executable]:
-    return [_AddItemGeneration(installation.item)]
-
-
-_MIGRATIONS: Final[Mapping[int, Callable[[_Installation], list[Executable]]]] = {
-    1: _v1,
-    2: _v2,
-    3: _v3,
-    4: _v4,
-    5: _v5,
-}
+_MIGRATIONS: Final[Mapping[int, Callable[[_Installation], list[Executable]]]] = {1: _v1}
 
 
 def _lock_timeout_statement(lock_timeout: timedelta) -> Executable:
@@ -379,13 +222,7 @@ def migration_statements(
     migration = _MIGRATIONS.get(version)
     if migration is None:
         raise ConfigurationError(_UNKNOWN_VERSION_ERROR)
-    installation = _installation(
-        schema,
-        prefix,
-        delta_timestamps=version >= _DELTA_TIMESTAMP_VERSION,
-        lease_redelivery=version >= _LEASE_REDELIVERY_VERSION,
-        item_generation=version >= _ITEM_GENERATION_VERSION,
-    )
+    installation = _installation(schema, prefix)
     return [
         _lock_timeout_statement(lock_timeout),
         *migration(installation),

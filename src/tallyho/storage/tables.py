@@ -26,7 +26,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Final, cast, final
+from typing import TYPE_CHECKING, Final, final
 
 from sqlalchemy import (
     BigInteger,
@@ -363,9 +363,6 @@ def build_metadata(
     prefix: str = DEFAULT_PREFIX,
     *,
     schema: str | None = None,
-    _delta_timestamps: bool = True,
-    _lease_redelivery: bool = True,
-    _item_generation: bool = True,
 ) -> Tables:
     """Описать таблицы tallyho с префиксом ``prefix`` в новом ``MetaData``.
 
@@ -385,9 +382,9 @@ def build_metadata(
         metadata=metadata,
         batch=_batch(metadata, prefix),
         batch_attr=_batch_attr(metadata, prefix),
-        item=_item(metadata, prefix, generation=_item_generation),
+        item=_item(metadata, prefix),
         outbox=_outbox(metadata, prefix),
-        lease=_lease(metadata, prefix, redelivery=_lease_redelivery),
+        lease=_lease(metadata, prefix),
         feed=_feed(metadata, prefix),
         counter=Table(
             f"{prefix}counter",
@@ -395,7 +392,7 @@ def build_metadata(
             CounterColumns,
             postgresql_with={"fillfactor": _HOT_FILLFACTOR, **_AGGRESSIVE_AUTOVACUUM},
         ),
-        counter_delta=_counter_delta(metadata, prefix, timestamps=_delta_timestamps),
+        counter_delta=_counter_delta(metadata, prefix),
         metric=Table(
             f"{prefix}metric",
             metadata,
@@ -452,14 +449,14 @@ def _batch(metadata: MetaData, prefix: str) -> Table[BatchColumns]:
             or_(~c.release_required, c.released_at.is_not(None)),
         ),
     )
-    # Листинг корней одного kind, keyset по id DESC (схема v3).
+    # Листинг корней одного kind, keyset по id DESC.
     Index(f"{name}_kind_idx", c.kind, c.id, postgresql_where=c.parent_id.is_(None))
     return batch
 
 
 def _batch_attr(metadata: MetaData, prefix: str) -> Table[BatchAttrColumns]:
     # Отдельная таблица, а не колонки th_batch: строка батча часто обновляется,
-    # и каждое не-HOT обновление заново писало бы jsonb в GIN (схема v3).
+    # и каждое не-HOT обновление заново писало бы jsonb в GIN.
     name = f"{prefix}batch_attr"
     attr = Table(name, metadata, BatchAttrColumns)
     Index(
@@ -471,38 +468,9 @@ def _batch_attr(metadata: MetaData, prefix: str) -> Table[BatchAttrColumns]:
     return attr
 
 
-def _item(metadata: MetaData, prefix: str, *, generation: bool) -> Table[ItemColumns]:
+def _item(metadata: MetaData, prefix: str) -> Table[ItemColumns]:
     name = f"{prefix}item"
-    item: Table[ItemColumns]
-    if generation:
-        item = Table(name, metadata, ItemColumns, postgresql_with={"fillfactor": _ITEM_FILLFACTOR})
-    else:
-        # Схема до версии 5 заморожена без generation; колонку добавляет
-        # миграция v5. Этот путь используется только генератором миграций v1-v4.
-        item = cast(
-            "Table[ItemColumns]",
-            Table(
-                name,
-                metadata,
-                Column("id", Uuid(), primary_key=True),
-                Column("batch_id", Uuid(), nullable=False),
-                Column("state", SmallInteger(), nullable=False),
-                Column("label", Text(), nullable=True),
-                Column("attempt", SmallInteger(), nullable=False, server_default=text("0")),
-                Column("depth", SmallInteger(), nullable=False, server_default=text("0")),
-                Column("task_name", Text(), nullable=False),
-                Column("payload", LargeBinary(), nullable=False),
-                Column("options", JSONB(), nullable=True),
-                Column("key", Text(), nullable=True),
-                Column("child_batch_id", Uuid(), nullable=True),
-                Column("weight", Integer(), nullable=False, server_default=text("1")),
-                Column("result", JSONB(), nullable=True),
-                Column("error", JSONB(), nullable=True),
-                Column("created_at", DateTime(timezone=True), nullable=False),
-                Column("finished_at", DateTime(timezone=True), nullable=True),
-                postgresql_with={"fillfactor": _ITEM_FILLFACTOR},
-            ),
-        )
+    item = Table(name, metadata, ItemColumns, postgresql_with={"fillfactor": _ITEM_FILLFACTOR})
     c = item.c
     # Только неизменяемые колонки: finish остаётся HOT update.
     Index(f"{name}_batch_idx", c.batch_id, c.id)
@@ -526,29 +494,9 @@ def _outbox(metadata: MetaData, prefix: str) -> Table[OutboxColumns]:
     return outbox
 
 
-def _lease(metadata: MetaData, prefix: str, *, redelivery: bool) -> Table[LeaseColumns]:
+def _lease(metadata: MetaData, prefix: str) -> Table[LeaseColumns]:
     name = f"{prefix}lease"
-    lease: Table[LeaseColumns]
-    if redelivery:
-        lease = Table(name, metadata, LeaseColumns, postgresql_with=_AGGRESSIVE_AUTOVACUUM)
-    else:
-        # Схема до версии 4 заморожена без redelivered; колонку добавляет
-        # миграция v4. Этот путь используется только генератором миграций v1-v3.
-        lease = cast(
-            "Table[LeaseColumns]",
-            Table(
-                name,
-                metadata,
-                Column("item_id", Uuid(), primary_key=True),
-                Column("batch_id", Uuid(), nullable=False),
-                Column("lease_until", DateTime(timezone=True), nullable=False),
-                Column("worker_id", Text(), nullable=False),
-                Column("attempt", SmallInteger(), nullable=False),
-                Column("progress_done", BigInteger(), nullable=True),
-                Column("progress_total", BigInteger(), nullable=True),
-                postgresql_with=_AGGRESSIVE_AUTOVACUUM,
-            ),
-        )
+    lease = Table(name, metadata, LeaseColumns, postgresql_with=_AGGRESSIVE_AUTOVACUUM)
     Index(f"{name}_until_idx", lease.c.lease_until)
     Index(f"{name}_batch_idx", lease.c.batch_id)
     return lease
@@ -561,50 +509,11 @@ def _feed(metadata: MetaData, prefix: str) -> Table[FeedColumns]:
     return feed
 
 
-def _counter_delta(
-    metadata: MetaData, prefix: str, *, timestamps: bool
-) -> Table[CounterDeltaColumns]:
+def _counter_delta(metadata: MetaData, prefix: str) -> Table[CounterDeltaColumns]:
     name = f"{prefix}counter_delta"
-    delta: Table[CounterDeltaColumns]
-    if timestamps:
-        delta = Table(
-            name,
-            metadata,
-            CounterDeltaColumns,
-            postgresql_with=_AGGRESSIVE_AUTOVACUUM,
-        )
-    else:
-        # Историческая схема v1 заморожена без created_at; миграция v2 добавляет
-        # колонку. Этот путь используется только генератором миграции v1.
-        delta = cast(
-            "Table[CounterDeltaColumns]",
-            Table(
-                name,
-                metadata,
-                Column("id", BigInteger(), Identity(always=True), primary_key=True),
-                Column("batch_id", Uuid(), nullable=False),
-                *(
-                    Column(f"d_{field}", BigInteger(), nullable=False, server_default=text("0"))
-                    for field in (
-                        "total",
-                        "ok",
-                        "skip",
-                        "error",
-                        "cancelled",
-                        "dispatched",
-                        "w_total",
-                        "w_done",
-                        "duplicates",
-                        "skipped_by_limit",
-                        "tree_total",
-                    )
-                ),
-                postgresql_with=_AGGRESSIVE_AUTOVACUUM,
-            ),
-        )
+    delta = Table(name, metadata, CounterDeltaColumns, postgresql_with=_AGGRESSIVE_AUTOVACUUM)
     Index(f"{name}_batch_idx", delta.c.batch_id)
-    if timestamps:
-        Index(f"{name}_created_idx", delta.c.created_at, delta.c.id)
+    Index(f"{name}_created_idx", delta.c.created_at, delta.c.id)
     return delta
 
 

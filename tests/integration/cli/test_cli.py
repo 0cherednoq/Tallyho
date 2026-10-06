@@ -15,6 +15,7 @@ from tallyho import Tallyho
 from tallyho.cli import app
 from tallyho.engine.maintenance import Maintenance
 from tallyho.model.errors import ClosedError
+from tallyho.storage.migrations import SCHEMA_VERSION
 from tallyho.storage.tables import build_metadata
 from tallyho.testing import InlineBroker
 from tests.helpers.db import schema_connection, schema_transaction
@@ -53,7 +54,7 @@ async def test_migrate_and_inspect_by_uuid_or_kind_key(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     assert await app.run(["migrate", "--dsn", postgres_dsn, "--schema", schema]) == 0
-    assert capsys.readouterr().out == f"schema={schema} version=5\n"
+    assert capsys.readouterr().out == f"schema={schema} version={SCHEMA_VERSION}\n"
 
     engine = create_async_engine(postgres_dsn)
     broker = InlineBroker()

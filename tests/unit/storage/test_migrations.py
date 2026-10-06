@@ -1,4 +1,4 @@
-"""Миграции без БД: проверка имён, DDL версии 1 против golden-снимка, операции версий 2-5."""
+"""Миграции без БД: проверка имён и DDL версии 1 против golden-снимка схемы."""
 
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ from tallyho.storage.migrations import (
 if TYPE_CHECKING:
     from sqlalchemy.sql.base import Executable
 
-GOLDEN = Path(__file__).parent / "golden" / "ddl_v1.sql"
+GOLDEN = Path(__file__).parent / "golden" / "ddl.sql"
 DIALECT = create_mock_engine("postgresql+asyncpg://", executor=print).dialect
 
 
@@ -43,100 +43,8 @@ def ddl_without_schema(schema: str) -> str:
 
 
 def test_version_one_matches_tables_snapshot() -> None:
-    # Историческая схема v1 заморожена отдельным golden-снимком.
+    # Версия 1 создаёт всю схему: тот же golden-снимок, что у build_metadata.
     assert ddl_without_schema("app") == GOLDEN.read_text(encoding="utf-8")
-
-
-def test_version_two_adds_timestamp_and_index() -> None:
-    statements = migration_statements(2, schema="app")
-    sql = [compiled(statement) for statement in statements]
-    assert sql[1] == (
-        "ALTER TABLE app.th_counter_delta ADD COLUMN created_at "
-        "TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP"
-    )
-    assert sql[2] == ("ALTER TABLE app.th_counter_delta ALTER COLUMN created_at DROP DEFAULT")
-    assert sql[3] == (
-        "CREATE INDEX th_counter_delta_created_idx ON app.th_counter_delta (created_at, id)"
-    )
-    assert "VALUES ('schema_version', '2')" in sql[-1]
-
-
-def test_version_three_adds_batch_attr_and_listing_index() -> None:
-    statements = migration_statements(3, schema="app")
-    sql = [compiled(statement).strip() for statement in statements]
-    assert sql[0] == "SET LOCAL lock_timeout = '5000ms'"
-    assert sql[1] == (
-        "CREATE TABLE app.th_batch_attr (\n"
-        "\tbatch_id UUID NOT NULL, \n"
-        "\tattributes JSONB DEFAULT '{}'::jsonb NOT NULL, \n"
-        "\tmemo JSONB, \n"
-        "\tPRIMARY KEY (batch_id)\n"
-        ")"
-    )
-    assert sql[2] == (
-        "CREATE INDEX th_batch_attr_attributes_idx ON app.th_batch_attr "
-        "USING gin (attributes jsonb_path_ops)"
-    )
-    assert sql[3] == (
-        "CREATE INDEX th_batch_kind_idx ON app.th_batch (kind, id) WHERE parent_id IS NULL"
-    )
-    assert "VALUES ('schema_version', '3')" in sql[4]
-    assert len(sql) == 5
-
-
-@pytest.mark.parametrize("version", [1, 2])
-def test_earlier_versions_do_not_create_version_three_objects(version: int) -> None:
-    # Версии 1 и 2 заморожены: объекты версии 3 создаёт только миграция 3.
-    sql = "\n".join(compiled(s) for s in migration_statements(version, schema="app"))
-    assert "th_batch_attr" not in sql
-    assert "th_batch_kind_idx" not in sql
-
-
-def test_version_four_adds_lease_redelivered() -> None:
-    statements = migration_statements(4, schema='we"ird; DROP', prefix="acme_")
-    sql = [compiled(statement).strip() for statement in statements]
-    assert sql[0] == "SET LOCAL lock_timeout = '5000ms'"
-    assert sql[1] == (
-        'ALTER TABLE "we""ird; DROP".acme_lease '
-        "ADD COLUMN redelivered BOOLEAN DEFAULT false NOT NULL"
-    )
-    assert "VALUES ('schema_version', '4')" in sql[2]
-    assert len(sql) == 3
-
-
-@pytest.mark.parametrize("version", [1, 2, 3])
-def test_earlier_versions_do_not_create_lease_redelivered(version: int) -> None:
-    # Версии 1-3 заморожены: колонку добавляет только миграция 4.
-    sql = "\n".join(compiled(s) for s in migration_statements(version, schema="app"))
-    assert "redelivered" not in sql
-
-
-def test_version_five_adds_item_generation() -> None:
-    statements = migration_statements(5, schema='we"ird; DROP', prefix="acme_")
-    sql = [compiled(statement).strip() for statement in statements]
-    assert sql[0] == "SET LOCAL lock_timeout = '5000ms'"
-    assert sql[1] == (
-        'ALTER TABLE "we""ird; DROP".acme_item ADD COLUMN generation INTEGER DEFAULT 0 NOT NULL'
-    )
-    assert "VALUES ('schema_version', '5')" in sql[2]
-    assert len(sql) == 3
-
-
-@pytest.mark.parametrize("version", [1, 2, 3, 4])
-def test_earlier_versions_do_not_create_item_generation(version: int) -> None:
-    # Версии 1-4 заморожены: колонку добавляет только миграция 5.
-    sql = "\n".join(compiled(s) for s in migration_statements(version, schema="app"))
-    assert "generation" not in sql
-
-
-def test_version_three_uses_prefix_and_quotes_schema() -> None:
-    statements = migration_statements(3, schema='we"ird; DROP', prefix="acme_")
-    sql = "\n".join(compiled(statement) for statement in statements)
-    assert 'CREATE TABLE "we""ird; DROP".acme_batch_attr (' in sql
-    assert 'CREATE INDEX acme_batch_kind_idx ON "we""ird; DROP".acme_batch (kind, id)' in sql
-    # "th_" встречается внутри jsonb_path_ops, поэтому проверяются имена объектов.
-    assert ".th_" not in sql
-    assert " th_" not in sql
 
 
 def test_statements_order() -> None:
@@ -165,7 +73,8 @@ def test_prefix_applies_to_all_objects() -> None:
     statements = migration_statements(1, schema="app", prefix="acme_")
     ddl = [compiled(s) for s in statements if isinstance(s, CreateTable | CreateIndex)]
     assert ddl
-    assert all("th_" not in text for text in ddl)
+    # "th_" встречается внутри jsonb_path_ops, поэтому проверяются имена объектов.
+    assert all(".th_" not in text and " th_" not in text for text in ddl)
     assert "INSERT INTO app.acme_meta" in compiled(statements[-1])
 
 

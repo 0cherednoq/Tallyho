@@ -6,25 +6,15 @@
 
 
     def upgrade() -> None:
-        tallyho_upgrade(op, version=1, schema="app")  # первая ревизия
-
-
-    # В следующей ревизии:
-    def upgrade() -> None:
-        tallyho_upgrade(op, version=2, schema="app")
-
-
-    # И ещё в одной:
-    def upgrade() -> None:
-        tallyho_upgrade(op, version=3, schema="app")
+        tallyho_upgrade(op, version=1, schema="app")
 
 Версия указывается в ревизии явно: ревизия не должна менять смысл, когда
 обновляется библиотека. Для каждой новой версии схемы tallyho пишется новая
-ревизия со следующим номером (``version=2``, ``version=3``, ``version=4``,
-``version=5``); пропускать версии нельзя. Выполняются те же операции, что у
-:func:`tallyho.storage.migrations.migrate`, включая ``SET LOCAL lock_timeout``
-и запись версии в ``th_meta``, поэтому ``migrate()`` после ревизии ничего не
-делает. Транзакцией и очерёдностью управляет Alembic: advisory lock не берётся.
+ревизия со следующим номером; пропускать версии нельзя. Выполняются те же
+операции, что у :func:`tallyho.storage.migrations.migrate`, включая
+``SET LOCAL lock_timeout`` и запись версии в ``th_meta``, поэтому ``migrate()``
+после ревизии ничего не делает. Транзакцией и очерёдностью управляет Alembic:
+advisory lock не берётся.
 
 Alembic — необязательная зависимость (extra ``alembic``): модуль импортирует
 его только для аннотаций, поэтому импорт модуля без alembic не падает, а
