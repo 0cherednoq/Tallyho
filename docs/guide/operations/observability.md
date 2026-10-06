@@ -12,50 +12,13 @@
 
 Объект, который получает события жизненного цикла. Он передаётся в
 `Tallyho(observer=...)`. Методы синхронные, вызываются вне транзакций и не должны блокировать;
-исключение наблюдателя на учёт не влияет. Наследуйте `NullObserver` и переопределяйте только нужное:
+исключение наблюдателя на учёт не влияет. Наследуйте `NullObserver` и переопределяйте только нужное.
 
-<!-- tallyho-noexec: фрагмент приложения: нужен пакет prometheus_client -->
-```python
-# app/metrics.py
-from uuid import UUID
+Готовые подключения:
 
-from prometheus_client import Counter
-from typing_extensions import override
+* [Prometheus](../../integrations/prometheus.md) - пример своего наблюдателя на `prometheus_client`;
+* [OpenTelemetry](../../integrations/opentelemetry.md) - наблюдатель из пакета, дополнение `otel`.
 
-from tallyho.model.states import BatchState, ResultClass
-from tallyho.protocols.observer import NullObserver
-
-ITEMS = Counter("tallyho_items_total", "Завершённые задачи", ["result", "label"])
-BATCHES = Counter("tallyho_batches_total", "Финализированные батчи", ["kind", "state"])
-HOOK_FAILURES = Counter("tallyho_hook_failures_total", "Падения tx-хуков", ["kind", "hook"])
-
-
-class PrometheusObserver(NullObserver):
-    @override
-    def item_finished(
-        self, *, batch_id: UUID, item_id: UUID, result: ResultClass, label: str | None, attempt: int
-    ) -> None:
-        ITEMS.labels(result.name.lower(), label or "").inc()
-
-    @override
-    def batch_finalized(self, *, batch_id: UUID, kind: str, state: BatchState) -> None:
-        BATCHES.labels(kind, state.name.lower()).inc()
-
-    @override
-    def hook_failed(
-        self, *, batch_id: UUID, kind: str, hook: str, attempt: int, error: BaseException
-    ) -> None:
-        HOOK_FAILURES.labels(kind, hook).inc()
-
-
-# app/tasks.py
-th = Tallyho(engine, schema="app", observer=PrometheusObserver())
-
-# после батча из четырёх задач, одна из которых завершилась ошибкой:
-# tallyho_items_total{result="ok",label="converted"} 3
-# tallyho_items_total{result="error",label="unsupported_format"} 1
-# tallyho_batches_total{kind="conversions",state="completed_with_errors"} 1
-```
 
 | Событие `Observer` | Когда |
 |---|---|
@@ -71,29 +34,6 @@ th = Tallyho(engine, schema="app", observer=PrometheusObserver())
 | `completer_buffer(items)` | сколько итогов ждёт записи в процессе воркера |
 | `oldest_lease(seconds)` | возраст самой старой аренды |
 | `transaction_retry(sqlstate)` | внутренняя транзакция будет повторена |
-
-## OpenTelemetry
-
-Готовый наблюдатель для OpenTelemetry ставится extra `otel`:
-
-<!-- tallyho-noexec: нужны настроенные провайдеры и экспортёр OpenTelemetry вашего приложения -->
-```python
-from tallyho import Tallyho
-from tallyho.observability.otel import OpenTelemetryObserver
-
-th = Tallyho(engine, schema="app", observer=OpenTelemetryObserver())
-# либо явно: OpenTelemetryObserver(tracer=my_tracer, meter=my_meter)
-```
-
-Он использует глобальные провайдеры OpenTelemetry (или переданные `tracer`/`meter`) и создаёт:
-
-| Что | Имена |
-|---|---|
-| спаны | `tallyho.create`, `tallyho.claim`, `tallyho.finish`, `tallyho.finalize` с атрибутами `tallyho.batch.id`, `tallyho.batch.kind`, `tallyho.batch.state`, `tallyho.item.id`, `tallyho.item.attempt`, `tallyho.item.result`, `tallyho.item.label` |
-| счётчики | `th_hook_failures`, `th_hook_missing`, `th_transaction_retries` (дедлоки) |
-| гистограммы | `th_relay_lag` (с), `th_completer_buffer_size`, `th_oldest_lease_age` (с) |
-
-Аргументы и результаты задач, атрибуты и `memo` в телеметрию не передаются.
 
 ## На что ставить алерты
 

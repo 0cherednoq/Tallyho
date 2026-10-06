@@ -26,7 +26,7 @@
 |---|---|
 | API с maintenance в lifespan | остановить приём запросов; `runner.stop()` и `await task`; `await th.aclose()`; закрыть адаптер; `await engine.dispose()` |
 | Отдельный maintenance | `serve_maintenance(...)` возвращается по сигналу; `await th.aclose()`; закрыть адаптер |
-| Воркер flexiq | `queue.run_worker(...)` возвращается по сигналу; `asyncio.run(th.aclose())`; для долгих задач - вариант со своим сроком, см. [Адаптер flexiq](../flexiq.md#остановка) |
+| Воркер flexiq | `queue.run_worker(...)` возвращается по сигналу; `asyncio.run(th.aclose())`; для долгих задач - вариант со своим сроком, см. [Адаптер flexiq](../../integrations/flexiq.md#остановка) |
 | Тест | `await th.aclose()` до удаления схемы - см. [Тестирование](../testing.md) |
 
 `aclose` можно вызывать из любого event loop: то, что работало в другом loop (так устроен воркер

@@ -186,79 +186,13 @@ finally:
   один цикл снимков прогресса. В тестах он заменяет [процесс maintenance](operations.md).
 * Без `FakeClock` клиент использует время базы данных - так он работает в продакшне.
 
-## pytest-фикстура
+## pytest
 
-Плагин `tallyho.testing.pytest_plugin` даёт фикстуру `tallyho_env`: клиент с `InlineBroker` и
-`FakeClock`, таблицы уже созданы, установка закрывается после теста (`th.aclose()`). Нужен extra
-`testing` (`pytest-asyncio`).
+Готовая фикстура `tallyho_env` собирает всё перечисленное: клиент с `InlineBroker` и `FakeClock`,
+созданные таблицы и закрытие установки после теста. Подключение описано на странице
+[pytest](../integrations/pytest.md).
 
-Плагин ожидает от вашего проекта две фикстуры: `engine` (`AsyncEngine`) и `schema` (имя схемы для
-этого теста).
-
-<!-- tallyho-noexec: conftest.py и тест выполняет pytest вашего проекта; DSN и фикстуры схемы - ваши -->
-```python
-# conftest.py
-import os
-from collections.abc import AsyncIterator
-from uuid import uuid4
-
-import pytest_asyncio
-from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
-
-pytest_plugins = ["tallyho.testing.pytest_plugin"]
-
-
-@pytest_asyncio.fixture
-async def engine() -> AsyncIterator[AsyncEngine]:
-    value = create_async_engine(os.environ["TEST_DATABASE_URL"])
-    try:
-        yield value
-    finally:
-        await value.dispose()
-
-
-@pytest_asyncio.fixture
-async def schema(engine: AsyncEngine) -> AsyncIterator[str]:
-    name = f"test_{uuid4().hex}"
-    try:
-        yield name  # схему создаст migrate() внутри tallyho_env
-    finally:
-        async with engine.begin() as connection:
-            await connection.execute(text(f'DROP SCHEMA IF EXISTS "{name}" CASCADE'))
-
-
-# test_reports.py
-import pytest
-
-from tallyho.model.states import BatchState
-from tallyho.testing import TallyhoTestEnv
-
-
-async def build(section: int) -> None: ...
-
-
-@pytest.mark.asyncio
-async def test_report_is_built(tallyho_env: TallyhoTestEnv) -> None:
-    async with tallyho_env.th.batch("report_build", key="report:1") as batch:
-        await batch.map(build, range(3))
-    await tallyho_env.drain()
-    assert (await batch.handle.view()).state is BatchState.SUCCEEDED
-```
-
-| Член `TallyhoTestEnv` | Значение |
-|---|---|
-| `th`, `broker`, `clock`, `engine`, `schema` | установленный клиент, `InlineBroker`, `FakeClock`, движок и схема |
-| `await env.step(n=1)`, `await env.drain()` | то же, что у брокера |
-| `await env.run_maintenance_once()` | один проход фоновых проверок |
-| `await env.close()` | закрыть установку (`th.aclose()`); фикстура вызывает сама |
-
-Хуки в таком тесте регистрируются на `tallyho_env.th` до создания батча. Если приложению нужна
-своя сборка клиента (свои `hook_modules`, настройки, наблюдатель), напишите собственную фикстуру по
-образцу. Порядок такой: `FakeClock`, `InlineBroker`, `Tallyho(...)`, `install`, `migrate`, `yield` и в
-конце `th.aclose()`.
-
-### Закрывайте установку до удаления схемы
+## Закрывайте установку до удаления схемы
 
 После коммита tallyho продолжает работать в фоне: финализирует батч, публикует прогресс. Тест к
 этому моменту может уже закончиться, и фикстура начнёт удалять схему. Фоновое чтение таблиц и
@@ -268,7 +202,7 @@ async def test_report_is_built(tallyho_env: TallyhoTestEnv) -> None:
 `await th.aclose()` дожидается всей фоновой работы, поэтому порядок в фикстуре такой: сначала
 `aclose`, потом удаление схемы и `engine.dispose()`. `tallyho_env` делает это сама: фикстура
 `schema` из вашего `conftest.py` завершается позже неё. Если тест создаёт клиент вручную, закройте
-его в `finally`, как в примерах этого раздела.
+его в `finally`, как в примерах на этой странице.
 
 Закрытой установкой пользоваться нельзя: запись бросает `ClosedError`. Читать состояние батча
 (`handle.view()`) после `aclose` можно - удобно для итоговых проверок.

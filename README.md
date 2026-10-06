@@ -106,7 +106,7 @@ asyncio.run(main())
 | Под-батчи, конвейеры `fed_by`, `spawn`, политики ошибок, пауза и отмена, прогресс, атрибуты и листинг | [Батчи](docs/guide/batches.md) |
 | Записать итог и прогресс в свои таблицы, retention и `release()` | [Хуки](docs/guide/hooks.md) |
 | Тесты с `InlineBroker` и `FakeClock` | [Тестирование](docs/guide/testing.md) |
-| Подключить брокер flexiq | [Адаптер flexiq](docs/guide/flexiq.md) |
+| Подключить брокер flexiq | [Адаптер flexiq](docs/integrations/flexiq.md) |
 | Процессы и maintenance, остановка, autovacuum, pgbouncer, метрики | [Процессы и maintenance](docs/guide/operations.md) |
 | Что не входит в v1 | [Ограничения v1](docs/guide/limitations.md) |
 

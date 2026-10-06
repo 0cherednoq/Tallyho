@@ -366,7 +366,7 @@ finally:
 
 ## guide-flexiq-call-options
 
-Страница: `docs/guide/flexiq.md`.
+Страница: `docs/integrations/flexiq.md`.
 
 <!-- tallyho-example: guide-flexiq-call-options -->
 ```python

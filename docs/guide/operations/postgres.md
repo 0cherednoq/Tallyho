@@ -110,40 +110,9 @@ LIMIT 10;
 
 ## pgbouncer
 
-tallyho работает через pgbouncer в режиме **transaction pooling** с обоими драйверами. Нужно
-отключить кэш подготовленных выражений на стороне драйвера, иначе получите
-`prepared statement does not exist`:
-
-<!-- tallyho-noexec: фрагмент конфигурации: нужен запущенный pgbouncer -->
-```python
-from sqlalchemy.ext.asyncio import create_async_engine
-
-# asyncpg
-engine = create_async_engine(
-    "postgresql+asyncpg://app:secret@pgbouncer:6432/app",
-    connect_args={"statement_cache_size": 0, "prepared_statement_cache_size": 0},
-)
-
-# psycopg 3
-engine = create_async_engine(
-    "postgresql+psycopg://app:secret@pgbouncer:6432/app",
-    connect_args={"prepare_threshold": None},
-)
-```
-
-Через transaction pooling проверены: создание батчей в вашей сессии, выполнение и завершение задач,
-финализация с хуками, `pause`/`resume`.
-
-Двум возможностям нужна сессия, а не транзакция, поэтому им дайте прямое подключение к
-PostgreSQL (или пул pgbouncer в режиме session):
-
-| Что | Почему |
-|---|---|
-| процесс maintenance | лидер удерживает advisory lock уровня сессии; через transaction pooling блокировка «уезжает» на чужое серверное соединение, и выбор лидера перестаёт работать |
-| `handle.watch()` и `handle.wait()` | используют `LISTEN`/`NOTIFY`; через transaction pooling уведомления не приходят, и обновления приходят только по таймауту опроса |
-
-Проще всего завести для процесса maintenance отдельный `AsyncEngine` с прямым DSN. Остальные
-процессы (API, воркеры) могут ходить через pgbouncer.
+tallyho работает через pgbouncer в режиме transaction pooling. Процессу maintenance и вызовам
+`watch()` и `wait()` нужно прямое подключение. Настройки драйверов и подробности собраны на странице
+[pgbouncer](../../integrations/pgbouncer.md).
 
 ## Retention
 

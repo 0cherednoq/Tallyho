@@ -2,7 +2,7 @@
 
 ## Адаптер flexiq
 
-Нужно дополнение `tallyho[flexiq]`. Руководство - [Адаптер flexiq](../../guide/flexiq.md).
+Нужно дополнение `tallyho[flexiq]`. Руководство - [Адаптер flexiq](../../integrations/flexiq.md).
 
 ```{eval-rst}
 .. autoclass:: tallyho.adapters.flexiq.FlexiqAdapter

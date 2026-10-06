@@ -21,6 +21,8 @@ if TYPE_CHECKING:
 _ROOT = Path(__file__).resolve().parents[1]
 # Справочник API импортирует пакет из исходников, а не из установленного wheel.
 sys.path.insert(0, str(_ROOT / "src"))
+# Собственные расширения сайта: таблицы схемы из кода.
+sys.path.insert(0, str(_ROOT / "docs" / "_ext"))
 
 _META = tomllib.loads((_ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]
 # Адрес репозитория задан в одном месте - в pyproject.toml.
@@ -46,12 +48,13 @@ extensions = [
     "sphinx_copybutton",
     "sphinxcontrib.mermaid",
     "sphinx_llm_friendly",
+    "tallyho_schema",
 ]
 
 # В docs/ лежат и внутренние документы проекта (ARCHITECTURE, ACCEPTANCE, plan/): на сайт
 # попадает только то, что перечислено здесь.
-include_patterns = ["index.md", "guide/**", "reference/**"]
-exclude_patterns = ["_build", "_locale"]
+include_patterns = ["index.md", "guide/**", "integrations/**", "architecture/**", "reference/**"]
+exclude_patterns = ["_build", "_locale", "_ext"]
 source_suffix = {".md": "markdown"}
 master_doc = "index"
 
@@ -93,8 +96,10 @@ html_theme_options = {
     "light_logo": "_static/images/logo-light.svg",
     "dark_logo": "_static/images/logo-dark.svg",
     "nav_links": [
-        {"title": "Быстрый старт", "url": "guide/getting-started"},
-        {"title": "Справочник API", "url": "reference/api"},
+        {"title": "Руководство", "url": "guide/getting-started"},
+        {"title": "Интеграции", "url": "integrations/index"},
+        {"title": "Архитектура", "url": "architecture/index"},
+        {"title": "API", "url": "reference/api"},
         {"title": "История изменений", "url": f"{_REPOSITORY}/blob/main/CHANGELOG.md"},
     ],
     # Кнопку «скопировать страницу как Markdown» добавляет sphinx_llm_friendly.

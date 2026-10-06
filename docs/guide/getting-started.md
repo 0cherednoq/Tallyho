@@ -37,10 +37,10 @@ pip install "tallyho[asyncpg]"
 
 Остальные дополнения подключают возможности:
 
-* `tallyho[flexiq]` - адаптер брокера [flexiq](flexiq.md);
-* `tallyho[alembic]` - миграции tallyho внутри ваших ревизий [Alembic](installation.md#alembic);
-* `tallyho[testing]` - [pytest-фикстура](testing.md#pytest-фикстура) с готовой установкой;
-* `tallyho[otel]` - наблюдатель для [OpenTelemetry](operations/observability.md#opentelemetry).
+* `tallyho[flexiq]` - адаптер брокера [flexiq](../integrations/flexiq.md);
+* `tallyho[alembic]` - миграции tallyho внутри ваших ревизий [Alembic](../integrations/alembic.md);
+* `tallyho[testing]` - [pytest-фикстура](../integrations/pytest.md) с готовой установкой;
+* `tallyho[otel]` - наблюдатель для [OpenTelemetry](../integrations/opentelemetry.md).
 
 :::{important}
 Таблицы tallyho и ваши доменные таблицы должны лежать в одной базе PostgreSQL. Схемы могут
@@ -117,7 +117,7 @@ asyncio.run(main())
 ## Про примеры в этой документации
 
 Дальше код показан так, как он выглядел бы в приложении: задачи объявлены через адаптер
-[flexiq](flexiq.md), батчи создаются в обработчиках API, итог пишется хуками в ваши таблицы.
+[flexiq](../integrations/flexiq.md), батчи создаются в обработчиках API, итог пишется хуками в ваши таблицы.
 Объекты `th`, `fq` и `engine` приходят из модуля приложения, он целиком показан в разделе
 [Разбор на примерах](tutorial/overview.md). Имена вроде `mail`, `storage` или `reports`
 обозначают ваш прикладной слой, его реализация для разговора о батчах не важна.
@@ -174,7 +174,7 @@ async def send_email(address: str) -> None:
 ```
 
 Код, который создаёт батчи, при этом не меняется. Подробности - на странице
-[Адаптер flexiq](flexiq.md).
+[Адаптер flexiq](../integrations/flexiq.md).
 
 ## Для LLM-ассистентов
 

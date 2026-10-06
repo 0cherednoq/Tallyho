@@ -8,10 +8,11 @@ Two markers are recognised, each on the line(s) right above a Python fence:
   broker worker, pgbouncer, a user project layout …) and is only accounted for.
 
 README and every page of the documentation site (``docs/index.md``,
-``docs/guide``, ``docs/reference``) are *strict*: a Python fence without one of
-the markers fails the manifest tests. The pages show application code without
-assertions, so most of their fences are ``tallyho-noexec``. The behaviour they
-describe is executed elsewhere: ``tests/examples/guide_scenarios.md`` holds the
+``docs/guide``, ``docs/integrations``, ``docs/architecture``,
+``docs/reference``) are *strict*: a Python fence without one of the markers
+fails the manifest tests. The pages show application code without assertions,
+so most of their fences are ``tallyho-noexec``. The behaviour they describe is
+executed elsewhere: ``tests/examples/guide_scenarios.md`` holds the
 assert-based scenarios of the guide, ``tests/examples/tutorial`` runs the
 tutorial applications. ARCHITECTURE keeps its many illustrative fragments
 unmarked; only its marked blocks are executed.
@@ -44,9 +45,13 @@ README = ROOT / "README.md"
 ARCHITECTURE = ROOT / "docs" / "ARCHITECTURE.md"
 DOCS = ROOT / "docs"
 # Страницы сайта документации (docs/conf.py, include_patterns): главная, руководство, справочник.
+SITE_SECTIONS = ("guide", "integrations", "architecture", "reference")
 GUIDE_PAGES = tuple(
     sorted(
-        [DOCS / "index.md", *(DOCS / "guide").rglob("*.md"), *(DOCS / "reference").rglob("*.md")]
+        [
+            DOCS / "index.md",
+            *(page for section in SITE_SECTIONS for page in (DOCS / section).rglob("*.md")),
+        ]
     )
 )
 # Учебный раздел показывает код приложения на flexiq без проверок: исполняемых блоков в нём нет,
@@ -108,12 +113,26 @@ EXPECTED_GUIDE_PAGES = {
     "guide/tutorial/export.md",
     "guide/tutorial/export-progress.md",
     "guide/tutorial/export-finalization.md",
-    "guide/flexiq.md",
     "guide/operations.md",
     "guide/operations/shutdown.md",
     "guide/operations/postgres.md",
     "guide/operations/observability.md",
     "guide/limitations.md",
+    "integrations/index.md",
+    "integrations/flexiq.md",
+    "integrations/alembic.md",
+    "integrations/pytest.md",
+    "integrations/prometheus.md",
+    "integrations/opentelemetry.md",
+    "integrations/pgbouncer.md",
+    "architecture/index.md",
+    "architecture/lifecycle.md",
+    "architecture/dispatch.md",
+    "architecture/counters.md",
+    "architecture/finalization.md",
+    "architecture/storage.md",
+    "architecture/failures.md",
+    "architecture/extension.md",
     "reference/settings.md",
     "reference/cli.md",
     "reference/errors.md",

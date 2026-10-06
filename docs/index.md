@@ -87,7 +87,7 @@ rate limit делает брокер. Бизнес-статусы и бизне�
 сообщает вам точные факты о батче, а что они значат для кампании или заказа, решаете вы.
 
 Нужны Python 3.11 или новее, PostgreSQL 14 или новее и SQLAlchemy 2.1 в async-режиме. Первый
-поддерживаемый брокер - [flexiq](guide/flexiq.md).
+поддерживаемый брокер - [flexiq](integrations/flexiq.md).
 
 ```{toctree}
 :caption: Начало работы
@@ -119,10 +119,10 @@ guide/testing
 ```
 
 ```{toctree}
-:caption: Брокеры
+:caption: Интеграции
 :hidden:
 
-guide/flexiq
+integrations/index
 ```
 
 ```{toctree}
@@ -134,6 +134,13 @@ guide/operations/shutdown
 guide/operations/postgres
 guide/operations/observability
 guide/limitations
+```
+
+```{toctree}
+:caption: Архитектура
+:hidden:
+
+architecture/index
 ```
 
 ```{toctree}

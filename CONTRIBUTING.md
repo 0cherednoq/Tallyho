@@ -116,9 +116,12 @@ python -m http.server -d docs/_build/html     # посмотреть локал�
 |---|---|
 | главная и оглавление | `docs/index.md` |
 | руководство | `docs/guide/` |
+| интеграции (flexiq, Alembic, pytest, метрики, pgbouncer) | `docs/integrations/` |
+| архитектура для пользователя | `docs/architecture/` |
 | справочник настроек, CLI, ошибок | `docs/reference/` |
 | справочник API из докстрингов | `docs/reference/api/` |
 | конфигурация, стили, логотип | `docs/conf.py`, `docs/_static/` |
+| таблицы схемы из кода (страница «Хранилище») | `docs/_ext/tallyho_schema.py` |
 
 Остальные файлы в `docs/` (ARCHITECTURE, ACCEPTANCE, `plan/`, `benchmarks/`) - внутренние документы
 проекта, на сайт они не попадают: список страниц сайта задаёт `include_patterns` в `docs/conf.py`.

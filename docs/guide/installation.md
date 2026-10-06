@@ -44,9 +44,9 @@ pip install "tallyho[asyncpg,flexiq]"     # с адаптером брокера
 | Extra | Что добавляет |
 |---|---|
 | `asyncpg` / `psycopg` | драйвер PostgreSQL; нужен один из двух |
-| `flexiq` | адаптер брокера [flexiq](flexiq.md) (`flexiq>=2.0,<3`) |
+| `flexiq` | адаптер брокера [flexiq](../integrations/flexiq.md) (`flexiq>=2.0,<3`) |
 | `alembic` | Alembic для встраивания миграций в ваш проект |
-| `testing` | `pytest-asyncio` для [pytest-фикстуры](testing.md#pytest-фикстура) |
+| `testing` | `pytest-asyncio` для [pytest-фикстуры](../integrations/pytest.md) |
 | `otel` | OpenTelemetry API для [наблюдаемости](operations/observability.md) |
 
 ## Клиент `Tallyho`
@@ -173,35 +173,9 @@ await th.migrate()  # повторный вызов ничего не меняе
 
 ### Alembic
 
-Если схемой базы управляет Alembic, вызывайте миграции tallyho из своих ревизий. Нужен extra
-`alembic`.
-
-<!-- tallyho-noexec: файл ревизии выполняет Alembic внутри вашего проекта -->
-```python
-"""add tallyho tables"""
-
-from alembic import op
-
-from tallyho.storage.alembic import upgrade as tallyho_upgrade
-
-
-def upgrade() -> None:
-    tallyho_upgrade(op, version=1, schema="app")
-```
-
-Правила:
-
-* Одна ревизия - одна версия схемы tallyho. Номер версии указывается явно, чтобы ревизия не
-  меняла смысл при обновлении библиотеки. Версии идут подряд, пропускать их нельзя: когда
-  выйдет `version=2`, для неё понадобится следующая ревизия.
-* Актуальную версию схемы возвращает `th.migrate()` и печатает `tallyho migrate`. Сейчас это 1.
-  После обновления библиотеки сравните её с последней версией в своих ревизиях и допишите
-  недостающие.
-* Параметры `upgrade(op, *, version, schema, prefix="th_", lock_timeout=...)` должны совпадать с
-  параметрами клиента `Tallyho`.
-* Транзакцией и порядком управляет Alembic. Работает и offline-режим (`alembic upgrade --sql`).
-* Ревизия записывает версию в служебную таблицу, поэтому `th.migrate()` после неё ничего не делает.
-* Обратных миграций (`downgrade`) в v1 нет.
+Если схемой базы управляет Alembic, миграции tallyho вызываются из ваших ревизий функцией
+`tallyho.storage.alembic.upgrade`. Подключение и правила описаны на странице
+[Alembic](../integrations/alembic.md).
 
 ### Командная строка
 
