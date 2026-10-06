@@ -78,11 +78,26 @@ Maintenance работает в процессе харнесса, как в API
 * Nightly-профиль P-04 выполняет 2M Items через воркеры. Если на runner не хватает 120 минут
   таймаута job, уменьшите ячейки в `PARAMS[Profile.NIGHTLY]` и запишите это в DECISIONS.
 
-## Как добавить вариант нагрузки (T11.6)
+## Оверхед против taskiq и flexiq (T11.6)
+
+```bash
+uv run poe bench-overhead                                   # 100 000 задач x 3, 2 x 20, все варианты
+uv run poe bench-overhead --tasks 20000 --variants flexiq,tallyho --label quick
+uv run python -m benchmarks.overhead_cli --help             # ещё --scheduler-batch, --completer-tick-ms, --dsn
+```
+
+Варианты: `taskiq-memory` (InMemoryBroker в процессе харнесса), `taskiq-redis` (ListQueueBroker и
+контейнер `bench-redis-<run>`), `flexiq` и `tallyho` (как в P-01). Задача — `print(f"task {i}")`.
+Каждый повтор каждого варианта — на чистом состоянии (свежие схемы, новые воркеры, `FLUSHDB`),
+повторы чередуются по вариантам. Итог — `.work-tmp/overhead/<label>/results.json` и `results.md`.
+Методика и результаты на машине разработчика — [overhead.md](overhead.md).
+
+## Как добавить вариант нагрузки
 
 `benchmarks/overhead.py` описывает протокол `LoadVariant` (`start`, `submit`, `wait`, `timings`,
 `stop`) и функцию `measure(variant, spec, root)`: прогрев, повторы, `RunMeasurement` на каждый
-повтор. `median_run` выбирает медианный повтор. Реализации — `FlexiqVariant` и `TallyhoVariant`.
-Вариант taskiq (InMemory, Redis) реализует тот же протокол, и P-01 / `poe bench-overhead` сравнивают
-все варианты одной и той же функцией `measure`. Тело задачи с `print(f"task {i}")` уже есть
-(`OverheadSpec(print_output=True)`); вывод воркеров пишется в их `worker-*.log`.
+повтор. `median_run` выбирает медианный повтор. Реализации — `FlexiqVariant`, `TallyhoVariant`
+(`benchmarks/overhead.py`), `TaskiqMemoryVariant` и `TaskiqRedisVariant`
+(`benchmarks/taskiq_variants.py`); `benchmarks/overhead_cli.py` сравнивает их одной функцией
+`measure`. Тело задачи с `print(f"task {i}")` включает `OverheadSpec(print_output=True)`; вывод
+воркеров пишется в их `worker-*.log`.
