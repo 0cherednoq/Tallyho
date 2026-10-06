@@ -328,6 +328,11 @@ def test_scenarios_name_the_page_they_support() -> None:
     assert all((ROOT / page).is_file() for page in pages)
 
 
+def test_llms_txt_links_resolve() -> None:
+    # llms.txt - карта репозитория для LLM-ассистентов: каждая ссылка ведёт на существующий файл.
+    assert broken_links(ROOT / "llms.txt") == []
+
+
 def test_tutorial_scenarios_are_tested_outside_the_pages() -> None:
     assert any(python_fences(page) for page in GUIDE_PAGES if TUTORIAL in page.parents)
     source = TUTORIAL_TESTS.read_text(encoding="utf-8")

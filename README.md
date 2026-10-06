@@ -110,6 +110,9 @@ asyncio.run(main())
 | Процессы и maintenance, остановка, autovacuum, pgbouncer, метрики | [Процессы и maintenance](docs/guide/operations.md) |
 | Что не входит в v1 | [Ограничения v1](docs/guide/limitations.md) |
 
+Для ИИ-ассистентов в корне лежит [llms.txt](llms.txt): краткие правила работы с библиотекой и
+карта документации со ссылками на файлы репозитория.
+
 ## Разработка
 
 Нужен [uv](https://docs.astral.sh/uv/) и (для интеграционных тестов) Docker.

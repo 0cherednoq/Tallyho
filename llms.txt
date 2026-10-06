@@ -1,0 +1,176 @@
+# tallyho
+
+> Async-библиотека для Python и PostgreSQL. Добавляет к брокеру задач учёт группы задач: батчи и
+> под-батчи, прогресс, финализацию ровно один раз, задачи, которые порождают задачи, конвейеры
+> этапов и хуки, которые пишут итог в таблицы приложения той же транзакцией. Задачи исполняет
+> брокер (первый адаптер - flexiq), состояние лежит в таблицах `th_*` базы приложения.
+
+Этот файл - карта для LLM-ассистента. Все ссылки ведут на Markdown-файлы репозитория, сайт
+открывать не нужно. Страницы написаны в MyST Markdown: строки с `:::` и блоки `{toctree}` -
+разметка сайта, их можно пропускать.
+
+## Главное за минуту
+
+Требования: Python 3.11 и новее, PostgreSQL 14 и новее, SQLAlchemy 2.1 и новее только в
+async-режиме, драйвер `asyncpg` или `psycopg`. Таблицы tallyho и таблицы приложения лежат в одной базе.
+
+```python
+# app/tasks.py - один модуль на API и воркеры
+from flexiq import Queue
+from sqlalchemy.ext.asyncio import create_async_engine
+
+from tallyho import Tallyho, item
+from tallyho.adapters.flexiq import FlexiqAdapter
+
+engine = create_async_engine("postgresql+asyncpg://app:secret@db/app")
+queue = Queue(backend="postgres", db_url="postgresql://app:secret@db/app", schema="flexiq")
+th = Tallyho(engine, schema="app", hook_modules=["app.hooks"])
+fq = FlexiqAdapter(queue)
+th.install(fq)  # до объявления задач
+
+
+@fq.task(max_retries=4, retry_on=[TemporaryError], queue="mail")
+async def send_email(address: str) -> None:
+    try:
+        await provider.send(address)
+    except HardBounce:
+        item.error("hard_bounce")  # ошибочный итог без ретраев
+        return
+    item.ok("sent")  # TemporaryError не ловим: это ретрай брокера
+
+
+# создание батча, в транзакции приложения
+async with th.batch("newsletter", key=f"issue:{issue_id}", session=session) as batch:
+    await batch.map(send_email, addresses)
+batch_id = batch.handle.id  # commit делает вызывающий
+
+
+# итог в таблицу приложения, атомарно с завершением батча
+@th.on_finalized("newsletter")
+async def save_result(session, summary) -> None:
+    await session.execute(update(issues).where(...).values(sent=summary.progress.ok))
+
+
+# чтение прогресса
+view = await (await th.find("newsletter", f"issue:{issue_id}")).view()
+view.state, view.progress.found, view.progress.done, dict(view.labels)
+```
+
+## Правила, которые нельзя нарушать
+
+- Задача - только `async def`. Ставить её нужно через tallyho (`batch.add`, `batch.map`,
+  `batch.add_calls`, `item.spawn`): задача, поставленная напрямую в брокер, в батч не попадёт.
+- Итог задачи: `item.ok(label)`, `item.skip(label)`, `item.error(label)`. Исключение, вышедшее из
+  задачи, ведёт к ретраю брокера и итогом не считается. Выпускать наружу только то, что лечится
+  повтором.
+- Задача может начаться повторно (at-least-once). Побочные эффекты делать идемпотентными.
+- Хук (`on_finalized`, `on_progress`, `on_policy_breach`): только работа с базой через переданную
+  сессию, без `commit()` и `rollback()`. Писать абсолютные значения: хук может выполниться больше одного
+  раза, закоммитится один.
+- Модули с хуками перечислить в `hook_modules`: хук должен быть зарегистрирован в каждом процессе.
+- Порядок блокировок: сначала строка приложения, потом вызов tallyho с `session=`.
+- Батч без `seal` не завершится. Выход из `async with th.batch(...)` закрывает его сам; этап с
+  `fed_by` закрывает библиотека.
+- В каждом процессе при остановке вызывать `await th.aclose()`.
+- Нужен процесс maintenance (`th.maintenance().run()` или `tallyho maintenance`), лучше два. Без
+  него не возвращаются задачи умерших воркеров и не вызывается `on_progress`.
+- Воркер flexiq - только `pool="thread"`.
+- Одинаковые `schema`, `prefix` и настройки учёта во всех процессах установки.
+
+## Конвейер
+
+```python
+async with th.batch("mail_export", key=f"run:{run_id}", max_items=2_000_000) as root:
+    pages = root.sub_batch("pages", max_depth=5_000)
+    messages = root.sub_batch("messages", fed_by=[pages])        # этап наполняют задачи pages
+    root.sub_batch("attachments", fed_by=[messages], max_in_flight=20)
+    await pages.add_calls(th.call(list_page, mailbox).opts(key=f"{mailbox}:first") for mailbox in ids)
+
+# внутри задачи
+item.spawn(fetch_message, mailbox, message_id, into="messages", key=f"{mailbox}/{message_id}")
+item.spawn(list_page, mailbox, next_cursor)  # без into= - в свой этап
+```
+
+Заказанные задачи записываются одной транзакцией с итогом задачи-заказчика. `key` дедуплицирует.
+Прогресс этапов - в `view.children["messages"].progress`; у корня `found` считает этапы.
+
+## С чего начать
+
+- [Быстрый старт](docs/guide/getting-started.md): установка, первый батч, как читать примеры
+- [Основные понятия](docs/guide/concepts.md): словарь, состояния, гарантии, таблица сбоев
+- [Установка и миграции](docs/guide/installation.md): клиент `Tallyho`, схема и префикс, `migrate()`
+
+## Примеры приложений целиком
+
+- [Общая часть](docs/guide/tutorial/overview.md): модуль с клиентом и адаптером, воркер
+- [Проверка аккаунтов](docs/guide/tutorial/checker.md): один батч, вердикты, итог, повтор упавших
+- [Экспорт почты](docs/guide/tutorial/export.md): конвейер из трёх этапов, пагинация, дедупликация
+- [Экспорт почты: прогресс](docs/guide/tutorial/export-progress.md): счётчики этапов, оценка, `watch()`
+- [Экспорт почты: итог и сбои](docs/guide/tutorial/export-finalization.md): `on_finalized`, `retry_failed`
+
+## Руководство
+
+- [Батчи](docs/guide/batches.md): `th.batch`, параметры, своя транзакция, потоковое добавление
+- [Задача и её итог](docs/guide/batches/tasks.md): все вызовы `item.*`, правила итога, `th.call(...).opts(...)`
+- [Под-батчи и конвейеры](docs/guide/batches/pipelines.md): `sub_batch`, `fed_by`, `spawn`, `into=`, лимиты
+- [Политики ошибок](docs/guide/batches/failure-policies.md): `continue_`, `fail_fast`, `threshold`
+- [Пауза, отмена, повтор](docs/guide/batches/operations.md): операции `BatchHandle`
+- [Чтение прогресса](docs/guide/batches/progress.md): поля `BatchView` и `Progress`, `watch`, `wait`
+- [Атрибуты и листинг](docs/guide/batches/attributes.md): `attributes`, `memo`, `list_batches`, `handle.items`
+- [Хуки](docs/guide/hooks.md): регистрация, `BatchSummary`, правила транзакции хука
+- [Повтор упавшего хука](docs/guide/hooks/retry.md)
+- [Колбэк-задачи](docs/guide/hooks/callbacks.md): `on_succeeded=th.call(...)` и другие
+- [Итог задачи в своей транзакции](docs/guide/hooks/complete-in.md): `item.complete_in`, `LeaseLostError`
+- [Retention и release](docs/guide/hooks/retention.md)
+- [Рецепт: строка на каждого получателя](docs/guide/hooks/recipe.md)
+- [Тестирование](docs/guide/testing.md): `InlineBroker`, `FakeClock`, `run_maintenance_once`
+
+## Интеграции
+
+- [flexiq](docs/integrations/flexiq.md): адаптер, опции постановки, ретраи и DLQ, остановка воркера
+- [Alembic](docs/integrations/alembic.md)
+- [pytest](docs/integrations/pytest.md): фикстура `tallyho_env`
+- [Prometheus](docs/integrations/prometheus.md)
+- [OpenTelemetry](docs/integrations/opentelemetry.md)
+- [pgbouncer](docs/integrations/pgbouncer.md)
+
+## Эксплуатация
+
+- [Процессы и maintenance](docs/guide/operations.md): кто что делает, отправка в брокер, сверка с DLQ
+- [Корректная остановка](docs/guide/operations/shutdown.md): `th.aclose()`, порядок по процессам
+- [PostgreSQL](docs/guide/operations/postgres.md): autovacuum, длинные транзакции, уровень изоляции
+- [Наблюдаемость](docs/guide/operations/observability.md): логи, события `Observer`, алерты, диагностика
+- [Ограничения v1](docs/guide/limitations.md): чего нет и чем заменить
+
+## Архитектура
+
+- [Обзор](docs/architecture/index.md)
+- [Жизненный цикл](docs/architecture/lifecycle.md): состояния батча и задачи, аренда
+- [Запись и отправка в брокер](docs/architecture/dispatch.md)
+- [Счётчики и прогресс](docs/architecture/counters.md): откуда `expected`, `ratio`, `eta`
+- [Финализация и хуки](docs/architecture/finalization.md)
+- [Модель отказов](docs/architecture/failures.md): каждый сбой и срок восстановления
+- [Точки расширения](docs/architecture/extension.md): свой брокер, наблюдатель, часы
+- [Хранилище](docs/architecture/storage.md): таблицы на странице строятся при сборке сайта; в
+  репозитории их определение - [src/tallyho/storage/tables.py](src/tallyho/storage/tables.py),
+  описания колонок - [docs/_ext/tallyho_schema.py](docs/_ext/tallyho_schema.py)
+
+## Справочник
+
+- [Настройки](docs/reference/settings.md): все именованные аргументы `Tallyho(...)` с умолчаниями
+- [Командная строка](docs/reference/cli.md): `tallyho migrate`, `maintenance`, `inspect`
+- [Ошибки](docs/reference/errors.md): какое исключение когда бросается
+- Справочник API на сайте строится из докстрингов. В репозитории читать исходники:
+  [клиент](src/tallyho/api/client.py), [батч и handle](src/tallyho/api/batch.py),
+  [`item` и `callback`](src/tallyho/runtime/context.py), [снимки и сводки](src/tallyho/model/views.py),
+  [состояния](src/tallyho/model/states.py), [исключения](src/tallyho/model/errors.py),
+  [адаптер flexiq](src/tallyho/adapters/flexiq/adapter.py), [тестовые инструменты](src/tallyho/testing/broker.py)
+
+## Необязательное
+
+- [Проверяемые сценарии примеров](tests/examples/guide_scenarios.md): те же примеры с `assert`,
+  выполняются в CI
+- [Сценарии учебного раздела](tests/examples/tutorial/test_tutorial.py)
+- [ARCHITECTURE.md](docs/ARCHITECTURE.md): внутренний документ с подробностями реализации
+- [AGENTS.md](AGENTS.md): правила для тех, кто меняет саму библиотеку
+- [CHANGELOG.md](CHANGELOG.md)
