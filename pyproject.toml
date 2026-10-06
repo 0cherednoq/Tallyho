@@ -18,7 +18,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
 license-files = ["LICENSE"]
-authors = [{ email = "0cherednoq@users.noreply.github.com" }]
+authors = [{ name = "0cherednoq" }]
 keywords = ["asyncio", "batch", "postgresql", "sqlalchemy", "task-queue", "outbox", "fan-out"]
 classifiers = [
   "Development Status :: 2 - Pre-Alpha",
@@ -36,7 +36,7 @@ classifiers = [
   "Typing :: Typed",
 ]
 dependencies = [
-  "sqlalchemy[asyncio]>=2.1",
+  "sqlalchemy[asyncio]>=2.0",
   "typing-extensions>=4.10",
 ]
 
@@ -114,7 +114,20 @@ default-groups = ["dev", "bench"]
 packages = ["src/tallyho"]
 
 [tool.hatch.build.targets.sdist]
-include = ["src/tallyho", "tests", "docs", "README.md", "CHANGELOG.md", "LICENSE"]
+include = [
+  "src/tallyho",
+  "tests",
+  "docs",
+  "README.md",
+  "CHANGELOG.md",
+  "SECURITY.md",
+  "LICENSE",
+]
+exclude = [
+  "/.uv-cache",
+  "/docs/_build",
+  "/docs/plan",
+]
 
 # -----------------------------------------------------------------------------
 # Task runner: `uv run poe <task>`

@@ -98,7 +98,7 @@
 
 Подробно — [docs/guide/limitations.md](docs/guide/limitations.md).
 
-- Только PostgreSQL ≥ 14 и SQLAlchemy ≥ 2.1 в async-режиме; таблицы библиотеки и доменные таблицы —
+- Только PostgreSQL ≥ 14 и SQLAlchemy ≥ 2.0 в async-режиме; таблицы библиотеки и доменные таблицы —
   в одной базе.
 - Отслеживаемые задачи — только `async def`.
 - flexiq: только `pool="thread"`; опции `depends_on`, `debounce*` и `@task(batch=…)` не

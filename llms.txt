@@ -11,7 +11,7 @@
 
 ## Главное за минуту
 
-Требования: Python 3.11 и новее, PostgreSQL 14 и новее, SQLAlchemy 2.1 и новее только в
+Требования: Python 3.11 и новее, PostgreSQL 14 и новее, SQLAlchemy 2.0 и новее только в
 async-режиме, драйвер `asyncpg` или `psycopg`. Таблицы tallyho и таблицы приложения лежат в одной базе.
 
 ```python

@@ -70,8 +70,8 @@ JSON не подходит: он теряет bytes, datetime и Decimal, пре
 * `threshold`: обработанные — `ok + skip + error`, отменённые не учитываются. Числитель — `error` или, если задан фильтр, сумма меток из `labels`. Срабатывает при `processed ≥ min_processed` и доле **строго больше** `ratio`. По умолчанию `min_processed=0`, `action="fail"`. `fail_fast` срабатывает на первой ошибке без учёта `min_processed`.
 * `PolicyBreach.labels: list[str]`: пример в §12.4 ждёт `['hard_bounce']` в f-строке. Из-за этого объект нехешируемый.
 
-## D-019 · SQLAlchemy ≥ 2.1 · ACCEPTED (автономно, пересмотреть) (T2.1)
-`Table(..., postgresql_with=...)` (fillfactor, per-table autovacuum) в 2.0.x даёт `ArgumentError`. Кроме того, `TypedColumns` из 2.1 дают типизированные `table.c.*`: голый `Table` раскрывается в `Column[Any]`, а это ломает `disallow_any_explicit`. ARCHITECTURE §1/§4.1 и `pyproject.toml` обновлены.
+## D-019 · SQLAlchemy ≥ 2.0 · ACCEPTED (пересмотрено)
+Основной путь использует `TypedColumns` и `postgresql_with` из 2.1. Для 2.0 compatibility-слой копирует декларации колонок в обычный `Table` и компилирует тот же PostgreSQL `WITH (...)`; DDL обеих веток побайтово совпадает. Статическая типизация по-прежнему проверяется на 2.1, поэтому `table.c.*` не деградирует до `Column[Any]`. Совместимость с нижней границей 2.0 проверяет отдельный CI job.
 
 ## D-020 · Предикаты partial-индексов — литералы · ACCEPTED (T2.1)
 Индекс sweeper'а по `th_batch.updated_at` построен с условием `state < 10` (активные). Индексы дедлайнов и снимков — `state IN (0, 1)`. **В запросах горячего пути условие по `state` пишется литералом, а не bind-параметром.** Иначе после пяти выполнений asyncpg переходит на generic plan и перестаёт брать partial-индекс. Условие запроса должно логически следовать из предиката индекса. Добавлен индекс `th_expiry(expires_at)`, которого нет в §5.2.

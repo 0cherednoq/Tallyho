@@ -6,7 +6,7 @@
 
 * CPython 3.11 или новее;
 * PostgreSQL 14 или новее;
-* SQLAlchemy 2.1 в async-режиме и один из драйверов, `asyncpg` или `psycopg`.
+* SQLAlchemy 2.0+ в async-режиме и один из драйверов, `asyncpg` или `psycopg`.
 
 ::::{tab-set}
 

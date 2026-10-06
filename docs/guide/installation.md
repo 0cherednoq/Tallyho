@@ -6,7 +6,7 @@
 |---|---|
 | Python | 3.11 и новее |
 | PostgreSQL | 14 и новее |
-| SQLAlchemy | 2.1 и новее, только async (`AsyncEngine`, `AsyncSession`, `AsyncConnection`) |
+| SQLAlchemy | 2.0 и новее, только async (`AsyncEngine`, `AsyncSession`, `AsyncConnection`) |
 | Драйвер | `asyncpg` от 0.29 или `psycopg` от 3.1 |
 
 :::{important}

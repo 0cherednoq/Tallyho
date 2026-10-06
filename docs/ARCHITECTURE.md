@@ -49,7 +49,7 @@
 
 | Требование | Как выполняется |
 |---|---|
-| PostgreSQL (≥ 14) | SQLAlchemy 2.1 Core, PG-специфика используется свободно: `SKIP LOCKED`, `LISTEN/NOTIFY`, advisory locks, `unnest` для bulk, partial-индексы |
+| PostgreSQL (≥ 14) | SQLAlchemy 2.0+ Core, PG-специфика используется свободно: `SKIP LOCKED`, `LISTEN/NOTIFY`, advisory locks, `unnest` для bulk, partial-индексы |
 | Таблицы в схеме пользователя | `schema=`: имя схемы записано в таблицах библиотеки и попадает в каждый её запрос (§11.1) |
 | Интеграция с любым брокером | Протоколы `Dispatcher` + `Runtime`, первый адаптер — flexiq |
 | Быстрые запросы на больших объёмах | Узкие индексы без изменяемых колонок, side-таблицы для разреженных множеств, UUIDv7, групповой коммит (§9) |
@@ -354,7 +354,7 @@ classDiagram
 |---|---|---|---|
 | Python | ≥ 3.11 | да | `TaskGroup`, `StrEnum`, `Self`, `ExceptionGroup` |
 | PostgreSQL | ≥ 14 | да | партиционирование и `MERGE` — задел на v2; всё остальное работает и на 12+ |
-| `sqlalchemy[asyncio]` | ≥ 2.1 | да | Core, `postgresql_with` у `Table` (storage-параметры), приём сессии пользователя, Alembic |
+| `sqlalchemy[asyncio]` | ≥ 2.0 | да | Core, storage-параметры PostgreSQL (с compatibility-слоем для 2.0), приём сессии пользователя, Alembic |
 | `asyncpg` или `psycopg[binary]` | ≥ 0.29 / ≥ 3.1 | один из | драйвер |
 | `typing-extensions` | ≥ 4.10 | да | `ParamSpec`/`TypeVar` defaults на 3.11 |
 | `flexiq` | `>=2.0,<3` | extra `flexiq` | адаптер |

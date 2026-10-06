@@ -26,7 +26,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Final, final
+from typing import TYPE_CHECKING, Final, Protocol, TypeVar, cast, final
 
 from sqlalchemy import (
     BigInteger,
@@ -42,7 +42,6 @@ from sqlalchemy import (
     SmallInteger,
     Table,
     Text,
-    TypedColumns,
     Uuid,
     and_,
     any_,
@@ -51,12 +50,129 @@ from sqlalchemy import (
     text,
 )
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB
+from sqlalchemy.ext.compiler import compiles
+from sqlalchemy.schema import CreateTable
 
 from tallyho.model.states import TERMINAL_THRESHOLD, BatchState, OnFeederFailed
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
     from datetime import datetime, timedelta
     from uuid import UUID
+
+    from sqlalchemy import TypedColumns
+
+    _native_typed_columns = True
+else:
+    try:
+        from sqlalchemy import TypedColumns
+    except ImportError:
+        # SQLAlchemy 2.0 не экспортирует TypedColumns. Runtime-fallback ниже
+        # сохраняет ту же декларативную форму, а статическую типизацию проверяем
+        # по SQLAlchemy 2.1, где этот API определён.
+        class TypedColumns:
+            """Совместимая runtime-база контейнеров колонок для SQLAlchemy 2.0."""
+
+        _native_typed_columns = False
+    else:
+        _native_typed_columns = True
+
+_ColumnsT = TypeVar("_ColumnsT", bound=TypedColumns)
+_POSTGRESQL_WITH = "with"
+
+
+class _CreateTableCompiler(Protocol):
+    """Минимальная часть DDLCompiler, используемая compatibility hook."""
+
+    def visit_create_table(self, element: CreateTable, **kwargs: object) -> str:
+        """Скомпилировать штатный CREATE TABLE."""
+        ...
+
+
+class _CopyableColumn(Protocol):
+    """Внутренний API копирования Column, общий для ветки SQLAlchemy 2.0."""
+
+    def _copy(self) -> Column[object]:
+        """Вернуть непривязанную копию колонки."""
+        ...
+
+
+class _TableFactory(Protocol):
+    """Общая runtime-сигнатура Table для обеих веток SQLAlchemy."""
+
+    def __call__(
+        self,
+        name: str,
+        metadata: MetaData,
+        *items: object,
+        postgresql_with: dict[str, int] | None,
+    ) -> Table[TypedColumns]:
+        """Создать таблицу."""
+        ...
+
+
+if not _native_typed_columns:
+    # В 2.1 этот dialect kwarg зарегистрирован самим PostgreSQL dialect.
+    Table.argument_for("postgresql", _POSTGRESQL_WITH, None)
+
+
+@compiles(CreateTable, "postgresql")
+def _compile_create_table(element: CreateTable, compiler: object, **kwargs: object) -> str:
+    """Добавить PostgreSQL storage parameters на SQLAlchemy 2.0.
+
+    Returns:
+        Скомпилированный PostgreSQL ``CREATE TABLE``.
+    """
+    ddl_compiler = cast("_CreateTableCompiler", compiler)
+    statement = ddl_compiler.visit_create_table(element, **kwargs)
+    if _native_typed_columns:
+        return statement
+    parameters = cast(
+        "dict[str, int | bool | str | None] | None",
+        element.element.dialect_options["postgresql"][_POSTGRESQL_WITH],
+    )
+    if not parameters:
+        return statement
+    rendered = ", ".join(
+        key
+        if value is None
+        else f"{key} = {str(value).lower() if isinstance(value, bool) else value}"
+        for key, value in parameters.items()
+    )
+    return f"{statement.rstrip()}\n WITH ({rendered})\n\n"
+
+
+def _table(
+    name: str,
+    metadata: MetaData,
+    columns: type[_ColumnsT],
+    *,
+    postgresql_with: dict[str, int] | None = None,
+) -> Table[_ColumnsT]:
+    """Создать типизированную таблицу на SQLAlchemy 2.0 и 2.1.
+
+    Returns:
+        Таблица с типизированной коллекцией колонок.
+    """
+    factory = cast("_TableFactory", cast("object", Table))
+    if _native_typed_columns:
+        return cast(
+            "Table[_ColumnsT]",
+            factory(name, metadata, columns, postgresql_with=postgresql_with),
+        )
+    copied: list[Column[object]] = []
+    namespace = cast("Mapping[str, object]", cast("object", vars(columns)))
+    for column_name, value in namespace.items():
+        if isinstance(value, Column):
+            column = cast("_CopyableColumn", value)._copy()  # ruff: ignore[private-member-access]  # pyright: ignore[reportPrivateUsage]  # Column.copy() deprecated without a public SQLAlchemy 2.0 replacement
+            column.name = column_name
+            column.key = column_name
+            copied.append(column)
+    return cast(
+        "Table[_ColumnsT]",
+        factory(name, metadata, *copied, postgresql_with=postgresql_with),
+    )
+
 
 __all__ = [
     "DEFAULT_PREFIX",
@@ -386,29 +502,29 @@ def build_metadata(
         outbox=_outbox(metadata, prefix),
         lease=_lease(metadata, prefix),
         feed=_feed(metadata, prefix),
-        counter=Table(
+        counter=_table(
             f"{prefix}counter",
             metadata,
             CounterColumns,
             postgresql_with={"fillfactor": _HOT_FILLFACTOR, **_AGGRESSIVE_AUTOVACUUM},
         ),
         counter_delta=_counter_delta(metadata, prefix),
-        metric=Table(
+        metric=_table(
             f"{prefix}metric",
             metadata,
             MetricColumns,
             postgresql_with={"fillfactor": _HOT_FILLFACTOR, **_AGGRESSIVE_AUTOVACUUM},
         ),
-        item_mark=Table(f"{prefix}item_mark", metadata, ItemMarkColumns),
+        item_mark=_table(f"{prefix}item_mark", metadata, ItemMarkColumns),
         expiry=_expiry(metadata, prefix),
         window=_window(metadata, prefix),
-        meta=Table(f"{prefix}meta", metadata, MetaColumns),
+        meta=_table(f"{prefix}meta", metadata, MetaColumns),
     )
 
 
 def _batch(metadata: MetaData, prefix: str) -> Table[BatchColumns]:
     name = f"{prefix}batch"
-    batch = Table(name, metadata, BatchColumns)
+    batch = _table(name, metadata, BatchColumns)
     c = batch.c
     Index(
         f"{name}_kind_key_uq",
@@ -458,7 +574,7 @@ def _batch_attr(metadata: MetaData, prefix: str) -> Table[BatchAttrColumns]:
     # Отдельная таблица, а не колонки th_batch: строка батча часто обновляется,
     # и каждое не-HOT обновление заново писало бы jsonb в GIN.
     name = f"{prefix}batch_attr"
-    attr = Table(name, metadata, BatchAttrColumns)
+    attr = _table(name, metadata, BatchAttrColumns)
     Index(
         f"{name}_attributes_idx",
         attr.c.attributes,
@@ -470,7 +586,7 @@ def _batch_attr(metadata: MetaData, prefix: str) -> Table[BatchAttrColumns]:
 
 def _item(metadata: MetaData, prefix: str) -> Table[ItemColumns]:
     name = f"{prefix}item"
-    item = Table(name, metadata, ItemColumns, postgresql_with={"fillfactor": _ITEM_FILLFACTOR})
+    item = _table(name, metadata, ItemColumns, postgresql_with={"fillfactor": _ITEM_FILLFACTOR})
     c = item.c
     # Только неизменяемые колонки: finish остаётся HOT update.
     Index(f"{name}_batch_idx", c.batch_id, c.id)
@@ -486,7 +602,7 @@ def _item(metadata: MetaData, prefix: str) -> Table[ItemColumns]:
 
 def _outbox(metadata: MetaData, prefix: str) -> Table[OutboxColumns]:
     name = f"{prefix}outbox"
-    outbox = Table(name, metadata, OutboxColumns, postgresql_with=_AGGRESSIVE_AUTOVACUUM)
+    outbox = _table(name, metadata, OutboxColumns, postgresql_with=_AGGRESSIVE_AUTOVACUUM)
     Index(f"{name}_available_idx", outbox.c.available_at)
     # (batch_id, available_at): pause/cancel по батчу и окно max_in_flight —
     # запаркованные (infinity) и готовые к отправке записи одного батча.
@@ -496,7 +612,7 @@ def _outbox(metadata: MetaData, prefix: str) -> Table[OutboxColumns]:
 
 def _lease(metadata: MetaData, prefix: str) -> Table[LeaseColumns]:
     name = f"{prefix}lease"
-    lease = Table(name, metadata, LeaseColumns, postgresql_with=_AGGRESSIVE_AUTOVACUUM)
+    lease = _table(name, metadata, LeaseColumns, postgresql_with=_AGGRESSIVE_AUTOVACUUM)
     Index(f"{name}_until_idx", lease.c.lease_until)
     Index(f"{name}_batch_idx", lease.c.batch_id)
     return lease
@@ -504,14 +620,14 @@ def _lease(metadata: MetaData, prefix: str) -> Table[LeaseColumns]:
 
 def _feed(metadata: MetaData, prefix: str) -> Table[FeedColumns]:
     name = f"{prefix}feed"
-    feed = Table(name, metadata, FeedColumns)
+    feed = _table(name, metadata, FeedColumns)
     Index(f"{name}_fed_idx", feed.c.fed_id)
     return feed
 
 
 def _counter_delta(metadata: MetaData, prefix: str) -> Table[CounterDeltaColumns]:
     name = f"{prefix}counter_delta"
-    delta = Table(name, metadata, CounterDeltaColumns, postgresql_with=_AGGRESSIVE_AUTOVACUUM)
+    delta = _table(name, metadata, CounterDeltaColumns, postgresql_with=_AGGRESSIVE_AUTOVACUUM)
     Index(f"{name}_batch_idx", delta.c.batch_id)
     Index(f"{name}_created_idx", delta.c.created_at, delta.c.id)
     return delta
@@ -520,7 +636,7 @@ def _counter_delta(metadata: MetaData, prefix: str) -> Table[CounterDeltaColumns
 def _expiry(metadata: MetaData, prefix: str) -> Table[ExpiryColumns]:
     # Sweeper ищет не захваченные вовремя Items по сроку.
     name = f"{prefix}expiry"
-    expiry = Table(name, metadata, ExpiryColumns)
+    expiry = _table(name, metadata, ExpiryColumns)
     Index(f"{name}_expires_idx", expiry.c.expires_at)
     return expiry
 
@@ -528,6 +644,6 @@ def _expiry(metadata: MetaData, prefix: str) -> Table[ExpiryColumns]:
 def _window(metadata: MetaData, prefix: str) -> Table[WindowColumns]:
     # Relay считает занятое окно батча по batch_id.
     name = f"{prefix}window"
-    window = Table(name, metadata, WindowColumns, postgresql_with=_AGGRESSIVE_AUTOVACUUM)
+    window = _table(name, metadata, WindowColumns, postgresql_with=_AGGRESSIVE_AUTOVACUUM)
     Index(f"{name}_batch_idx", window.c.batch_id)
     return window
