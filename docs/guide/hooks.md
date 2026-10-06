@@ -1,37 +1,34 @@
 # Хуки
 
-[← Оглавление](README.md) · назад: [Батчи и конвейеры](batches.md) · далее: [Тестирование](testing.md)
-
 ## Зачем нужны хуки
 
-Прогресс и итог батча обычно нужны в **вашей** таблице: `campaigns.sent`, `campaigns.status`.
-Причин три:
+Прогресс и итог батча обычно нужны в вашей таблице: `campaigns.sent`, `campaigns.status`.
+На это есть причины:
 
 1. Таблицы tallyho очищаются по retention, а итог кампании нужен навсегда.
 2. Списки, сортировки и фильтры по вашей таблице не должны зависеть от служебных таблиц.
-3. Доменный статус должен меняться ровно тогда, когда батч действительно завершился: не раньше и
-   не позже.
+3. Доменный статус должен меняться в тот момент, когда батч завершился.
 
-Привычные решения этого не дают. Задача-колбэк в брокере — это второй коммит: батч уже завершён, а
+Привычные решения этого не дают. Задача-колбэк в брокере - это второй коммит: батч уже завершён, а
 колбэк ещё в очереди или упал. `UPDATE campaigns SET sent = sent + 1` в каждой задаче создаёт
 горячую строку в вашей таблице. Опрос `view()` теряет данные, если поллер отстал дольше retention.
 
-**Транзакционный хук (tx-хук)** — ваша функция, которую tallyho выполняет **внутри своей
-транзакции** на событии батча. Ваши изменения и изменение состояния батча коммитятся вместе или
+**Транзакционный хук (tx-хук)** - ваша функция, которую tallyho выполняет внутри своей
+транзакции на событии батча. Ваши изменения и изменение состояния батча коммитятся вместе или
 вместе откатываются.
 
 | Хук | Когда вызывается | Гарантия |
 |---|---|---|
-| `on_finalized(session, summary)` | батч переходит в терминальное состояние | ровно один успешный коммит, атомарно с финализацией. Хук упал — финализации нет, будет повтор |
+| `on_finalized(session, summary)` | батч переходит в терминальное состояние | ровно один успешный коммит, атомарно с финализацией. Хук упал - финализации нет, будет повтор |
 | `on_progress(session, summary)` | не чаще `every` на батч и только если счётчики изменились | снимки монотонны по `summary.seq`; опоздавший снимок не перезапишет итог |
-| `on_policy_breach(session, summary, breach)` | сработала [политика ошибок](batches.md#политики-ошибок) | атомарно с постановкой на паузу или провалом |
+| `on_policy_breach(session, summary, breach)` | сработала [политика ошибок](batches/failure-policies.md) | атомарно с постановкой на паузу или провалом |
 
 ## Регистрация
 
 Хуки регистрируются декораторами клиента на `kind` батча. Один хук каждого вида на `kind`; повторная
-регистрация — `ConfigurationError`.
+регистрация - `ConfigurationError`.
 
-<!-- tallyho-noexec: раскладка по модулям вашего приложения; полный рабочий пример — ниже -->
+<!-- tallyho-noexec: раскладка по модулям вашего приложения; полный рабочий пример - ниже -->
 ```python
 # app/tallyho_client.py
 th = Tallyho(engine, schema="app", hook_modules=["app.mailing.hooks"])
@@ -53,16 +50,18 @@ async def save_progress(session: AsyncSession, summary: BatchSummary) -> None: .
 async def auto_pause(session: AsyncSession, summary: BatchSummary, breach: PolicyBreach) -> None: ...
 ```
 
-**Хуки должны быть зарегистрированы в каждом процессе, который может финализировать батч**: в
+:::{warning}
+Хуки должны быть зарегистрированы в каждом процессе, который может финализировать батч: в
 воркерах (там завершается последняя задача), в процессе maintenance (он подбирает пропущенное и
 делает снимки прогресса) и в API-процессе (он финализирует, например, пустые батчи). Перечислите
-модули с хуками в `hook_modules` — клиент импортирует их при создании. Для `tallyho maintenance`
+модули с хуками в `hook_modules` - клиент импортирует их при создании. Для `tallyho maintenance`
 это флаг `--hook-module`.
+:::
 
-Защита от забытого импорта: при создании батча запоминается, какие хуки зарегистрированы для его
-`kind`. Процесс, в котором нужного хука нет, батч **не финализирует**: пишет ошибку в лог, сообщает
-событие `hook_missing` наблюдателю и оставляет батч процессу, где хук есть. Тихо пропустить запись
-итога невозможно.
+От забытого импорта есть защита. При создании батча запоминается, какие хуки зарегистрированы для его
+`kind`. Процесс, в котором нужного хука нет, батч не финализирует: пишет ошибку в лог, отправляет
+наблюдателю событие `hook_missing` и оставляет батч процессу, где хук есть. Запись итога не
+пропадёт незаметно.
 
 Хук регистрируется на `kind` корня и получает сводку всего дерева. Под-батчи по умолчанию имеют
 `kind` вида `<kind корня>.<key>`, поэтому хук корня не вызывается на каждом этапе; собственный хук
@@ -73,58 +72,23 @@ async def auto_pause(session: AsyncSession, summary: BatchSummary, breach: Polic
 | Поле | Значение |
 |---|---|
 | `id`, `kind`, `key` | идентификация батча |
-| `state` | состояние: в `on_finalized` — терминальное, в остальных хуках — текущее |
-| `progress` | счётчики и оценки, те же поля, что у [`view().progress`](batches.md#чтение-прогресса) |
-| `labels` | число задач батча по меткам итога ([метки и метрики](batches.md#задача-и-её-итог)) |
+| `state` | состояние: в `on_finalized` - терминальное, в остальных хуках - текущее |
+| `progress` | счётчики и оценки, те же поля, что у [`view().progress`](batches/progress.md) |
+| `labels` | число задач батча по меткам итога ([метки и метрики](batches/tasks.md)) |
 | `metrics` | суммы `item.incr` по именам метрик |
 | `children` | сводки под-батчей по ключу: `summary.children["send"]` |
 | `seq` | монотонный номер снимка в пределах батча; у финализации он больше любого снимка прогресса |
 | `reason` | причина запроса отмены: `cancel`, `deadline`, `fail_fast`, `policy` |
 | `finished_at` | время финализации |
-| `attributes` | [атрибуты](batches.md#атрибуты-memo-и-листинг) корня |
+| `attributes` | [атрибуты](batches/attributes.md) корня |
 
 Сводка неизменяема. В `on_finalized` числа окончательные и точные.
 
 ## Пример: статус, прогресс и авто-пауза
 
-<!-- tallyho-example: guide-hooks-domain -->
+<!-- tallyho-noexec: фрагмент приложения: таблица reports принадлежит вашему проекту -->
 ```python
-from datetime import UTC, datetime, timedelta
-
-from sqlalchemy import Column, Float, Integer, MetaData, String, Table, Uuid, func, insert, select, update
-from sqlalchemy.ext.asyncio import AsyncSession
-
-from tallyho import Tallyho, item
-from tallyho.model.policy import PolicyBreach
-from tallyho.model.states import BatchState
-from tallyho.model.views import BatchSummary
-from tallyho.testing import FakeClock, InlineBroker
-
-# Движок приложения: ваши таблицы без схемы лежат в схеме приложения. Хуки получат сессию этого движка.
-app_engine = engine.execution_options(schema_translate_map={None: schema})
-
-# Доменная таблица приложения — в той же базе, что и таблицы tallyho.
-reports = Table(
-    "reports",
-    MetaData(),
-    Column("id", Integer, primary_key=True),
-    Column("batch_id", Uuid),
-    Column("status", String, nullable=False),
-    Column("pause_reason", String),
-    Column("done", Integer, nullable=False, default=0),
-    Column("failed", Integer, nullable=False, default=0),
-    Column("progress", Float, nullable=False, default=0.0),
-    Column("progress_seq", Integer, nullable=False, default=0),
-)
-async with app_engine.begin() as connection:
-    await connection.run_sync(reports.metadata.create_all)
-
-clock = FakeClock(datetime(2026, 10, 1, 9, tzinfo=UTC))
-broker = InlineBroker()
-th = Tallyho(app_engine, schema=schema, clock=clock)
-th.install(broker.adapter)
-await th.migrate()
-
+# app/hooks.py
 KIND = "report_build"
 ACTIVE = ("running", "paused")
 FINAL = {
@@ -174,93 +138,66 @@ async def auto_pause(session: AsyncSession, summary: BatchSummary, breach: Polic
     )
 
 
-async def build_section(section: int) -> None:
-    if section >= 4:
-        item.error("render_failed")
-
-
-async def report() -> dict[str, object]:
-    async with app_engine.connect() as connection:
-        row = (await connection.execute(select(reports).where(reports.c.id == 1))).mappings().one()
-    return dict(row)
-
-
-try:
-    # Доменная запись и батч создаются одной транзакцией приложения.
+# app/api.py
+async def start_report(session: AsyncSession, report_id: int, sections: list[int]) -> None:
     policy = th.FailurePolicy.threshold(ratio=0.3, min_processed=6, action="pause")
-    async with AsyncSession(app_engine) as session, session.begin():
-        async with th.batch(KIND, key="report:1", failure_policy=policy, session=session) as batch:
-            await batch.map(build_section, range(8))
-        await session.execute(
-            insert(reports).values(id=1, batch_id=batch.handle.id, status="running")
-        )
-    handle = batch.handle
+    async with th.batch(KIND, key=f"report:{report_id}", failure_policy=policy, session=session) as batch:
+        await batch.map(build_section, sections)
+    await session.execute(
+        insert(reports).values(id=report_id, batch_id=batch.handle.id, status="running")
+    )
+    # commit делает вызывающий: строка отчёта и батч появятся вместе
 
-    # Снимок прогресса: три задачи выполнены, прошло больше `every`.
-    await broker.step(3)
-    clock.advance(seconds=2)
-    await th.run_maintenance_once()  # в продакшне это делает процесс maintenance
-    snapshot = await report()
-    assert (snapshot["status"], snapshot["done"]) == ("running", 3)
 
-    # Политика ошибок ставит дерево на паузу и в той же транзакции вызывает on_policy_breach.
-    await broker.drain()
-    paused = await report()
-    assert paused["status"] == "paused"
-    assert paused["pause_reason"] == "доля ошибок 33%"
-    assert (await handle.view()).paused
+async def cancel_report(session: AsyncSession, report_id: int) -> None:
+    report = await session.get(Report, report_id, with_for_update=True)  # сначала своя строка
+    await th.handle(report.batch_id).cancel(session=session)  # потом tallyho, в той же транзакции
 
-    # Оператор отменяет отчёт: сначала своя строка, затем tallyho — в одной транзакции.
-    async with AsyncSession(app_engine) as session, session.begin():
-        await session.execute(select(reports).where(reports.c.id == 1).with_for_update())
-        await handle.cancel(session=session)
-    assert (await handle.wait(timeout=30)).state is BatchState.CANCELLED
 
-    final = await report()
-    assert final["status"] == "cancelled"  # поставил on_finalized, атомарно с финализацией
-    assert (final["done"], final["failed"]) == (8, 2)
-finally:
-    await th.aclose()
+# строка reports по ходу отчёта из восьми разделов, два из которых не собрались:
+# после трёх разделов       status="running",   done=3, progress=0.375
+# политика сработала        status="paused",    pause_reason="доля ошибок 33%"
+# оператор отменил отчёт    status="cancelled", done=8, failed=2    записал on_finalized
 ```
 
 ## Правила транзакции хука
 
-Финализация устроена так: tallyho открывает транзакцию, читает итоговые счётчики, вызывает ваш хук
+При финализации tallyho открывает транзакцию, читает итоговые счётчики, вызывает ваш хук
 и только потом переводит батч в терминальное состояние. Затем в той же транзакции ставятся
 колбэк-задачи, и всё коммитится.
 
-* **Сессия хука — `AsyncSession` на соединении и в транзакции tallyho.** Вызывать `commit()` и
+* Сессия хука - `AsyncSession` на соединении и в транзакции tallyho. Вызывать `commit()` и
   `rollback()` внутри хука нельзя: будет `HookTransactionError`, и финализация откатится.
-* **Соединение хука взято из движка, переданного в `Tallyho(engine, ...)`.** Ваши таблицы хук
+* Соединение хука взято из движка, переданного в `Tallyho(engine, ...)`. Ваши таблицы хук
   находит так же, как остальной код на этом движке: по `search_path` или по
-  `schema_translate_map` движка. Подробнее — [«Схема в ваших сессиях»](installation.md#схема-в-ваших-сессиях).
-* **Только работа с базой.** HTTP-запросы, письма, обращения к брокеру из хука не делайте: они не
-  откатятся вместе с транзакцией. Для них есть [колбэк-задачи](#колбэк-задачи).
-* **Хук должен быть идемпотентным по смыслу.** Пишите «установить итог», а не «прибавить к итогу».
+  `schema_translate_map` движка. Подробнее - [«Схема в ваших сессиях»](installation.md#схема-в-ваших-сессиях).
+* Только работа с базой. HTTP-запросы, письма, обращения к брокеру из хука не делайте: они не
+  откатятся вместе с транзакцией. Для них есть [колбэк-задачи](hooks/callbacks.md).
+* Хук должен быть идемпотентным по смыслу. Пишите «установить итог», а не «прибавить к итогу».
   Два процесса могут начать финализацию одновременно: оба выполнят хук, но закоммитится ровно один,
   а изменения второго откатятся. Если `cancel()`, дедлайн или политика ошибок сработали, пока хук
-  выполнялся, его изменения тоже откатятся, и хук будет вызван ещё раз — с тем итогом, который
+  выполнялся, его изменения тоже откатятся, и хук будет вызван ещё раз - с тем итогом, который
   запишется (`summary.state`, `summary.reason`). После `retry_failed()` хук вызывается заново с
   новым итогом.
-* **Хук должен уложиться в `hook_timeout`** (10 секунд по умолчанию). Ограничение действует и на
+* Хук должен уложиться в `hook_timeout` (10 секунд по умолчанию). Ограничение действует и на
   время выполнения Python-кода, и на SQL-запросы внутри хука.
-* **Порядок блокировок — «сначала ваша строка, потом tallyho».** Хук блокирует ваши строки до того,
+* Порядок блокировок - «сначала ваша строка, потом tallyho». Хук блокирует ваши строки до того,
   как tallyho меняет свою. Соблюдайте тот же порядок в API: сначала `SELECT … FOR UPDATE` своей
   строки, затем `handle.pause(session=...)`. Тогда хук и API-операция не образуют дедлок.
-* **Защищайте переход условием.** `WHERE status IN (...)` в `on_finalized` не даст перезаписать
-  статус, который уже изменил оператор. Учтите, что батч может финализироваться и во время паузы,
+* Защищайте переход условием. `WHERE status IN (...)` в `on_finalized` не даст перезаписать
+  статус, который уже изменил оператор. Батч может финализироваться и во время паузы,
   если на момент паузы оставались только выполняющиеся задачи: хук должен уметь закрыть сущность
   из статуса `paused`.
 
 ### `on_progress`
 
-* Снимки делает процесс [maintenance](operations.md#процессы) — тот его экземпляр, который сейчас
+* Снимки делает процесс [maintenance](operations.md) - тот его экземпляр, который сейчас
   лидер. Без работающего maintenance `on_progress` не вызывается.
-* `every` — минимальный интервал между снимками одного батча. Если счётчики не изменились, хук не
+* `every` - минимальный интервал между снимками одного батча. Если счётчики не изменились, хук не
   вызывается и в базу ничего не пишется.
 * Хук получает сводку корня со всеми под-батчами.
 * Снимок, опоздавший к финализации, откатывается вместе с вашими изменениями и итог не
-  перезаписывает. Дополнительная защита на вашей стороне — условие
+  перезаписывает. Дополнительная защита на вашей стороне - условие
   `WHERE progress_seq < :seq`, как в примере.
 * `summary.progress.ratio` может немного уменьшиться, когда растёт оценка объёма. Храните максимум:
   `progress = GREATEST(progress, :ratio)`.
@@ -269,403 +206,22 @@ finally:
 
 ### `on_policy_breach`
 
-* Вызывается для политик `threshold` и `fail_fast` — в той же транзакции, что и постановка дерева
+* Вызывается для политик `threshold` и `fail_fast` - в той же транзакции, что и постановка дерева
   на паузу (`action="pause"`) или запрос отмены (`action="fail"`).
-* Третий аргумент — `PolicyBreach` (`tallyho.model.policy`): `batch_key` — ключ батча, где сработала
-  политика; `labels` — метки фильтра политики (пустой список — считались все ошибки); `ratio` —
-  фактическая доля; `action` — `"fail"` или `"pause"`.
+* Третий аргумент - `PolicyBreach` (`tallyho.model.policy`): `batch_key` - ключ батча, где сработала
+  политика; `labels` - метки фильтра политики (пустой список - считались все ошибки); `ratio` -
+  фактическая доля; `action` - `"fail"` или `"pause"`.
 * Хук ищется по `kind` батча, где сработала политика. Если там его нет, вызывается хук `kind` корня,
   а `breach.batch_key` говорит, где именно случилось.
 * После `resume()` политика проверяется заново. Если доля ошибок всё ещё выше порога, батч снова
   встанет на паузу после следующей завершённой задачи: устраните причину или отмените батч.
 
-## Повтор упавшего хука
+```{toctree}
+:hidden:
 
-Если `on_finalized` бросил исключение или не уложился в таймаут:
-
-1. вся транзакция финализации откатывается — и ваши изменения, и переход батча;
-2. батч остаётся `SEALED`; число попыток и текст ошибки видны в `view.hook_attempts` и
-   `view.hook_error`;
-3. наблюдатель получает событие `hook_failed` (метрика `th_hook_failures`);
-4. фоновые проверки повторяют финализацию с растущей паузой: она удваивается после каждой неудачи
-   от 1 секунды до 5 минут (`hook_backoff_initial`, `hook_backoff_max`).
-
-Батч **не станет терминальным без успешного хука**: ваш статус и состояние батча не расходятся.
-После исправления кода ничего делать не нужно — очередной повтор пройдёт. Чтобы не ждать,
-вызовите `await handle.retry_finalize()`.
-
-<!-- tallyho-example: guide-hooks-retry -->
-```python
-from sqlalchemy.ext.asyncio import AsyncSession
-
-from tallyho import Tallyho
-from tallyho.model.states import BatchState
-from tallyho.model.views import BatchSummary
-from tallyho.testing import InlineBroker
-
-broker = InlineBroker()
-th = Tallyho(engine, schema=schema)
-th.install(broker.adapter)
-await th.migrate()
-
-saved: list[BatchState] = []
-bug = {"present": True}
-
-
-@th.on_finalized("invoices")
-async def save_result(session: AsyncSession, summary: BatchSummary) -> None:
-    if bug["present"]:
-        raise LookupError("нет строки счёта")
-    saved.append(summary.state)
-
-
-async def issue_invoice(number: int) -> None: ...
-
-
-try:
-    async with th.batch("invoices", key="month:10") as batch:
-        await batch.map(issue_invoice, range(3))
-    await broker.drain()
-
-    stuck = await batch.handle.view()
-    assert stuck.state is BatchState.SEALED  # все задачи выполнены, но батч не финализирован
-    assert stuck.progress.ok == 3
-    assert stuck.hook_attempts >= 1
-    assert "нет строки счёта" in (stuck.hook_error or "")
-    assert saved == []
-
-    bug["present"] = False  # код исправлен
-    await batch.handle.retry_finalize()  # не ждать очередного повтора
-
-    final = await batch.handle.wait(timeout=30)
-    assert final.state is BatchState.SUCCEEDED
-    assert saved == [BatchState.SUCCEEDED]  # хук закоммичен ровно один раз
-finally:
-    await th.aclose()
+hooks/retry
+hooks/callbacks
+hooks/complete-in
+hooks/retention
+hooks/recipe
 ```
-
-## Колбэк-задачи
-
-Всё, что нельзя делать в транзакции хука (уведомления, HTTP, долгий экспорт), выносится в
-**колбэк-задачу** — обычную задачу брокера, которая ставится в очередь той же транзакцией, что и
-финализация.
-
-| Параметр `th.batch` / `sub_batch` | Когда ставится |
-|---|---|
-| `on_succeeded=th.call(...)` | батч завершился как `SUCCEEDED` |
-| `on_completed_with_errors=th.call(...)` | `COMPLETED_WITH_ERRORS` |
-| `on_failed=th.call(...)` | `FAILED` |
-| `on_cancelled=th.call(...)` | `CANCELLED` |
-| `on_finalized_task=th.call(...)` | любое терминальное состояние |
-
-* Постановка — ровно один раз на финализацию, выполнение — at-least-once: колбэк может быть
-  доставлен повторно, поэтому должен быть идемпотентным.
-* Внутри колбэка `callback.current()` (`from tallyho import callback`) возвращает контекст с
-  `callback_id` и `batch_id`. `callback_id` стабилен при повторной доставке — используйте его как
-  ключ идемпотентности. Сводки итога в контексте нет: точные счётчики пишет ваш `on_finalized`, а
-  если колбэку они нужны — `await th.handle(context.batch_id).view()`.
-* Колбэк выполняется после коммита финализации и хука `on_finalized`: итог в вашей таблице уже есть.
-* После `retry_failed()` и новой финализации колбэк ставится заново.
-
-## Итог задачи в вашей транзакции
-
-Если задача пишет в вашу таблицу и её запись должна быть атомарна с итогом задачи, завершите задачу
-в своей транзакции:
-
-<!-- tallyho-noexec: фрагмент задачи; engine и таблица deliveries принадлежат вашему приложению (исполняемая версия — в рецепте ниже) -->
-```python
-async def send_email(campaign_id: int, email: str) -> None:
-    message_id = await mail_provider.send(to=email)
-    async with engine.begin() as connection:
-        await connection.execute(
-            update(deliveries)
-            .where(deliveries.c.campaign_id == campaign_id, deliveries.c.email == email)
-            .values(status="sent", message_id=message_id)
-        )
-        item.ok("sent")
-        await item.complete_in(connection)  # итог задачи — в этом же коммите
-```
-
-`item.complete_in(session)` принимает `AsyncSession` или `AsyncConnection`. Сначала задайте итог
-(`ok/skip/error`) и все `spawn`, затем вызовите `complete_in`: он записывает то, что накоплено к
-этому моменту. Если ваша транзакция откатилась, задача остаётся незавершённой и будет повторена
-брокером.
-
-### Если задача потеряла аренду
-
-Задача может пережить свою аренду: зависла дольше `lease_ttl` без продления, батч отменили, после
-сбоя её уже повторяет другой воркер. К моменту `complete_in` итог такой задачи записан без неё
-(`lease_expired`, `cancelled`) или принадлежит другой попытке. Записать вашу строку в этот момент
-значило бы получить доменный эффект у задачи, которая не считается успешной.
-
-Поэтому `complete_in` проверяет, что задача ещё принадлежит этой попытке. Если нет, он ничего не
-записывает и бросает `LeaseLostError`:
-
-* **не ловите её.** Исключение должно выйти из блока транзакции: `async with engine.begin()` и
-  `async with session.begin()` откатят ваши записи сами;
-* это **не ошибка задачи**. Обёртка tallyho не записывает итог, не тратит попытку и возвращает
-  брокеру успех: ни ретрая, ни DLQ не будет. Задачу доведёт тот, кому она теперь принадлежит, или
-  она уже завершена;
-* то же правило действует и без `complete_in`: если задача, потерявшая аренду, вернула результат
-  или упала, обёртка не записывает итог и не отпускает чужую аренду, а брокеру отдаёт успех;
-* побочные эффекты вне базы (отправленное письмо) к этому моменту уже случились — как и при любом
-  повторе at-least-once, их идемпотентность остаётся на вас.
-
-<!-- tallyho-example: guide-hooks-lease-lost -->
-```python
-from datetime import UTC, datetime, timedelta
-
-from sqlalchemy import Column, MetaData, String, Table, insert, select
-
-from tallyho import Tallyho, item
-from tallyho.model.states import BatchState
-from tallyho.testing import FakeClock, InlineBroker
-
-app_engine = engine.execution_options(schema_translate_map={None: schema})
-metadata = MetaData()
-deliveries = Table("deliveries", metadata, Column("email", String, primary_key=True))
-async with app_engine.begin() as connection:
-    await connection.run_sync(metadata.create_all)
-
-clock = FakeClock(datetime(2026, 10, 1, 9, tzinfo=UTC))
-broker = InlineBroker()
-th = Tallyho(app_engine, schema=schema, clock=clock, lease_ttl=timedelta(seconds=60))
-th.install(broker.adapter)
-await th.migrate()
-
-reached_the_end: list[str] = []
-
-
-async def send(email: str) -> None:
-    # Задача «зависла» дольше аренды: фоновые проверки завершили её как lease_expired.
-    clock.advance(seconds=61)
-    await th.run_maintenance_once()
-    async with app_engine.begin() as connection:
-        await connection.execute(insert(deliveries).values(email=email))
-        item.ok("sent")
-        await item.complete_in(connection)  # LeaseLostError: транзакция откатывается
-    reached_the_end.append(email)
-
-
-try:
-    async with th.batch("issue", key="2026-10-01") as batch:
-        await batch.add(send, "ada@example.com")
-    await broker.drain()
-
-    view = await batch.handle.wait(timeout=30)
-    assert view.state is BatchState.COMPLETED_WITH_ERRORS
-    assert (view.progress.ok, view.progress.error) == (0, 1)
-    assert view.labels["lease_expired"] == 1  # итог фоновой проверки не изменился
-    assert reached_the_end == []
-    assert broker.dead_letters == ()  # для брокера попытка закончилась успехом
-    async with app_engine.connect() as connection:
-        assert (await connection.execute(select(deliveries))).all() == []  # строки «sent» нет
-finally:
-    await broker.close()
-```
-
-Повторный вызов `complete_in` в той же задаче:
-
-| Когда | Что происходит |
-|---|---|
-| после коммита вашей транзакции | ничего: задача уже завершена |
-| в той же транзакции, пока первая запись в силе | ничего; итог и `spawn`, заданные после первого вызова, не записываются |
-| после отката транзакции или savepoint | итог записывается заново — вместе с вашими новыми записями |
-| в другой транзакции, пока первая открыта | `ConfigurationError`: задача завершается в одной транзакции |
-
-## Retention и `release()`
-
-Завершённые деревья удаляются фоновыми проверками.
-
-| Настройка корня | Поведение |
-|---|---|
-| `retention=timedelta(days=14)` (по умолчанию) | дерево удаляется через 14 дней после завершения корня |
-| `retention=None` | хранить вечно |
-| `release_required=True` | удалять только после `handle.release()` **и** истечения `retention` |
-
-* `release()` вызывается у корня и только после его завершения; раньше — `InvalidStateError`.
-* `release()` относится к **последней** финализации. `retry_failed()` на любом узле дерева
-  сбрасывает выданное разрешение: после новой финализации итоги задач другие, и их нужно забрать
-  заново и снова вызвать `release()`.
-* **`retry_failed()` после `release()` возможен только до истечения `retention`.** Как только у
-  корня истёк `retention` (и вызван `release()`, если он обязателен), дерево закрыто для операций,
-  даже если фоновые проверки до него ещё не дошли: `retry_failed`, `cancel`, `pause`, `resume`,
-  `reschedule`, `retry_finalize` и `release` на любом узле бросают `BatchPurged`. Повторный
-  `release()` на таком дереве — тоже `BatchPurged`. Срок сверяется по часам базы на момент запроса.
-  Иначе `retry_failed` мог бы переоткрыть дерево посреди удаления и вернуть успех, а дерево всё
-  равно исчезло бы.
-* Чтение (`view`, `items`, `in_flight`) показывает истёкшее дерево, пока его строки не удалены.
-  После удаления `handle.view()` и `handle.items()` бросают `BatchPurged`. Всё, что нужно навсегда,
-  к этому моменту должно быть в ваших таблицах — для этого и существуют хуки.
-* Удалённое дерево следов не оставляет, поэтому удалённый батч неотличим от несуществующего:
-  чтение по id и операции над ним бросают `BatchPurged` в обоих случаях. `BatchPurged` — подкласс
-  `NotFoundError`; `NotFoundError` без уточнения бросает поиск по ключу (`th.find`, `handle.child`).
-* Ваши таблицы retention не затрагивает.
-
-## Рецепт «строка на каждого получателя»
-
-Задача: приложение ведёт строку на каждого получателя рассылки, и в неё должны попасть **все**
-исходы — в том числе те, при которых код задачи не выполнялся или упал: исчерпанные ретраи
-(`exhausted`), истёкшая аренда (`lease_expired`), истёкший срок (`expired`), отмена. Отдельного хука
-на исход каждой задачи в v1 нет. Рецепт собирается из существующих механизмов в два шага:
-
-1. **нормальный исход задача пишет сама** — своей строкой и итогом в одном коммите
-   (`item.complete_in`);
-2. **остальные исходы переносит колбэк финализации** — он читает `handle.items(states=...)`,
-   обновляет строки и в той же транзакции вызывает `release()`.
-
-<!-- tallyho-example: guide-hooks-release -->
-```python
-from datetime import UTC, datetime, timedelta
-
-from sqlalchemy import Column, MetaData, String, Table, insert, select, update
-from sqlalchemy.ext.asyncio import AsyncSession
-
-from tallyho import Tallyho, item
-from tallyho.model.errors import BatchPurged
-from tallyho.model.states import ItemState
-from tallyho.model.views import BatchSummary
-from tallyho.testing import FakeClock, InlineBroker
-
-# Движок приложения: ваши таблицы без схемы лежат в схеме приложения. Хуки получат сессию этого движка.
-app_engine = engine.execution_options(schema_translate_map={None: schema})
-
-metadata = MetaData()
-issues = Table("issues", metadata, Column("key", String, primary_key=True), Column("status", String))
-deliveries = Table(
-    "deliveries",
-    metadata,
-    Column("email", String, primary_key=True),
-    Column("status", String, nullable=False),
-    Column("reason", String),
-)
-async with app_engine.begin() as connection:
-    await connection.run_sync(metadata.create_all)
-
-clock = FakeClock(datetime(2026, 10, 1, 9, tzinfo=UTC))
-broker = InlineBroker()
-th = Tallyho(app_engine, schema=schema, clock=clock)
-th.install(broker.adapter)
-await th.migrate()
-
-KIND = "issue_deliveries"
-EXPORTED = {ItemState.ERROR: "failed", ItemState.CANCELLED: "cancelled"}
-
-
-async def send(email: str) -> None:
-    if email.endswith("@down.test"):
-        raise ConnectionError("451 try again later")  # ретраи брокера, затем error("exhausted")
-    async with app_engine.begin() as connection:  # строка получателя и итог задачи — один коммит
-        await connection.execute(
-            update(deliveries).where(deliveries.c.email == email).values(status="sent")
-        )
-        item.ok("sent")
-        await item.complete_in(connection)
-
-
-@th.on_finalized(KIND)
-async def save_result(session: AsyncSession, summary: BatchSummary) -> None:
-    # Счётчики точные уже здесь; терминальный статус поставит колбэк после экспорта.
-    await session.execute(update(issues).where(issues.c.key == summary.key).values(status="settling"))
-
-
-async def settle(key: str) -> None:
-    async with AsyncSession(app_engine) as session, session.begin():
-        status = await session.scalar(select(issues.c.status).where(issues.c.key == key).with_for_update())
-        if status != "settling":
-            return  # повторная доставка колбэка
-        handle = await th.find(KIND, key)
-        async for entry in handle.items(states=set(EXPORTED)):
-            await session.execute(
-                update(deliveries)
-                .where(deliveries.c.email == entry.key)
-                .values(status=EXPORTED[entry.state], reason=entry.label)
-            )
-        await session.execute(  # получатели, которые так и не стали задачами
-            update(deliveries)
-            .where(deliveries.c.status == "pending")
-            .values(status="cancelled", reason="not_dispatched")
-        )
-        await session.execute(update(issues).where(issues.c.key == key).values(status="done"))
-        await handle.release(session=session)  # разрешение на удаление — в той же транзакции
-
-
-async def statuses() -> dict[str, tuple[str, str | None]]:
-    async with app_engine.connect() as connection:
-        rows = await connection.execute(select(deliveries))
-        return {row.email: (row.status, row.reason) for row in rows}
-
-
-try:
-    emails = ["ada@ok.test", "grace@ok.test", "later@down.test"]
-    async with AsyncSession(app_engine) as session, session.begin():
-        await session.execute(insert(issues).values(key="issue:1", status="running"))
-        await session.execute(
-            insert(deliveries), [{"email": email, "status": "pending"} for email in emails]
-        )
-        async with th.batch(
-            KIND,
-            key="issue:1",
-            retention=timedelta(days=1),
-            release_required=True,  # дерево ждёт экспорта
-            on_finalized_task=th.call(settle, "issue:1"),
-            session=session,
-        ) as batch:
-            await batch.add_calls(th.call(send, email).opts(key=email) for email in emails)
-
-    await broker.drain()  # задачи → финализация → on_finalized → колбэк settle
-
-    assert await statuses() == {
-        "ada@ok.test": ("sent", None),
-        "grace@ok.test": ("sent", None),
-        "later@down.test": ("failed", "exhausted"),  # записал колбэк, а не задача
-    }
-    async with app_engine.connect() as connection:
-        assert await connection.scalar(select(issues.c.status)) == "done"
-
-    # Дерево освобождено и старше retention: фоновые проверки его удаляют.
-    clock.advance(days=2)
-    await th.run_maintenance_once()
-    try:
-        await batch.handle.view()
-    except BatchPurged:
-        purged = True
-    else:
-        purged = False
-    assert purged
-    assert (await statuses())["later@down.test"] == ("failed", "exhausted")  # ваши данные на месте
-finally:
-    await th.aclose()
-```
-
-Условия, без которых рецепт некорректен:
-
-* **Нормальный путь пишет строку в самой задаче**, через `complete_in`. Экспорт читает только
-  `ERROR` и `CANCELLED`. Задача, которая после `retry_failed()` завершилась успешно, исправит свою
-  строку сама, тем же кодом.
-* **Последний шаг экспорта — запрос по остатку.** Получатели, которые так и не стали задачами
-  (отмена посреди разворачивания аудитории, дубли по ключу, `skipped_by_limit`), в `items()` не
-  появятся: их строки закрывает один `UPDATE … WHERE status = 'pending'`.
-* **Счётчики ставит `on_finalized`**, а не колбэк: сводка уже содержит точные числа, и они атомарны
-  с финализацией.
-* **Терминальный доменный статус ставит колбэк.** Между финализацией и экспортом сущность находится
-  в промежуточном статусе (`settling`), поэтому она не бывает «завершена, а строки ещё не
-  обновлены».
-* **Колбэк идемпотентен.** Экспорт, итоговый статус и `release()` — одна транзакция. Падение
-  посередине оставляет `settling` и неосвобождённое дерево; повторная доставка безопасна. Если одна
-  транзакция слишком велика, коммитьте экспорт чанками, а `release()` вызывайте в транзакции
-  последнего.
-* **`retry_failed()` повторяет цикл**: разрешение на удаление сбрасывается, `on_finalized` снова
-  ставит `settling` и новый итог, колбэк экспортирует оставшиеся ошибки и снова вызывает
-  `release()`. Повтор после `release()` возможен, только пока не истёк `retention`; позже
-  `retry_failed()` бросает `BatchPurged`.
-* **Задачи этапа читайте у этапа.** В конвейере задачи лежат в под-батче, а не в корне:
-  `send = await root.child("send")`, затем `send.items(...)`. `release()` при этом вызывается у корня.
-
-Чего рецепт не даёт: исходы, возникшие без участия кода задачи, видны в ваших таблицах только после
-финализации батча, а не по мере появления.
-
-## Что дальше
-
-* Проверить хуки в тестах — [Тестирование](testing.md).
-* Где должны работать хуки и снимки прогресса — [Эксплуатация PostgreSQL](operations.md#процессы).

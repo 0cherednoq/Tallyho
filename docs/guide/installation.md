@@ -1,25 +1,45 @@
 # Установка и миграции
 
-[← Оглавление](README.md) · далее: [Батчи и конвейеры](batches.md)
-
 ## Требования
 
 | Что | Версия |
 |---|---|
-| Python | ≥ 3.11 |
-| PostgreSQL | ≥ 14 |
-| SQLAlchemy | ≥ 2.1, только async (`AsyncEngine`, `AsyncSession`, `AsyncConnection`) |
-| Драйвер | `asyncpg` ≥ 0.29 или `psycopg` ≥ 3.1 |
+| Python | 3.11 и новее |
+| PostgreSQL | 14 и новее |
+| SQLAlchemy | 2.1 и новее, только async (`AsyncEngine`, `AsyncSession`, `AsyncConnection`) |
+| Драйвер | `asyncpg` от 0.29 или `psycopg` от 3.1 |
 
-Таблицы tallyho и ваши доменные таблицы должны лежать в **одной базе PostgreSQL** (схемы могут быть
-разными): только так хуки и операции в вашей транзакции остаются атомарными.
+:::{important}
+Таблицы tallyho и ваши доменные таблицы должны лежать в одной базе PostgreSQL. Схемы могут быть
+разными. Иначе хуки и операции в вашей транзакции перестают быть атомарными.
+:::
 
 ## Установка пакета
 
+::::{tab-set}
+
+:::{tab-item} uv
+```bash
+uv add "tallyho[asyncpg]"            # или tallyho[psycopg]
+uv add "tallyho[asyncpg,flexiq]"     # с адаптером брокера flexiq
+```
+:::
+
+:::{tab-item} poetry
+```bash
+poetry add "tallyho[asyncpg]"            # или tallyho[psycopg]
+poetry add "tallyho[asyncpg,flexiq]"     # с адаптером брокера flexiq
+```
+:::
+
+:::{tab-item} pip
 ```bash
 pip install "tallyho[asyncpg]"            # или tallyho[psycopg]
 pip install "tallyho[asyncpg,flexiq]"     # с адаптером брокера flexiq
 ```
+:::
+
+::::
 
 | Extra | Что добавляет |
 |---|---|
@@ -27,7 +47,7 @@ pip install "tallyho[asyncpg,flexiq]"     # с адаптером брокера
 | `flexiq` | адаптер брокера [flexiq](flexiq.md) (`flexiq>=2.0,<3`) |
 | `alembic` | Alembic для встраивания миграций в ваш проект |
 | `testing` | `pytest-asyncio` для [pytest-фикстуры](testing.md#pytest-фикстура) |
-| `otel` | OpenTelemetry API для [наблюдаемости](operations.md#наблюдаемость) |
+| `otel` | OpenTelemetry API для [наблюдаемости](operations/observability.md) |
 
 ## Клиент `Tallyho`
 
@@ -47,7 +67,7 @@ th = Tallyho(
     schema="app",  # схема таблиц tallyho
     prefix="th_",  # префикс имён таблиц
     hook_modules=["app.mailing.hooks"],  # модули с tx-хуками, импортируются сразу
-    retention=timedelta(days=30),  # любая настройка из таблицы ниже — именованным аргументом
+    retention=timedelta(days=30),  # любая настройка из таблицы ниже - именованным аргументом
 )
 th.install(adapter)  # адаптер брокера: FlexiqAdapter или InlineBroker().adapter в тестах
 ```
@@ -55,22 +75,26 @@ th.install(adapter)  # адаптер брокера: FlexiqAdapter или Inlin
 | Параметр | Значение |
 |---|---|
 | `engine` | ваш `AsyncEngine`; tallyho берёт из него соединения для собственных транзакций |
-| `schema` | схема таблиц. `None` — схема из `search_path` |
+| `schema` | схема таблиц. `None` - схема из `search_path` |
 | `prefix` | префикс имён таблиц, по умолчанию `"th_"` |
-| `hook_modules` | модули с [tx-хуками](hooks.md#регистрация). Импортируются в конструкторе, **в каждом процессе** |
-| `observer` | приёмник событий для метрик и трассировки — [наблюдаемость](operations.md#наблюдаемость) |
-| `clock` | источник времени; в тестах — [`FakeClock`](testing.md#fakeclock) |
+| `hook_modules` | модули с [tx-хуками](hooks.md#регистрация). Импортируются в конструкторе, в каждом процессе |
+| `observer` | приёмник событий для метрик и трассировки - [наблюдаемость](operations/observability.md) |
+| `clock` | источник времени; в тестах - [`FakeClock`](testing.md#fakeclock) |
 | `serializer` | сериализатор аргументов задач для адаптеров без собственного кодека |
 | `id_factory` | генератор идентификаторов (по умолчанию UUIDv7) |
-| `**settings` | настройки из раздела [«Настройки»](#настройки) |
+| `**settings` | настройки из раздела [«Настройки»](../reference/settings.md) |
 
 `th.install(adapter)` связывает клиент с брокером. Его вызывают один раз, до первого `th.batch(...)`,
 `th.call(...)` и `th.maintenance()`; без `install` эти методы бросают `ConfigurationError`.
 Для `th.migrate()` адаптер не нужен.
 
-Процесс с адаптером сам [отправляет сообщения в брокер](operations.md#отправка-в-брокер) — сразу
-после коммита и страховочным проходом. При остановке любого процесса вызовите `await th.aclose()`:
-он дожидается фоновой работы tallyho — см. [Корректная остановка](operations.md#корректная-остановка).
+Процесс с адаптером сам [отправляет сообщения в брокер](operations.md#отправка-в-брокер): сразу
+после коммита и ещё раз страховочным проходом.
+
+:::{warning}
+При остановке любого процесса вызывайте `await th.aclose()`. Он дожидается фоновой работы tallyho.
+Что будет без него, описано на странице [Корректная остановка](operations/shutdown.md).
+:::
 
 Процессу, который брокера не знает и только обслуживает установку или читает прогресс, подходит
 `th.install(None)`. В нём работают `th.maintenance()`, `th.handle(...)`, `th.find(...)` и
@@ -88,57 +112,38 @@ th.install(adapter)  # адаптер брокера: FlexiqAdapter или Inlin
   Миграции установок одной схемы выполняются по очереди.
 * `schema` и `prefix` должны совпадать во всех процессах одной установки: в API, в воркерах и
   в maintenance.
-* Имена схемы и префикса проверяются при создании клиента и при миграции; недопустимое имя —
+* Имена схемы и префикса проверяются при создании клиента и при миграции; недопустимое имя -
   `ConfigurationError`.
 
 ### Схема в ваших сессиях
 
 Имя схемы записано в каждом запросе tallyho. Поэтому библиотека находит свои таблицы на любом
 соединении этой базы: и в собственных транзакциях, и когда вы передаёте свою сессию или
-соединение — в `th.batch(session=...)`, в операции `handle.pause(session=...)` и подобные, в
+соединение - в `th.batch(session=...)`, в операции `handle.pause(session=...)` и подобные, в
 `item.complete_in(session)`. Настраивать `search_path` или `schema_translate_map` ради tallyho не
 нужно, и настройки вашего соединения библиотека не меняет.
 
-<!-- tallyho-example: guide-install-session -->
+<!-- tallyho-noexec: фрагмент приложения: Order и notify принадлежат вашему проекту -->
 ```python
-from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncSession
-
-from tallyho import Tallyho
-from tallyho.model.states import BatchState
-from tallyho.testing import InlineBroker
-
-broker = InlineBroker()
-th = Tallyho(engine, schema=schema)  # таблицы tallyho лежат в схеме schema
-th.install(broker.adapter)
-await th.migrate()
-
-
-async def notify(order_id: int) -> None:
-    assert order_id > 0
-
-
-# Обычная сессия приложения: схема tallyho не входит в её search_path.
+# Обычная сессия приложения: схема tallyho в её search_path не входит.
 async with AsyncSession(engine) as session, session.begin():
-    search_path = await session.scalar(text("SHOW search_path"))
-    assert schema not in str(search_path)
-    async with th.batch("orders", key="order:1", session=session) as batch:
-        await batch.add(notify, 1)
-
-await broker.drain()
-assert (await batch.handle.view()).state is BatchState.SUCCEEDED
-await broker.close()
+    order = Order(customer_id=customer_id)
+    session.add(order)
+    await session.flush()
+    async with th.batch("orders", key=f"order:{order.id}", session=session) as batch:
+        await batch.add(notify, order.id)
+# заказ и батч закоммичены вместе; таблицы tallyho библиотека нашла сама
 ```
 
-Ваши таблицы tallyho не трогает — их адрес определяет ваш движок:
+Ваши таблицы tallyho не трогает. Где они лежат, определяет ваш движок:
 
-* **В ваших транзакциях** всё работает как раньше: таблицы без схемы ищутся по `search_path` или
+* В ваших транзакциях всё работает как раньше: таблицы без схемы ищутся по `search_path` или
   по вашей `schema_translate_map`.
-* **В [tx-хуках](hooks.md)** так же. Сессия хука работает на соединении движка, который вы
+* В [tx-хуках](hooks.md) так же. Сессия хука работает на соединении движка, который вы
   передали в `Tallyho(engine, ...)`, с его настройками. Если ваши таблицы адресует
-  `schema_translate_map`, передавайте в `Tallyho` движок с этим отображением — как в
-  [примере хуков](hooks.md#пример-статус-прогресс-и-авто-пауза).
-* **`Tallyho(engine, schema=None)`** описывает таблицы tallyho без схемы: их, как и ваши, ищет
+  `schema_translate_map`, передавайте в `Tallyho` движок с этим отображением:
+  `Tallyho(engine.execution_options(schema_translate_map={None: "app"}), schema="app")`.
+* `Tallyho(engine, schema=None)` описывает таблицы tallyho без схемы: их, как и ваши, ищет
   соединение. Тогда все движки, через которые вы вызываете tallyho, должны быть настроены
   одинаково.
 * Если в вашей `schema_translate_map` есть ключ, равный имени схемы tallyho, отображение
@@ -151,26 +156,16 @@ await broker.close()
 
 ### Встроенный `migrate()`
 
-<!-- tallyho-example: guide-install-migrate -->
+<!-- tallyho-noexec: фрагмент запуска приложения: engine создаётся в вашем проекте -->
 ```python
-from sqlalchemy import text
-
-from tallyho import Tallyho
-
-th = Tallyho(engine, schema=schema, prefix="jobs_")  # префикс по умолчанию — "th_"
+th = Tallyho(engine, schema="app", prefix="jobs_")  # префикс по умолчанию - "th_"
 version = await th.migrate()  # создаёт схему и таблицы, возвращает версию схемы
-assert version >= 1
-assert await th.migrate() == version  # повторный вызов ничего не меняет
+await th.migrate()  # повторный вызов ничего не меняет и возвращает ту же версию
 
-async with engine.connect() as connection:
-    names = await connection.scalars(
-        text("SELECT tablename FROM pg_tables WHERE schemaname = :schema"), {"schema": schema}
-    )
-    tables = set(names)
-assert {"jobs_batch", "jobs_item", "jobs_outbox", "jobs_counter"} <= tables
+# в схеме app появились таблицы jobs_batch, jobs_item, jobs_outbox, jobs_counter и остальные
 ```
 
-`migrate()` выполняет всю миграцию одной транзакцией под advisory lock, поэтому его безопасно
+`migrate()` проводит всю миграцию одной транзакцией под advisory lock, поэтому его безопасно
 вызывать при старте каждого процесса: параллельные вызовы выстроятся в очередь, а повторный ничего
 не сделает. DDL ждёт чужие блокировки не дольше 5 секунд (`lock_timeout`) и при таймауте
 откатывается целиком. Если схема в базе новее установленной библиотеки, `migrate()` бросает
@@ -196,12 +191,12 @@ def upgrade() -> None:
 
 Правила:
 
-* **Одна ревизия — одна версия схемы tallyho.** Номер версии указывается явно, чтобы ревизия не
-  меняла смысл при обновлении библиотеки. Версии идут подряд: `version=1`, в следующей ревизии
-  `version=2`, затем `version=3`, `version=4` и `version=5`. Пропускать версии нельзя.
-* Актуальную версию схемы возвращает `th.migrate()` и печатает `tallyho migrate`; на момент
-  написания это 5. После обновления библиотеки сравните её с последней версией в своих ревизиях и
-  допишите недостающие.
+* Одна ревизия - одна версия схемы tallyho. Номер версии указывается явно, чтобы ревизия не
+  меняла смысл при обновлении библиотеки. Версии идут подряд, пропускать их нельзя: когда
+  выйдет `version=2`, для неё понадобится следующая ревизия.
+* Актуальную версию схемы возвращает `th.migrate()` и печатает `tallyho migrate`. Сейчас это 1.
+  После обновления библиотеки сравните её с последней версией в своих ревизиях и допишите
+  недостающие.
 * Параметры `upgrade(op, *, version, schema, prefix="th_", lock_timeout=...)` должны совпадать с
   параметрами клиента `Tallyho`.
 * Транзакцией и порядком управляет Alembic. Работает и offline-режим (`alembic upgrade --sql`).
@@ -210,68 +205,17 @@ def upgrade() -> None:
 
 ### Командная строка
 
-Команда `tallyho` ставится вместе с пакетом (то же самое — `python -m tallyho.cli`).
+Те же миграции выполняет команда `tallyho migrate`, она ставится вместе с пакетом:
 
 ```bash
 tallyho migrate --dsn postgresql+asyncpg://app:secret@db/app --schema app
-# schema=app version=5
+# schema=app version=1
 ```
 
-| Команда | Что делает |
-|---|---|
-| `tallyho migrate --dsn DSN --schema SCHEMA` | создаёт или обновляет таблицы и печатает версию схемы |
-| `tallyho maintenance --dsn DSN --schema SCHEMA [--hook-module MODULE ...] [--once]` | фоновые проверки отдельным процессом — см. [эксплуатацию](operations.md#maintenance-отдельным-процессом) |
-| `tallyho inspect TARGET --dsn DSN --schema SCHEMA` | печатает дерево батча с прогрессом; `TARGET` — UUID батча или `kind:key` корня |
-| `tallyho --version` | версия пакета |
-
-`--dsn` — async-DSN SQLAlchemy (`postgresql+asyncpg://…` или `postgresql+psycopg://…`), `--schema`
-обязателен. Команды работают с префиксом по умолчанию `th_`; установку с другим префиксом
-мигрируйте через `th.migrate()` или Alembic.
-
-Пример вывода `inspect` для конвейера из двух этапов (идентификаторы сокращены):
-
-```text
-catalog_parse key=catalog:7 id=01a0fbbd-… state=sealed done=0/2 found=2 queued=2 in_flight=0 errors=0 cancelled=0 progress=33.3%
-  catalog_parse.cards key=cards id=01a0fbbd-… state=open done=2/6 found=2 queued=0 in_flight=0 errors=0 cancelled=0 progress=33.3%
-  catalog_parse.pages key=pages id=01a0fbbd-… state=sealed done=1/3 found=3 queued=2 in_flight=0 errors=0 cancelled=0 progress=33.3%
-```
-
-`done=1/3` — завершено и ожидается всего, `?` на месте числа — оценки пока нет. В строке родителя
-каждый под-батч считается одной задачей.
+Все команды и их флаги собраны на странице [Командная строка](../reference/cli.md).
 
 ## Настройки
 
-Настройки передаются именованными аргументами в `Tallyho(...)`. Неизвестное имя или недопустимое
-значение — `ConfigurationError` при создании клиента.
-
-| Настройка | По умолчанию | Смысл |
-|---|---|---|
-| `retention` | 14 дней | через сколько после завершения удалять дерево батча; `None` — хранить вечно. Можно переопределить в `th.batch(retention=...)` |
-| `max_items` | `None` | лимит задач на дерево по умолчанию; переопределяется в `th.batch(max_items=...)` |
-| `lease_ttl` / `heartbeat_every` | 60 с / 20 с | через сколько задача без признаков жизни считается потерянной и как часто воркер продлевает аренду |
-| `completer_tick` / `completer_max_batch` | 20 мс / 500 | групповой коммит завершений: окно накопления и максимальный размер пачки |
-| `completer_backpressure` | 10 000 | предел буфера завершений в процессе воркера |
-| `relay_grace` / `relay_claim_ttl` | 5 с / 30 с | когда страховочная отправка подбирает неотправленные сообщения и на сколько их захватывает |
-| `finalize_grace` | 30 с | через сколько фоновые проверки подбирают пропущенную финализацию |
-| `sweep_interval` | 5 с | период фоновых проверок и страховочной отправки |
-| `hook_timeout` | 10 с | предельное время одного tx-хука |
-| `hook_backoff_initial` / `hook_backoff_max` | 1 с / 5 мин | пауза перед первым повтором упавшего хука и её верхняя граница; между ними пауза удваивается |
-| `snapshot_tick` | 500 мс | период цикла снимков прогресса; частота на батч задаётся `every` в хуке |
-| `estimate_min_basis` / `estimate_min_share` | 20 / 0.05 | минимальная выборка для оценки ожидаемого объёма этапа |
-| `eta_window` | 60 с | окно усреднения скорости для ETA |
-| `lock_timeout` | 5 с | сколько транзакции tallyho ждут чужие блокировки |
-| `close_timeout` | 10 с | сколько `th.aclose()` ждёт фоновую работу; что не успело — отменяется и восстанавливается фоновыми проверками |
-| `watch_throttle` | 500 мс | не чаще одного уведомления `watch()` на батч |
-| `counter_slots` | 8 | число слотов счётчиков на батч |
-| `items_scan_window` | 5 000 | сколько строк читает один запрос `handle.items(states=...)` |
-| `attributes_max_keys` | 32 | максимум атрибутов корня |
-| `attributes_max_key_bytes` / `attributes_max_value_bytes` | 128 / 512 | длина ключа и строкового значения атрибута в UTF-8 |
-| `attributes_max_bytes` / `memo_max_bytes` | 8 192 / 16 384 | размер всех атрибутов и `memo` в JSON |
-
-Настройки, влияющие на учёт (`lease_ttl`, `counter_slots`, `relay_*`, `finalize_grace`), держите
-одинаковыми во всех процессах установки.
-
-## Что дальше
-
-* Создать первый батч — [Батчи и конвейеры](batches.md).
-* Где запускать фоновые проверки — [Эксплуатация PostgreSQL](operations.md#процессы).
+Сроки, размеры пачек и лимиты задаются именованными аргументами `Tallyho(...)`, например
+`Tallyho(engine, schema="app", retention=timedelta(days=30))`. Полная таблица с умолчаниями - на
+странице [Настройки](../reference/settings.md).

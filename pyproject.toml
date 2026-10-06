@@ -93,6 +93,16 @@ bench = [
   "taskiq>=0.13.0",
   "taskiq-redis>=1.2.4",
 ]
+# Сайт документации (docs/, poe docs): Sphinx + тема Shibuya, страницы в MyST Markdown.
+docs = [
+  "sphinx>=8.2,<10",
+  "shibuya>=2026.1,<2027",
+  "myst-parser>=4,<6",
+  "sphinx-design>=0.6,<0.8",
+  "sphinx-copybutton>=0.5,<0.6",
+  "sphinxcontrib-mermaid>=1,<3",
+  "sphinx-llm-friendly>=0.5,<0.6",
+]
 
 [tool.uv]
 default-groups = ["dev", "bench"]
@@ -157,6 +167,7 @@ bench-overhead = { cmd = "python -m benchmarks.overhead_cli --tasks ${TASKS} --r
 ] }
 mutation-cas ={ shell = "mutmut run --max-children 4 '*Tx*claim*' '*Tx*finish*' '*Finalizer*_cas*' '*Snapshotter*_attempt*' '*Operations*_retry_items*' && ! mutmut results | grep -Eq ': (survived|suspicious|no tests)'", help = "Mutation gate for critical CAS functions (Linux/WSL only)" }
 check = { sequence = ["lint", "types", "imports", "deps", "test"], help = "Everything CI runs, except integration" }
+docs = { cmd = "python -m sphinx -b html -W --keep-going -q docs docs/_build/html", help = "Сайт документации в docs/_build/html (нужна группа docs: uv sync --group docs)" }
 check-all = { sequence = ["lint", "types", "imports", "deps", "test-all"], help = "Всё, включая PostgreSQL и покрытие ≥ 95%" }
 
 # -----------------------------------------------------------------------------

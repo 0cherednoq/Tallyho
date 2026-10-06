@@ -1,0 +1,56 @@
+# Подписи темы Shibuya, у которой нет русского перевода.
+msgid ""
+msgstr ""
+"Project-Id-Version: tallyho-docs\n"
+"Language: ru\n"
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=utf-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+
+msgid "Back to top"
+msgstr "Наверх"
+
+msgid "Copy page"
+msgstr "Скопировать страницу"
+
+msgid "Discussion"
+msgstr "Обсуждение"
+
+msgid "Edit this page"
+msgstr "Править страницу"
+
+msgid "Home"
+msgstr "Главная"
+
+msgid "More actions"
+msgstr "Ещё"
+
+msgid "Next"
+msgstr "Дальше"
+
+msgid "On this page"
+msgstr "На странице"
+
+msgid "Previous"
+msgstr "Назад"
+
+msgid "Switch to auto color mode"
+msgstr "Тема как в системе"
+
+msgid "Switch to dark color mode"
+msgstr "Тёмная тема"
+
+msgid "Switch to light color mode"
+msgstr "Светлая тема"
+
+msgid "Translations"
+msgstr "Переводы"
+
+msgid "Versions"
+msgstr "Версии"
+
+msgid "View Source"
+msgstr "Исходник"
+
+msgid "View as Markdown"
+msgstr "Открыть как Markdown"

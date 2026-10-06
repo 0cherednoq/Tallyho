@@ -20,6 +20,7 @@ uv run pre-commit install
 | `test-all` | всё, включая PostgreSQL (Docker или `TALLYHO_TEST_DSN`) |
 | `check` | `lint` → `types` → `imports` → `deps` → `test` |
 | `check-all` | то же, но с `test-all`: PostgreSQL и покрытие ≥ 95% |
+| `docs` | сайт документации в `docs/_build/html`; нужна группа `docs` (`uv sync --all-extras --group docs`) |
 | `bench` | бенчмарки A-PERF: `--id P-01[,P-04,...]` или `all`, `--profile smoke\|nightly\|full`; отчёт в `.work-tmp/bench/` ([docs/benchmarks](docs/benchmarks/README.md)) |
 
 ## Что проверяется и где
@@ -100,6 +101,47 @@ tests/
 
 Слои и запреты импортов описаны в `[tool.importlinter]` в `pyproject.toml`
 и соответствуют [docs/ARCHITECTURE.md §3.3](docs/ARCHITECTURE.md).
+
+## Документация
+
+Сайт собирается Sphinx с темой [Shibuya](https://shibuya.lepture.com/) из страниц в MyST Markdown.
+
+```bash
+uv sync --all-extras --group docs
+uv run poe docs                               # HTML в docs/_build/html, предупреждение = ошибка
+python -m http.server -d docs/_build/html     # посмотреть локально
+```
+
+| Что | Где |
+|---|---|
+| главная и оглавление | `docs/index.md` |
+| руководство | `docs/guide/` |
+| справочник настроек, CLI, ошибок | `docs/reference/` |
+| справочник API из докстрингов | `docs/reference/api/` |
+| конфигурация, стили, логотип | `docs/conf.py`, `docs/_static/` |
+
+Остальные файлы в `docs/` (ARCHITECTURE, ACCEPTANCE, `plan/`, `benchmarks/`) - внутренние документы
+проекта, на сайт они не попадают: список страниц сайта задаёт `include_patterns` в `docs/conf.py`.
+
+Правила для страниц:
+
+* Примеры на страницах - код приложения без проверок: задачи через `@fq.task`, батчи в
+  обработчиках API, хуки в свои таблицы. Что код вернёт или запишет, пишется комментарием под ним.
+  `assert` остаётся только на странице «Тестирование».
+* Каждый блок `python` помечен `<!-- tallyho-noexec: причина -->` либо, если он выполняется в CI,
+  `<!-- tallyho-example: имя -->`. Новую страницу добавьте в манифест
+  `tests/examples/test_documentation.py`.
+* Поведение, которое описывает пример, подтверждает сценарий с проверками в
+  `tests/examples/guide_scenarios.md` (выполняется в CI на PostgreSQL, имя сценария - в том же
+  манифесте). Сценарии учебного раздела лежат в `tests/examples/tutorial/`. Меняете пример на
+  странице - поправьте и сценарий.
+* Ссылки между страницами относительные, на файл `.md`, с якорем как на GitHub. Их проверяют и тест,
+  и сборка сайта.
+* Предупреждения, вкладки и карточки пишутся директивами с двоеточиями (`:::{warning}`,
+  `::::{tab-set}`), диаграммы - блоком `mermaid`.
+
+Публикует сайт `.github/workflows/docs.yml`: на PR только сборка, после push в `main` - выкладка на
+GitHub Pages. В настройках репозитория один раз включите Settings, Pages, Source: GitHub Actions.
 
 ## Релиз
 

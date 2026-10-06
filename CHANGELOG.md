@@ -6,7 +6,7 @@
 ## [Unreleased]
 
 Содержимое будущей версии 1.0 — первой публичной. Руководство пользователя:
-[docs/guide](docs/guide/README.md).
+[docs/](docs/index.md).
 
 ### Added
 
@@ -88,6 +88,9 @@
 - Наблюдаемость: протокол `Observer`, `NullObserver`, `OpenTelemetryObserver` (`tallyho[otel]`).
 - Совместимость с pgbouncer в режиме transaction pooling (asyncpg и psycopg 3).
 - Руководство пользователя `docs/guide/` с примерами, которые выполняются в CI.
+- Сайт документации на Sphinx с темой Shibuya: руководство, справочник настроек, CLI и ошибок,
+  справочник API из докстрингов, `llms.txt`, учебный раздел «Разбор на примерах»: проверка
+  аккаунтов одним батчем и экспорт почты конвейером из трёх этапов, оба на flexiq. Сборка `poe docs`, публикация на GitHub Pages.
 - Структура проекта, линтеры, тесты, CI и публикация на PyPI.
 
 ### Known limitations

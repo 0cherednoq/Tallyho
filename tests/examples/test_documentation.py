@@ -7,9 +7,14 @@ Two markers are recognised, each on the line(s) right above a Python fence:
 * ``<!-- tallyho-noexec: reason -->`` — the block is illustrative (it needs a
   broker worker, pgbouncer, a user project layout …) and is only accounted for.
 
-README and every page of ``docs/guide`` are *strict*: a Python fence without
-one of the markers fails the manifest tests. ARCHITECTURE keeps its many
-illustrative fragments unmarked; only its marked blocks are executed.
+README and every page of the documentation site (``docs/index.md``,
+``docs/guide``, ``docs/reference``) are *strict*: a Python fence without one of
+the markers fails the manifest tests. The pages show application code without
+assertions, so most of their fences are ``tallyho-noexec``. The behaviour they
+describe is executed elsewhere: ``tests/examples/guide_scenarios.md`` holds the
+assert-based scenarios of the guide, ``tests/examples/tutorial`` runs the
+tutorial applications. ARCHITECTURE keeps its many illustrative fragments
+unmarked; only its marked blocks are executed.
 
 Relative links of the strict documents are checked too: the target file must
 exist and a ``#fragment`` must match a heading of that file.
@@ -37,19 +42,32 @@ __all__: list[str] = []
 ROOT = Path(__file__).parents[2]
 README = ROOT / "README.md"
 ARCHITECTURE = ROOT / "docs" / "ARCHITECTURE.md"
-GUIDE = ROOT / "docs" / "guide"
-GUIDE_PAGES = tuple(sorted(GUIDE.rglob("*.md")))
-DOCUMENTS = (README, ARCHITECTURE, *GUIDE_PAGES)
+DOCS = ROOT / "docs"
+# Страницы сайта документации (docs/conf.py, include_patterns): главная, руководство, справочник.
+GUIDE_PAGES = tuple(
+    sorted(
+        [DOCS / "index.md", *(DOCS / "guide").rglob("*.md"), *(DOCS / "reference").rglob("*.md")]
+    )
+)
+# Учебный раздел показывает код приложения на flexiq без проверок: исполняемых блоков в нём нет,
+# его сценарии выполняет tests/examples/tutorial/test_tutorial.py.
+TUTORIAL = DOCS / "guide" / "tutorial"
+TUTORIAL_TESTS = ROOT / "tests" / "examples" / "tutorial" / "test_tutorial.py"
+# Сценарии руководства с проверками: страницы сайта показывают тот же код без assert.
+SCENARIOS = ROOT / "tests" / "examples" / "guide_scenarios.md"
+DOCUMENTS = (README, ARCHITECTURE, SCENARIOS, *GUIDE_PAGES)
 STRICT_DOCUMENTS = (README, *GUIDE_PAGES)
 EXPECTED = {
     "readme-quickstart",
     "architecture-mailing",
     "architecture-delivery",
     "architecture-catalog",
+    "guide-start-first-batch",
     "guide-install-migrate",
     "guide-install-session",
     "guide-batches-basics",
     "guide-batches-streaming",
+    "guide-batches-streaming-close",
     "guide-batches-pipeline",
     "guide-batches-policy",
     "guide-batches-operations",
@@ -63,17 +81,48 @@ EXPECTED = {
     "guide-flexiq-call-options",
     "guide-operations-maintenance",
     "guide-operations-observer",
+    "guide-postgres-storage",
 }
 # Guide pages that must exist; a renamed or deleted page fails the manifest.
 EXPECTED_GUIDE_PAGES = {
-    "README.md",
-    "installation.md",
-    "batches.md",
-    "hooks.md",
-    "testing.md",
-    "flexiq.md",
-    "operations.md",
-    "limitations.md",
+    "index.md",
+    "guide/getting-started.md",
+    "guide/concepts.md",
+    "guide/installation.md",
+    "guide/batches.md",
+    "guide/batches/tasks.md",
+    "guide/batches/pipelines.md",
+    "guide/batches/failure-policies.md",
+    "guide/batches/operations.md",
+    "guide/batches/progress.md",
+    "guide/batches/attributes.md",
+    "guide/hooks.md",
+    "guide/hooks/retry.md",
+    "guide/hooks/callbacks.md",
+    "guide/hooks/complete-in.md",
+    "guide/hooks/retention.md",
+    "guide/hooks/recipe.md",
+    "guide/testing.md",
+    "guide/tutorial/overview.md",
+    "guide/tutorial/checker.md",
+    "guide/tutorial/export.md",
+    "guide/tutorial/export-progress.md",
+    "guide/tutorial/export-finalization.md",
+    "guide/flexiq.md",
+    "guide/operations.md",
+    "guide/operations/shutdown.md",
+    "guide/operations/postgres.md",
+    "guide/operations/observability.md",
+    "guide/limitations.md",
+    "reference/settings.md",
+    "reference/cli.md",
+    "reference/errors.md",
+    "reference/api.md",
+    "reference/api/client.md",
+    "reference/api/runtime.md",
+    "reference/api/model.md",
+    "reference/api/testing.md",
+    "reference/api/extensions.md",
 }
 MARKER = re.compile(r"^\s*<!--\s*tallyho-example:\s*([a-z0-9-]+)\s*-->\s*$")
 NOEXEC = re.compile(r"^\s*<!--\s*tallyho-noexec:\s*(\S.*?)\s*-->\s*$")
@@ -232,15 +281,12 @@ EXAMPLES = extract_examples(DOCUMENTS)
 def test_documentation_example_manifest_is_complete() -> None:
     assert {example.name for example in EXAMPLES} == EXPECTED
     with_examples = {example.path for example in EXAMPLES}
-    assert {README, ARCHITECTURE} <= with_examples
-    readme_python_fences = python_fences(README)
-    assert readme_python_fences
-    # README остаётся полностью исполняемым: noexec-блоков в нём нет.
-    assert all(fence.example is not None for fence in readme_python_fences)
+    assert {ARCHITECTURE, SCENARIOS} <= with_examples
+    assert python_fences(README)
 
 
 def test_guide_pages_are_present() -> None:
-    assert {page.relative_to(GUIDE).as_posix() for page in GUIDE_PAGES} == EXPECTED_GUIDE_PAGES
+    assert {page.relative_to(DOCS).as_posix() for page in GUIDE_PAGES} == EXPECTED_GUIDE_PAGES
 
 
 @pytest.mark.parametrize(
@@ -255,16 +301,19 @@ def test_every_python_block_is_marked(path: Path) -> None:
     assert not unmarked, f"Python blocks without tallyho-example/tallyho-noexec: {unmarked}"
 
 
-@pytest.mark.parametrize(
-    "path", GUIDE_PAGES, ids=lambda value: cast("Path", value).relative_to(ROOT).as_posix()
-)
-def test_guide_page_with_code_has_executable_example(path: Path) -> None:
-    fences = python_fences(path)
-    if fences:
-        assert any(fence.example is not None for fence in fences), (
-            f"{path.relative_to(ROOT).as_posix()}: no executable example among "
-            f"{len(fences)} Python blocks"
-        )
+def test_scenarios_name_the_page_they_support() -> None:
+    # Каждый сценарий называет страницу, поведение которой он подтверждает, и она существует.
+    text = SCENARIOS.read_text(encoding="utf-8")
+    pages = re.findall(r"^Страница: `([^`]+)`", text, flags=re.MULTILINE)
+    assert len(pages) == len(extract_examples([SCENARIOS]))
+    assert all((ROOT / page).is_file() for page in pages)
+
+
+def test_tutorial_scenarios_are_tested_outside_the_pages() -> None:
+    assert any(python_fences(page) for page in GUIDE_PAGES if TUTORIAL in page.parents)
+    source = TUTORIAL_TESTS.read_text(encoding="utf-8")
+    assert "async def test_account_check" in source
+    assert "async def test_mail_export" in source
 
 
 @pytest.mark.parametrize(

@@ -4,31 +4,33 @@
 [![PyPI](https://img.shields.io/pypi/v/tallyho.svg)](https://pypi.org/project/tallyho/)
 [![Python](https://img.shields.io/pypi/pyversions/tallyho.svg)](https://pypi.org/project/tallyho/)
 
-Async-библиотека для Python + PostgreSQL. Добавляет к любому брокеру задач групповой учёт
-(батчи, вложенные батчи, прогресс, финализация ровно один раз), динамический fan-out,
-конвейеры этапов и транзакционные хуки в доменные таблицы.
+Async-библиотека для Python и PostgreSQL. Она добавляет к брокеру задач то, чего в нём обычно
+нет: учёт группы задач (батчи, вложенные батчи, прогресс, финализация ровно один раз), задачи,
+которые порождают задачи, конвейеры этапов и хуки, которые пишут итог в ваши таблицы той же
+транзакцией.
 
-> Статус: pre-alpha, идёт реализация. Руководство — [docs/guide](docs/guide/README.md),
-> архитектура — [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+> Статус: pre-alpha, версия 1.0 ещё не выпущена. Документация собирается в сайт из
+> [docs/](docs/index.md) и публикуется на [GitHub Pages](https://0cherednoq.github.io/tallyho/). Как библиотека
+> устроена внутри, описано в [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## Что это даёт
 
-* **Батч как единица учёта.** Сколько задач найдено, сделано, упало, сколько осталось и когда
-  закончится — одним запросом, для всего дерева под-батчей.
-* **Финализация ровно один раз.** Итог батча записывается в вашу таблицу в той же транзакции, в
-  которой батч становится завершённым: статус кампании и состояние батча не расходятся.
-* **Динамический fan-out и конвейеры.** Задачи порождают задачи, этапы работают параллельно, и
-  следующий этап сам закрывается, когда закончились его источники.
-* **Управление группой.** Отложенный старт, пауза, отмена, повтор упавших, ограничение
+* Батч считает, сколько задач найдено, сделано, упало и сколько осталось. Один запрос отдаёт
+  снимок всего дерева под-батчей вместе с оценкой времени до конца.
+* Итог батча записывается в вашу таблицу в той же транзакции, в которой батч становится
+  завершённым. Статус кампании и состояние батча не расходятся.
+* Задачи порождают задачи, этапы конвейера работают параллельно, и следующий этап закрывается
+  сам, когда закончились его источники.
+* Группой можно управлять: отложенный старт, пауза, отмена, повтор упавших, ограничение
   параллелизма, политики ошибок.
-* **Ничего не зависает.** Падение воркера, брокера или сети не теряет задачи и не оставляет батч
-  незавершённым.
+* При падении воркера, брокера или сети задачи не теряются, и батч доходит до итога.
 
-Исполнение задач, ретраи и расписания остаются за брокером; бизнес-статусы — в ваших таблицах.
+Исполнение задач, ретраи и расписания остаются за брокером, бизнес-статусы живут в ваших
+таблицах.
 
 ## Установка
 
-Нужны Python ≥ 3.11 и PostgreSQL ≥ 14.
+Нужны Python 3.11 или новее и PostgreSQL 14 или новее.
 
 ```bash
 pip install "tallyho[asyncpg]"            # или tallyho[psycopg]
@@ -37,61 +39,75 @@ pip install "tallyho[asyncpg,flexiq]"     # с адаптером flexiq
 
 ## Быстрый старт
 
-Ниже используется встроенный `InlineBroker`: пример действительно извлекается из README и
-выполняется в CI на PostgreSQL. В нём уже определены `engine` (`AsyncEngine` SQLAlchemy) и `schema`
-(имя схемы для таблиц tallyho).
+Скрипт ниже работает со встроенным `InlineBroker`: он выполняет задачи в том же процессе,
+поэтому для знакомства хватит PostgreSQL и одного файла.
 
-<!-- tallyho-example: readme-quickstart -->
+<!-- tallyho-noexec: самостоятельный скрипт: нужен ваш DSN; сценарий readme-quickstart выполняется в tests/examples/guide_scenarios.md -->
 ```python
+# quickstart.py
+import asyncio
+
+from sqlalchemy.ext.asyncio import create_async_engine
+
 from tallyho import Tallyho, item
-from tallyho.model.states import BatchState
 from tallyho.testing import InlineBroker
 
-broker = InlineBroker()  # в продакшне — адаптер вашего брокера
-th = Tallyho(engine, schema=schema)
+engine = create_async_engine("postgresql+asyncpg://app:secret@localhost/app")
+broker = InlineBroker()  # выполняет задачи в этом же процессе; в продакшне здесь адаптер брокера
+th = Tallyho(engine, schema="quickstart")
 th.install(broker.adapter)
-seen: list[str] = []
 
 
-async def greet(name: str) -> None:
-    seen.append(name)
-    item.ok("greeted")  # итог задачи с меткой
+async def send_email(address: str) -> None:
+    if address.endswith("@bounce.test"):
+        item.error("hard_bounce")  # ошибка без исключения и без ретраев
+        return
+    item.ok("sent")  # итог задачи с меткой
 
 
-await th.migrate()  # создать таблицы
-try:
-    async with th.batch("readme.quickstart", key="demo") as batch:
-        await batch.map(greet, ["Ada", "Grace"])  # по задаче на элемент
+async def main() -> None:
+    await th.migrate()  # создать схему и таблицы
+    async with th.batch("newsletter") as batch:
+        await batch.map(send_email, ["ada@ok.test", "grace@ok.test", "gone@bounce.test"])
+    # выход из блока: батч закрыт, транзакция закоммичена
 
-    assert await broker.drain(concurrency=2) == 2  # выполнить задачи
+    await broker.drain()  # выполнить задачи; в продакшне это делают воркеры
+
     view = await batch.handle.view()
-    assert view.state is BatchState.SUCCEEDED
-    assert view.progress.ok == 2
-    assert dict(view.labels) == {"greeted": 2}
-    assert sorted(seen) == ["Ada", "Grace"]
-finally:
+    print(view.state.name, view.progress.found, view.progress.ok, view.progress.error)
+    print(dict(view.labels))
+
     await th.aclose()
+    await engine.dispose()
+
+
+asyncio.run(main())
+
+# COMPLETED_WITH_ERRORS 3 2 1
+# {'sent': 2, 'hard_bounce': 1}
 ```
 
 Что здесь произошло:
 
-1. `th.batch(kind, key=...)` создал батч и записал две задачи одной транзакцией; повторный вызов с
-   тем же ключом второй батч не создаст.
+1. `th.batch(kind)` создал батч и записал три задачи одной транзакцией. С ключом,
+   `th.batch(kind, key=...)`, повторный вызов второй батч не создаст.
 2. При выходе из `async with` батч закрылся, а транзакция закоммитилась; после этого задачи
    отправляются в брокер.
-3. Каждая задача записала свой итог; после последней батч финализировался — ровно один раз.
+3. Каждая задача записала свой итог; после последней батч финализировался - ровно один раз.
 4. `handle.view()` вернул состояние и счётчики.
 
 ## Дальше
 
-| Задача | Страница руководства |
+| Задача | Страница |
 |---|---|
+| Разобраться в терминах и гарантиях | [Основные понятия](docs/guide/concepts.md) |
+| Посмотреть два приложения целиком на flexiq: проверка аккаунтов и экспорт почты | [Разбор на примерах](docs/guide/tutorial/overview.md) |
 | Поставить пакет, создать таблицы (`migrate`, Alembic, CLI) | [Установка и миграции](docs/guide/installation.md) |
-| Под-батчи, конвейеры `fed_by`, `spawn`, политики ошибок, пауза и отмена, прогресс, атрибуты и листинг | [Батчи и конвейеры](docs/guide/batches.md) |
+| Под-батчи, конвейеры `fed_by`, `spawn`, политики ошибок, пауза и отмена, прогресс, атрибуты и листинг | [Батчи](docs/guide/batches.md) |
 | Записать итог и прогресс в свои таблицы, retention и `release()` | [Хуки](docs/guide/hooks.md) |
 | Тесты с `InlineBroker` и `FakeClock` | [Тестирование](docs/guide/testing.md) |
 | Подключить брокер flexiq | [Адаптер flexiq](docs/guide/flexiq.md) |
-| Процессы, autovacuum, pgbouncer, метрики | [Эксплуатация PostgreSQL](docs/guide/operations.md) |
+| Процессы и maintenance, остановка, autovacuum, pgbouncer, метрики | [Процессы и maintenance](docs/guide/operations.md) |
 | Что не входит в v1 | [Ограничения v1](docs/guide/limitations.md) |
 
 ## Разработка
@@ -105,7 +121,8 @@ uv run poe check                   # всё, что проверяет CI (кр�
 uv run poe test-all                # + интеграционные тесты с PostgreSQL
 ```
 
-Подробнее — [CONTRIBUTING.md](CONTRIBUTING.md).
+Сайт документации собирается командой `uv run --group docs poe docs`. Подробнее -
+[CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Лицензия
 

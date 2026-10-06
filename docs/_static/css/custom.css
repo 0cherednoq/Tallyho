@@ -1,0 +1,61 @@
+/* Зелёное свечение сверху страницы, как на главной django-modern-rest. */
+body {
+  background-image: radial-gradient(
+    ellipse 80% 50% at 50% 0%,
+    rgba(45, 164, 78, 0.09) 0%,
+    transparent 60%
+  );
+  background-attachment: fixed;
+}
+
+html.dark body {
+  background-image: radial-gradient(
+    ellipse 80% 50% at 50% 0%,
+    rgba(63, 185, 80, 0.09) 0%,
+    transparent 60%
+  );
+}
+
+/* Главная: логотип, подзаголовок, кнопки. Заголовок страницы заменяет логотип. */
+section#tallyho > h1 {
+  display: none;
+}
+
+.hero-logo {
+  display: block;
+  width: min(420px, 80%);
+  margin: 2.5rem auto 1.25rem;
+}
+
+html.light .hero-logo.dark-only,
+html.dark .hero-logo.light-only {
+  display: none;
+}
+
+p.lead {
+  margin-bottom: 0.25rem;
+  text-align: center;
+}
+
+div.buttons {
+  margin-top: 1rem;
+  margin-bottom: 0;
+  text-align: center;
+}
+
+p.rubric {
+  margin-top: 1.75rem;
+  margin-bottom: 0.75rem;
+}
+
+/* Широкие таблицы справочника прокручиваются, а не ломают колонку. */
+.yue table code {
+  white-space: nowrap;
+}
+
+/* Диаграммы mermaid по центру. */
+pre.mermaid {
+  background: transparent;
+  border: 0;
+  text-align: center;
+}

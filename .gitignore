@@ -30,3 +30,8 @@ Thumbs.db
 
 # Local env
 .env
+
+# Docs
+docs/_build/
+docs/_locale/**/*.mo
+.playwright-mcp/
