@@ -36,8 +36,10 @@ __all__ = [
     "Schemas",
     "Stand",
     "Toxiproxy",
+    "free_port",
     "ident",
     "provision",
+    "run_command",
     "schemas",
     "sql",
     "wait_postgres",
@@ -67,7 +69,15 @@ class BenchError(Exception):
     """Стенд или нагрузка не смогли выполнить прогон."""
 
 
-async def _run(*args: str, check: bool = True) -> str:
+async def run_command(*args: str, check: bool = True) -> str:
+    """Выполнить команду (``docker …``) и вернуть её stdout.
+
+    Returns:
+        stdout без пробелов по краям.
+
+    Raises:
+        BenchError: код возврата не 0 при ``check``.
+    """
     process = await asyncio.create_subprocess_exec(
         *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
     )
@@ -79,7 +89,7 @@ async def _run(*args: str, check: bool = True) -> str:
 
 
 async def _published_port(container: str, port: int) -> int:
-    raw = await _run("docker", "port", container, f"{port}/tcp")
+    raw = await run_command("docker", "port", container, f"{port}/tcp")
     # «127.0.0.1:49153»; при нескольких адресах — первая строка.
     return int(raw.splitlines()[0].rsplit(":", 1)[1])
 
@@ -175,9 +185,9 @@ class Stand:
         if self.container is None:
             message = "перезапуск PostgreSQL возможен только на своём стенде"
             raise BenchError(message)
-        _ = await _run("docker", "kill", self.container)
+        _ = await run_command("docker", "kill", self.container)
         await asyncio.sleep(down_seconds)
-        _ = await _run("docker", "start", self.container)
+        _ = await run_command("docker", "start", self.container)
         await wait_postgres(self.dsn)
 
     async def toxiproxy(self) -> Toxiproxy:
@@ -194,7 +204,7 @@ class Stand:
             message = "toxiproxy доступен только на своём стенде"
             raise BenchError(message)
         name = f"bench-toxiproxy-{self.run_id}"
-        _ = await _run(
+        _ = await run_command(
             "docker", "run", "-d", "--name", name, "--network", self.network,
             "-p", "127.0.0.1::8474", "-p", "127.0.0.1::8666", TOXIPROXY_IMAGE,
         )  # fmt: skip
@@ -220,10 +230,15 @@ class Stand:
     async def remove_proxies(self) -> None:
         """Удалить поднятые toxiproxy."""
         while self._proxies:
-            _ = await _run("docker", "rm", "-f", self._proxies.pop(), check=False)
+            _ = await run_command("docker", "rm", "-f", self._proxies.pop(), check=False)
 
 
-def _free_port() -> int:
+def free_port() -> int:
+    """Свободный TCP-порт на 127.0.0.1 для публикации порта контейнера.
+
+    Returns:
+        Номер порта.
+    """
     # Порт фиксируется при создании: после ``docker kill``/``start`` (P-09) он не меняется,
     # и воркеры переподключаются по тому же DSN.
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
@@ -250,11 +265,11 @@ async def provision(dsn: str | None) -> AsyncGenerator[Stand]:
         return
     network = f"bench-net-{run_id}"
     container = f"bench-pg-{run_id}"
-    port = _free_port()
-    _ = await _run("docker", "network", "create", network)
+    port = free_port()
+    _ = await run_command("docker", "network", "create", network)
     try:
         settings = [part for setting in _POSTGRES_SETTINGS for part in ("-c", setting)]
-        _ = await _run(
+        _ = await run_command(
             "docker", "run", "-d", "--name", container, "--network", network,
             "--network-alias", "postgres", "--shm-size", "1g",
             "-e", f"POSTGRES_USER={_USER}", "-e", f"POSTGRES_PASSWORD={_USER}",
@@ -268,8 +283,8 @@ async def provision(dsn: str | None) -> AsyncGenerator[Stand]:
         finally:
             await stand.remove_proxies()
     finally:
-        _ = await _run("docker", "rm", "-f", "-v", container, check=False)
-        _ = await _run("docker", "network", "rm", network, check=False)
+        _ = await run_command("docker", "rm", "-f", "-v", container, check=False)
+        _ = await run_command("docker", "network", "rm", network, check=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -337,12 +352,12 @@ class CpuSampler:
 
     async def start(self, origin: float) -> None:
         """Начать опрос; моменты — секунды от ``origin`` (``time.monotonic``)."""
-        self._cpus = max(1, int(await _run("docker", "info", "--format", "{{.NCPU}}")))
+        self._cpus = max(1, int(await run_command("docker", "info", "--format", "{{.NCPU}}")))
         self._task = asyncio.create_task(self._loop(origin), name="bench-cpu-sampler")
 
     async def _loop(self, origin: float) -> None:
         while True:
-            raw = await _run(
+            raw = await run_command(
                 "docker", "stats", "--no-stream", "--format", "{{.CPUPerc}}", self.container,
                 check=False,
             )  # fmt: skip

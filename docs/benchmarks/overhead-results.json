@@ -1,0 +1,5601 @@
+{
+ "note": "Сырые результаты T11.6; методика и выводы — docs/benchmarks/overhead.md",
+ "sessions": {
+  "before-100k-4x50": {
+   "label": "before-100k-4x50",
+   "started_at": "2026-10-06T03:00:22",
+   "duration_s": 2315.1,
+   "parameters": {
+    "tasks": 100000,
+    "repeats": 3,
+    "warmup": 2000,
+    "processes": 4,
+    "concurrency": 50,
+    "scheduler_batch": 50,
+    "variants": [
+     "taskiq-memory",
+     "taskiq-redis",
+     "flexiq",
+     "tallyho"
+    ]
+   },
+   "environment": {
+    "os": "Windows-10-10.0.26200-SP0",
+    "machine": "AMD64",
+    "processor": "AMD64 Family 23 Model 113 Stepping 0, AuthenticAMD",
+    "cpu_count": 16,
+    "python": "3.11.15",
+    "packages": {
+     "flexiq": "2.0.0",
+     "taskiq": "0.13.0",
+     "taskiq-redis": "1.2.4",
+     "redis": "8.1.0",
+     "sqlalchemy": "2.1.1",
+     "asyncpg": "0.31.0"
+    },
+    "postgres": "PostgreSQL 16.13 on x86_64-pc-linux-musl, compiled by gcc (Alpine 15.2.0) 15.2.0, 64-bit",
+    "postgres_settings": {
+     "fsync": "on",
+     "max_connections": "600",
+     "shared_buffers": "65536",
+     "synchronous_commit": "on"
+    },
+    "redis": "7.4.8",
+    "docker": "29.2.1",
+    "docker_info": "Docker Desktop; 6.6.87.2-microsoft-standard-WSL2; 16 CPU; 67398426624 B"
+   },
+   "summary": {
+    "taskiq-memory": {
+     "median": {
+      "variant": "taskiq-memory",
+      "repeat": 2,
+      "tasks": 100000,
+      "enqueue_s": 8.078,
+      "total_s": 8.078,
+      "finalize_s": null,
+      "throughput_per_s": 12379.3,
+      "latency_ms": {
+       "count": 100000,
+       "mean": 35.884,
+       "p50": 32.92,
+       "p95": 57.162,
+       "p99": 98.598,
+       "max": 160.854
+      },
+      "dispatch_ms": {
+       "count": 0,
+       "mean": null,
+       "p50": null,
+       "p95": null,
+       "p99": null,
+       "max": null
+      },
+      "service_ms": {
+       "count": 0,
+       "mean": null,
+       "p50": null,
+       "p95": null,
+       "p99": null,
+       "max": null
+      }
+     },
+     "throughput_min": 12029.4,
+     "throughput_max": 13224.0,
+     "total_s_median": 8.078,
+     "throughput_share_vs_flexiq": 39.6021,
+     "overhead_pct_throughput": -97.5,
+     "overhead_pct_total_time": -97.5,
+     "added_p99_latency_ms": -307754.4
+    },
+    "taskiq-redis": {
+     "median": {
+      "variant": "taskiq-redis",
+      "repeat": 1,
+      "tasks": 100000,
+      "enqueue_s": 54.359,
+      "total_s": 54.547,
+      "finalize_s": null,
+      "throughput_per_s": 1833.3,
+      "latency_ms": {
+       "count": 100000,
+       "mean": 347.081,
+       "p50": 338.513,
+       "p95": 507.691,
+       "p99": 679.457,
+       "max": 1029.316
+      },
+      "dispatch_ms": {
+       "count": 0,
+       "mean": null,
+       "p50": null,
+       "p95": null,
+       "p99": null,
+       "max": null
+      },
+      "service_ms": {
+       "count": 0,
+       "mean": null,
+       "p50": null,
+       "p95": null,
+       "p99": null,
+       "max": null
+      }
+     },
+     "throughput_min": 1795.7,
+     "throughput_max": 1848.1,
+     "total_s_median": 54.547,
+     "throughput_share_vs_flexiq": 5.8648,
+     "overhead_pct_throughput": -82.9,
+     "overhead_pct_total_time": -82.9,
+     "added_p99_latency_ms": -307173.5
+    },
+    "flexiq": {
+     "median": {
+      "variant": "flexiq",
+      "repeat": 1,
+      "tasks": 100000,
+      "enqueue_s": 9.422,
+      "total_s": 319.906,
+      "finalize_s": null,
+      "throughput_per_s": 312.6,
+      "latency_ms": {
+       "count": 100000,
+       "mean": 157037.758,
+       "p50": 157683.0,
+       "p95": 295482.0,
+       "p99": 307853.0,
+       "max": 310488.0
+      },
+      "dispatch_ms": {
+       "count": 100000,
+       "mean": 0.02,
+       "p50": 0.0,
+       "p95": 0.0,
+       "p99": 0.543,
+       "max": 1.95
+      },
+      "service_ms": {
+       "count": 100000,
+       "mean": 0.861,
+       "p50": 0.0,
+       "p95": 3.778,
+       "p99": 6.736,
+       "max": 117.821
+      }
+     },
+     "throughput_min": 309.8,
+     "throughput_max": 315.6,
+     "total_s_median": 319.906,
+     "throughput_share_vs_flexiq": 1.0,
+     "overhead_pct_throughput": 0.0,
+     "overhead_pct_total_time": 0.0,
+     "added_p99_latency_ms": 0.0
+    },
+    "tallyho": {
+     "median": {
+      "variant": "tallyho",
+      "repeat": 0,
+      "tasks": 100000,
+      "enqueue_s": 5.672,
+      "total_s": 357.281,
+      "finalize_s": 357.344,
+      "throughput_per_s": 279.9,
+      "latency_ms": {
+       "count": 100000,
+       "mean": 183029.799,
+       "p50": 181191.95,
+       "p95": 340523.485,
+       "p99": 354125.568,
+       "max": 357198.519
+      },
+      "dispatch_ms": {
+       "count": 100000,
+       "mean": 80.222,
+       "p50": 85.052,
+       "p95": 127.337,
+       "p99": 170.801,
+       "max": 1377.655
+      },
+      "service_ms": {
+       "count": 100000,
+       "mean": 271.168,
+       "p50": 278.815,
+       "p95": 413.119,
+       "p99": 557.703,
+       "max": 1838.633
+      }
+     },
+     "throughput_min": 265.3,
+     "throughput_max": 303.4,
+     "total_s_median": 357.281,
+     "throughput_share_vs_flexiq": 0.8954,
+     "overhead_pct_throughput": 11.7,
+     "overhead_pct_total_time": 11.7,
+     "added_p99_latency_ms": 46272.6
+    }
+   },
+   "completer": {
+    "tallyho": [
+     {
+      "flushes": 5087,
+      "items_mean": 40.1,
+      "duration_p50_ms": 31.0,
+      "duration_p99_ms": 109.0,
+      "span_s": 364.9
+     },
+     {
+      "flushes": 5089,
+      "items_mean": 40.1,
+      "duration_p50_ms": 31.0,
+      "duration_p99_ms": 110.0,
+      "span_s": 386.7
+     },
+     {
+      "flushes": 5046,
+      "items_mean": 40.4,
+      "duration_p50_ms": 31.0,
+      "duration_p99_ms": 94.0,
+      "span_s": 337.3
+     }
+    ]
+   },
+   "runs": [
+    {
+     "variant": "taskiq-memory",
+     "repeat": 0,
+     "tasks": 100000,
+     "enqueue_s": 7.562,
+     "total_s": 7.562,
+     "finalize_s": null,
+     "throughput_per_s": 13224.0,
+     "latency_ms": {
+      "count": 100000,
+      "mean": 34.293,
+      "p50": 32.75,
+      "p95": 43.119,
+      "p99": 74.416,
+      "max": 79.958
+     },
+     "dispatch_ms": {
+      "count": 0,
+      "mean": null,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "max": null
+     },
+     "service_ms": {
+      "count": 0,
+      "mean": null,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "max": null
+     }
+    },
+    {
+     "variant": "taskiq-memory",
+     "repeat": 1,
+     "tasks": 100000,
+     "enqueue_s": 8.313,
+     "total_s": 8.313,
+     "finalize_s": null,
+     "throughput_per_s": 12029.4,
+     "latency_ms": {
+      "count": 100000,
+      "mean": 38.573,
+      "p50": 33.937,
+      "p95": 87.668,
+      "p99": 103.054,
+      "max": 152.744
+     },
+     "dispatch_ms": {
+      "count": 0,
+      "mean": null,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "max": null
+     },
+     "service_ms": {
+      "count": 0,
+      "mean": null,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "max": null
+     }
+    },
+    {
+     "variant": "taskiq-memory",
+     "repeat": 2,
+     "tasks": 100000,
+     "enqueue_s": 8.078,
+     "total_s": 8.078,
+     "finalize_s": null,
+     "throughput_per_s": 12379.3,
+     "latency_ms": {
+      "count": 100000,
+      "mean": 35.884,
+      "p50": 32.92,
+      "p95": 57.162,
+      "p99": 98.598,
+      "max": 160.854
+     },
+     "dispatch_ms": {
+      "count": 0,
+      "mean": null,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "max": null
+     },
+     "service_ms": {
+      "count": 0,
+      "mean": null,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "max": null
+     }
+    },
+    {
+     "variant": "taskiq-redis",
+     "repeat": 0,
+     "tasks": 100000,
+     "enqueue_s": 53.922,
+     "total_s": 54.11,
+     "finalize_s": null,
+     "throughput_per_s": 1848.1,
+     "latency_ms": {
+      "count": 100000,
+      "mean": 353.664,
+      "p50": 341.925,
+      "p95": 529.895,
+      "p99": 770.016,
+      "max": 897.114
+     },
+     "dispatch_ms": {
+      "count": 0,
+      "mean": null,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "max": null
+     },
+     "service_ms": {
+      "count": 0,
+      "mean": null,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "max": null
+     }
+    },
+    {
+     "variant": "taskiq-redis",
+     "repeat": 1,
+     "tasks": 100000,
+     "enqueue_s": 54.359,
+     "total_s": 54.547,
+     "finalize_s": null,
+     "throughput_per_s": 1833.3,
+     "latency_ms": {
+      "count": 100000,
+      "mean": 347.081,
+      "p50": 338.513,
+      "p95": 507.691,
+      "p99": 679.457,
+      "max": 1029.316
+     },
+     "dispatch_ms": {
+      "count": 0,
+      "mean": null,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "max": null
+     },
+     "service_ms": {
+      "count": 0,
+      "mean": null,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "max": null
+     }
+    },
+    {
+     "variant": "taskiq-redis",
+     "repeat": 2,
+     "tasks": 100000,
+     "enqueue_s": 55.5,
+     "total_s": 55.688,
+     "finalize_s": null,
+     "throughput_per_s": 1795.7,
+     "latency_ms": {
+      "count": 100000,
+      "mean": 350.719,
+      "p50": 345.743,
+      "p95": 511.883,
+      "p99": 621.531,
+      "max": 738.298
+     },
+     "dispatch_ms": {
+      "count": 0,
+      "mean": null,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "max": null
+     },
+     "service_ms": {
+      "count": 0,
+      "mean": null,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "max": null
+     }
+    },
+    {
+     "variant": "flexiq",
+     "repeat": 0,
+     "tasks": 100000,
+     "enqueue_s": 9.25,
+     "total_s": 322.813,
+     "finalize_s": null,
+     "throughput_per_s": 309.8,
+     "latency_ms": {
+      "count": 100000,
+      "mean": 154337.492,
+      "p50": 153861.0,
+      "p95": 297754.0,
+      "p99": 310889.0,
+      "max": 313453.0
+     },
+     "dispatch_ms": {
+      "count": 100000,
+      "mean": 0.02,
+      "p50": 0.0,
+      "p95": 0.0,
+      "p99": 0.546,
+      "max": 1.908
+     },
+     "service_ms": {
+      "count": 100000,
+      "mean": 0.908,
+      "p50": 0.0,
+      "p95": 3.922,
+      "p99": 7.162,
+      "max": 76.458
+     }
+    },
+    {
+     "variant": "flexiq",
+     "repeat": 1,
+     "tasks": 100000,
+     "enqueue_s": 9.422,
+     "total_s": 319.906,
+     "finalize_s": null,
+     "throughput_per_s": 312.6,
+     "latency_ms": {
+      "count": 100000,
+      "mean": 157037.758,
+      "p50": 157683.0,
+      "p95": 295482.0,
+      "p99": 307853.0,
+      "max": 310488.0
+     },
+     "dispatch_ms": {
+      "count": 100000,
+      "mean": 0.02,
+      "p50": 0.0,
+      "p95": 0.0,
+      "p99": 0.543,
+      "max": 1.95
+     },
+     "service_ms": {
+      "count": 100000,
+      "mean": 0.861,
+      "p50": 0.0,
+      "p95": 3.778,
+      "p99": 6.736,
+      "max": 117.821
+     }
+    },
+    {
+     "variant": "flexiq",
+     "repeat": 2,
+     "tasks": 100000,
+     "enqueue_s": 8.907,
+     "total_s": 316.844,
+     "finalize_s": null,
+     "throughput_per_s": 315.6,
+     "latency_ms": {
+      "count": 100000,
+      "mean": 153690.334,
+      "p50": 153193.0,
+      "p95": 293130.0,
+      "p99": 305675.0,
+      "max": 307999.0
+     },
+     "dispatch_ms": {
+      "count": 100000,
+      "mean": 0.019,
+      "p50": 0.0,
+      "p95": 0.0,
+      "p99": 0.544,
+      "max": 1.963
+     },
+     "service_ms": {
+      "count": 100000,
+      "mean": 0.884,
+      "p50": 0.0,
+      "p95": 3.821,
+      "p99": 6.87,
+      "max": 41.886
+     }
+    },
+    {
+     "variant": "tallyho",
+     "repeat": 0,
+     "tasks": 100000,
+     "enqueue_s": 5.672,
+     "total_s": 357.281,
+     "finalize_s": 357.344,
+     "throughput_per_s": 279.9,
+     "latency_ms": {
+      "count": 100000,
+      "mean": 183029.799,
+      "p50": 181191.95,
+      "p95": 340523.485,
+      "p99": 354125.568,
+      "max": 357198.519
+     },
+     "dispatch_ms": {
+      "count": 100000,
+      "mean": 80.222,
+      "p50": 85.052,
+      "p95": 127.337,
+      "p99": 170.801,
+      "max": 1377.655
+     },
+     "service_ms": {
+      "count": 100000,
+      "mean": 271.168,
+      "p50": 278.815,
+      "p95": 413.119,
+      "p99": 557.703,
+      "max": 1838.633
+     }
+    },
+    {
+     "variant": "tallyho",
+     "repeat": 1,
+     "tasks": 100000,
+     "enqueue_s": 4.828,
+     "total_s": 376.906,
+     "finalize_s": 377.203,
+     "throughput_per_s": 265.3,
+     "latency_ms": {
+      "count": 100000,
+      "mean": 190426.809,
+      "p50": 188620.035,
+      "p95": 359363.145,
+      "p99": 373524.218,
+      "max": 376762.802
+     },
+     "dispatch_ms": {
+      "count": 100000,
+      "mean": 83.582,
+      "p50": 86.464,
+      "p95": 132.485,
+      "p99": 191.239,
+      "max": 1612.073
+     },
+     "service_ms": {
+      "count": 100000,
+      "mean": 283.009,
+      "p50": 284.552,
+      "p95": 456.741,
+      "p99": 634.53,
+      "max": 2063.452
+     }
+    },
+    {
+     "variant": "tallyho",
+     "repeat": 2,
+     "tasks": 100000,
+     "enqueue_s": 4.219,
+     "total_s": 329.61,
+     "finalize_s": 329.891,
+     "throughput_per_s": 303.4,
+     "latency_ms": {
+      "count": 100000,
+      "mean": 171095.423,
+      "p50": 173750.721,
+      "p95": 314591.971,
+      "p99": 326593.121,
+      "max": 329565.412
+     },
+     "dispatch_ms": {
+      "count": 100000,
+      "mean": 75.497,
+      "p50": 81.56,
+      "p95": 115.237,
+      "p99": 155.18,
+      "max": 1079.149
+     },
+     "service_ms": {
+      "count": 100000,
+      "mean": 253.869,
+      "p50": 264.069,
+      "p95": 378.34,
+      "p99": 472.843,
+      "max": 1382.704
+     }
+    }
+   ]
+  },
+  "after-100k-4x50": {
+   "label": "after-100k-4x50",
+   "started_at": "2026-10-06T01:55:23",
+   "duration_s": 2483.8,
+   "parameters": {
+    "tasks": 100000,
+    "repeats": 3,
+    "warmup": 2000,
+    "processes": 4,
+    "concurrency": 50,
+    "scheduler_batch": 50,
+    "completer_tick_ms": 20.0,
+    "variants": [
+     "taskiq-memory",
+     "taskiq-redis",
+     "flexiq",
+     "tallyho"
+    ]
+   },
+   "environment": {
+    "os": "Windows-10-10.0.26200-SP0",
+    "machine": "AMD64",
+    "processor": "AMD64 Family 23 Model 113 Stepping 0, AuthenticAMD",
+    "cpu_count": 16,
+    "python": "3.11.15",
+    "packages": {
+     "flexiq": "2.0.0",
+     "taskiq": "0.13.0",
+     "taskiq-redis": "1.2.4",
+     "redis": "8.1.0",
+     "sqlalchemy": "2.1.1",
+     "asyncpg": "0.31.0"
+    },
+    "postgres": "PostgreSQL 16.13 on x86_64-pc-linux-musl, compiled by gcc (Alpine 15.2.0) 15.2.0, 64-bit",
+    "postgres_settings": {
+     "fsync": "on",
+     "max_connections": "600",
+     "shared_buffers": "65536",
+     "synchronous_commit": "on"
+    },
+    "redis": "7.4.8",
+    "docker": "29.2.1",
+    "docker_info": "Docker Desktop; 6.6.87.2-microsoft-standard-WSL2; 16 CPU; 67398426624 B"
+   },
+   "summary": {
+    "taskiq-memory": {
+     "median": {
+      "variant": "taskiq-memory",
+      "repeat": 2,
+      "tasks": 100000,
+      "enqueue_s": 8.437,
+      "total_s": 8.437,
+      "finalize_s": null,
+      "throughput_per_s": 11852.6,
+      "latency_ms": {
+       "count": 100000,
+       "mean": 38.013,
+       "p50": 34.726,
+       "p95": 59.375,
+       "p99": 108.244,
+       "max": 132.999
+      },
+      "dispatch_ms": {
+       "count": 0,
+       "mean": null,
+       "p50": null,
+       "p95": null,
+       "p99": null,
+       "max": null
+      },
+      "service_ms": {
+       "count": 0,
+       "mean": null,
+       "p50": null,
+       "p95": null,
+       "p99": null,
+       "max": null
+      }
+     },
+     "throughput_min": 11469.2,
+     "throughput_max": 12476.6,
+     "total_s_median": 8.437,
+     "throughput_share_vs_flexiq": 43.9007,
+     "overhead_pct_throughput": -97.7,
+     "overhead_pct_total_time": -97.7,
+     "added_p99_latency_ms": -356158.8
+    },
+    "taskiq-redis": {
+     "median": {
+      "variant": "taskiq-redis",
+      "repeat": 2,
+      "tasks": 100000,
+      "enqueue_s": 58.984,
+      "total_s": 59.234,
+      "finalize_s": null,
+      "throughput_per_s": 1688.2,
+      "latency_ms": {
+       "count": 100000,
+       "mean": 381.157,
+       "p50": 371.337,
+       "p95": 594.839,
+       "p99": 761.155,
+       "max": 904.023
+      },
+      "dispatch_ms": {
+       "count": 0,
+       "mean": null,
+       "p50": null,
+       "p95": null,
+       "p99": null,
+       "max": null
+      },
+      "service_ms": {
+       "count": 0,
+       "mean": null,
+       "p50": null,
+       "p95": null,
+       "p99": null,
+       "max": null
+      }
+     },
+     "throughput_min": 1636.0,
+     "throughput_max": 1714.4,
+     "total_s_median": 59.234,
+     "throughput_share_vs_flexiq": 6.253,
+     "overhead_pct_throughput": -84.0,
+     "overhead_pct_total_time": -84.0,
+     "added_p99_latency_ms": -355505.8
+    },
+    "flexiq": {
+     "median": {
+      "variant": "flexiq",
+      "repeat": 2,
+      "tasks": 100000,
+      "enqueue_s": 10.328,
+      "total_s": 370.39,
+      "finalize_s": null,
+      "throughput_per_s": 270.0,
+      "latency_ms": {
+       "count": 100000,
+       "mean": 171408.98,
+       "p50": 164818.0,
+       "p95": 343173.0,
+       "p99": 356267.0,
+       "max": 360139.0
+      },
+      "dispatch_ms": {
+       "count": 100000,
+       "mean": 0.021,
+       "p50": 0.0,
+       "p95": 0.0,
+       "p99": 0.547,
+       "max": 2.291
+      },
+      "service_ms": {
+       "count": 100000,
+       "mean": 1.042,
+       "p50": 0.506,
+       "p95": 4.454,
+       "p99": 8.951,
+       "max": 163.866
+      }
+     },
+     "throughput_min": 259.4,
+     "throughput_max": 302.5,
+     "total_s_median": 370.39,
+     "throughput_share_vs_flexiq": 1.0,
+     "overhead_pct_throughput": 0.0,
+     "overhead_pct_total_time": 0.0,
+     "added_p99_latency_ms": 0.0,
+     "added_p99_service_ms": 0.0
+    },
+    "tallyho": {
+     "median": {
+      "variant": "tallyho",
+      "repeat": 0,
+      "tasks": 100000,
+      "enqueue_s": 4.891,
+      "total_s": 356.656,
+      "finalize_s": 356.719,
+      "throughput_per_s": 280.4,
+      "latency_ms": {
+       "count": 100000,
+       "mean": 179104.171,
+       "p50": 175682.157,
+       "p95": 339517.871,
+       "p99": 353312.197,
+       "max": 356592.341
+      },
+      "dispatch_ms": {
+       "count": 100000,
+       "mean": 63.887,
+       "p50": 51.823,
+       "p95": 159.913,
+       "p99": 237.026,
+       "max": 1233.807
+      },
+      "service_ms": {
+       "count": 100000,
+       "mean": 217.087,
+       "p50": 215.668,
+       "p95": 347.056,
+       "p99": 473.621,
+       "max": 1674.885
+      }
+     },
+     "throughput_min": 263.6,
+     "throughput_max": 285.3,
+     "total_s_median": 356.656,
+     "throughput_share_vs_flexiq": 1.0385,
+     "overhead_pct_throughput": -3.7,
+     "overhead_pct_total_time": -3.7,
+     "added_p99_latency_ms": -2954.8,
+     "added_p99_service_ms": 464.7
+    }
+   },
+   "completer": {
+    "tallyho": [
+     {
+      "flushes": 6877,
+      "items_mean": 29.7,
+      "duration_p50_ms": 47.0,
+      "duration_p99_ms": 250.0,
+      "span_s": 364.0
+     },
+     {
+      "flushes": 6922,
+      "items_mean": 29.5,
+      "duration_p50_ms": 47.0,
+      "duration_p99_ms": 281.0,
+      "span_s": 388.2
+     },
+     {
+      "flushes": 6848,
+      "items_mean": 29.8,
+      "duration_p50_ms": 47.0,
+      "duration_p99_ms": 219.0,
+      "span_s": 358.4
+     }
+    ]
+   },
+   "runs": [
+    {
+     "variant": "taskiq-memory",
+     "repeat": 0,
+     "tasks": 100000,
+     "enqueue_s": 8.719,
+     "total_s": 8.719,
+     "finalize_s": null,
+     "throughput_per_s": 11469.2,
+     "latency_ms": {
+      "count": 100000,
+      "mean": 39.9,
+      "p50": 36.314,
+      "p95": 68.655,
+      "p99": 106.7,
+      "max": 132.709
+     },
+     "dispatch_ms": {
+      "count": 0,
+      "mean": null,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "max": null
+     },
+     "service_ms": {
+      "count": 0,
+      "mean": null,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "max": null
+     }
+    },
+    {
+     "variant": "taskiq-memory",
+     "repeat": 1,
+     "tasks": 100000,
+     "enqueue_s": 8.015,
+     "total_s": 8.015,
+     "finalize_s": null,
+     "throughput_per_s": 12476.6,
+     "latency_ms": {
+      "count": 100000,
+      "mean": 35.837,
+      "p50": 33.885,
+      "p95": 42.868,
+      "p99": 91.468,
+      "max": 97.584
+     },
+     "dispatch_ms": {
+      "count": 0,
+      "mean": null,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "max": null
+     },
+     "service_ms": {
+      "count": 0,
+      "mean": null,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "max": null
+     }
+    },
+    {
+     "variant": "taskiq-memory",
+     "repeat": 2,
+     "tasks": 100000,
+     "enqueue_s": 8.437,
+     "total_s": 8.437,
+     "finalize_s": null,
+     "throughput_per_s": 11852.6,
+     "latency_ms": {
+      "count": 100000,
+      "mean": 38.013,
+      "p50": 34.726,
+      "p95": 59.375,
+      "p99": 108.244,
+      "max": 132.999
+     },
+     "dispatch_ms": {
+      "count": 0,
+      "mean": null,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "max": null
+     },
+     "service_ms": {
+      "count": 0,
+      "mean": null,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "max": null
+     }
+    },
+    {
+     "variant": "taskiq-redis",
+     "repeat": 0,
+     "tasks": 100000,
+     "enqueue_s": 58.14,
+     "total_s": 58.328,
+     "finalize_s": null,
+     "throughput_per_s": 1714.4,
+     "latency_ms": {
+      "count": 100000,
+      "mean": 386.615,
+      "p50": 372.5,
+      "p95": 619.202,
+      "p99": 740.996,
+      "max": 1033.319
+     },
+     "dispatch_ms": {
+      "count": 0,
+      "mean": null,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "max": null
+     },
+     "service_ms": {
+      "count": 0,
+      "mean": null,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "max": null
+     }
+    },
+    {
+     "variant": "taskiq-redis",
+     "repeat": 1,
+     "tasks": 100000,
+     "enqueue_s": 60.953,
+     "total_s": 61.125,
+     "finalize_s": null,
+     "throughput_per_s": 1636.0,
+     "latency_ms": {
+      "count": 100000,
+      "mean": 533.089,
+      "p50": 400.833,
+      "p95": 1537.028,
+      "p99": 1910.562,
+      "max": 2224.589
+     },
+     "dispatch_ms": {
+      "count": 0,
+      "mean": null,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "max": null
+     },
+     "service_ms": {
+      "count": 0,
+      "mean": null,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "max": null
+     }
+    },
+    {
+     "variant": "taskiq-redis",
+     "repeat": 2,
+     "tasks": 100000,
+     "enqueue_s": 58.984,
+     "total_s": 59.234,
+     "finalize_s": null,
+     "throughput_per_s": 1688.2,
+     "latency_ms": {
+      "count": 100000,
+      "mean": 381.157,
+      "p50": 371.337,
+      "p95": 594.839,
+      "p99": 761.155,
+      "max": 904.023
+     },
+     "dispatch_ms": {
+      "count": 0,
+      "mean": null,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "max": null
+     },
+     "service_ms": {
+      "count": 0,
+      "mean": null,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "max": null
+     }
+    },
+    {
+     "variant": "flexiq",
+     "repeat": 0,
+     "tasks": 100000,
+     "enqueue_s": 10.828,
+     "total_s": 385.547,
+     "finalize_s": null,
+     "throughput_per_s": 259.4,
+     "latency_ms": {
+      "count": 100000,
+      "mean": 184217.164,
+      "p50": 177185.0,
+      "p95": 359396.0,
+      "p99": 372041.0,
+      "max": 374775.0
+     },
+     "dispatch_ms": {
+      "count": 100000,
+      "mean": 0.022,
+      "p50": 0.0,
+      "p95": 0.0,
+      "p99": 0.547,
+      "max": 2.073
+     },
+     "service_ms": {
+      "count": 100000,
+      "mean": 1.046,
+      "p50": 0.52,
+      "p95": 4.423,
+      "p99": 9.007,
+      "max": 71.942
+     }
+    },
+    {
+     "variant": "flexiq",
+     "repeat": 1,
+     "tasks": 100000,
+     "enqueue_s": 9.422,
+     "total_s": 330.547,
+     "finalize_s": null,
+     "throughput_per_s": 302.5,
+     "latency_ms": {
+      "count": 100000,
+      "mean": 161173.089,
+      "p50": 162641.0,
+      "p95": 305438.0,
+      "p99": 317932.0,
+      "max": 321030.0
+     },
+     "dispatch_ms": {
+      "count": 100000,
+      "mean": 0.02,
+      "p50": 0.0,
+      "p95": 0.0,
+      "p99": 0.545,
+      "max": 1.864
+     },
+     "service_ms": {
+      "count": 100000,
+      "mean": 0.932,
+      "p50": 0.0,
+      "p95": 3.993,
+      "p99": 7.471,
+      "max": 69.605
+     }
+    },
+    {
+     "variant": "flexiq",
+     "repeat": 2,
+     "tasks": 100000,
+     "enqueue_s": 10.328,
+     "total_s": 370.39,
+     "finalize_s": null,
+     "throughput_per_s": 270.0,
+     "latency_ms": {
+      "count": 100000,
+      "mean": 171408.98,
+      "p50": 164818.0,
+      "p95": 343173.0,
+      "p99": 356267.0,
+      "max": 360139.0
+     },
+     "dispatch_ms": {
+      "count": 100000,
+      "mean": 0.021,
+      "p50": 0.0,
+      "p95": 0.0,
+      "p99": 0.547,
+      "max": 2.291
+     },
+     "service_ms": {
+      "count": 100000,
+      "mean": 1.042,
+      "p50": 0.506,
+      "p95": 4.454,
+      "p99": 8.951,
+      "max": 163.866
+     }
+    },
+    {
+     "variant": "tallyho",
+     "repeat": 0,
+     "tasks": 100000,
+     "enqueue_s": 4.891,
+     "total_s": 356.656,
+     "finalize_s": 356.719,
+     "throughput_per_s": 280.4,
+     "latency_ms": {
+      "count": 100000,
+      "mean": 179104.171,
+      "p50": 175682.157,
+      "p95": 339517.871,
+      "p99": 353312.197,
+      "max": 356592.341
+     },
+     "dispatch_ms": {
+      "count": 100000,
+      "mean": 63.887,
+      "p50": 51.823,
+      "p95": 159.913,
+      "p99": 237.026,
+      "max": 1233.807
+     },
+     "service_ms": {
+      "count": 100000,
+      "mean": 217.087,
+      "p50": 215.668,
+      "p95": 347.056,
+      "p99": 473.621,
+      "max": 1674.885
+     }
+    },
+    {
+     "variant": "tallyho",
+     "repeat": 1,
+     "tasks": 100000,
+     "enqueue_s": 5.218,
+     "total_s": 379.422,
+     "finalize_s": 379.656,
+     "throughput_per_s": 263.6,
+     "latency_ms": {
+      "count": 100000,
+      "mean": 198897.813,
+      "p50": 202141.599,
+      "p95": 363193.46,
+      "p99": 376137.875,
+      "max": 379349.651
+     },
+     "dispatch_ms": {
+      "count": 100000,
+      "mean": 65.312,
+      "p50": 53.056,
+      "p95": 164.612,
+      "p99": 245.169,
+      "max": 1346.738
+     },
+     "service_ms": {
+      "count": 100000,
+      "mean": 225.093,
+      "p50": 221.675,
+      "p95": 364.806,
+      "p99": 514.406,
+      "max": 1773.261
+     }
+    },
+    {
+     "variant": "tallyho",
+     "repeat": 2,
+     "tasks": 100000,
+     "enqueue_s": 4.735,
+     "total_s": 350.563,
+     "finalize_s": 350.75,
+     "throughput_per_s": 285.3,
+     "latency_ms": {
+      "count": 100000,
+      "mean": 178616.674,
+      "p50": 179021.776,
+      "p95": 333850.988,
+      "p99": 347294.277,
+      "max": 350514.938
+     },
+     "dispatch_ms": {
+      "count": 100000,
+      "mean": 63.328,
+      "p50": 52.549,
+      "p95": 158.423,
+      "p99": 224.62,
+      "max": 1287.393
+     },
+     "service_ms": {
+      "count": 100000,
+      "mean": 215.059,
+      "p50": 215.669,
+      "p95": 334.905,
+      "p99": 428.888,
+      "max": 1718.605
+     }
+    }
+   ]
+  },
+  "before-20k-2x20": {
+   "label": "before-20k-2x20",
+   "started_at": "2026-10-06T03:38:59",
+   "duration_s": 1182.2,
+   "parameters": {
+    "tasks": 20000,
+    "repeats": 3,
+    "warmup": 1000,
+    "processes": 2,
+    "concurrency": 20,
+    "scheduler_batch": 1,
+    "variants": [
+     "taskiq-memory",
+     "taskiq-redis",
+     "flexiq",
+     "tallyho"
+    ]
+   },
+   "environment": {
+    "os": "Windows-10-10.0.26200-SP0",
+    "machine": "AMD64",
+    "processor": "AMD64 Family 23 Model 113 Stepping 0, AuthenticAMD",
+    "cpu_count": 16,
+    "python": "3.11.15",
+    "packages": {
+     "flexiq": "2.0.0",
+     "taskiq": "0.13.0",
+     "taskiq-redis": "1.2.4",
+     "redis": "8.1.0",
+     "sqlalchemy": "2.1.1",
+     "asyncpg": "0.31.0"
+    },
+    "postgres": "PostgreSQL 16.13 on x86_64-pc-linux-musl, compiled by gcc (Alpine 15.2.0) 15.2.0, 64-bit",
+    "postgres_settings": {
+     "fsync": "on",
+     "max_connections": "600",
+     "shared_buffers": "65536",
+     "synchronous_commit": "on"
+    },
+    "redis": "7.4.8",
+    "docker": "29.2.1",
+    "docker_info": "Docker Desktop; 6.6.87.2-microsoft-standard-WSL2; 16 CPU; 67398426624 B"
+   },
+   "summary": {
+    "taskiq-memory": {
+     "median": {
+      "variant": "taskiq-memory",
+      "repeat": 0,
+      "tasks": 20000,
+      "enqueue_s": 1.578,
+      "total_s": 1.578,
+      "finalize_s": null,
+      "throughput_per_s": 12674.3,
+      "latency_ms": {
+       "count": 20000,
+       "mean": 36.458,
+       "p50": 34.134,
+       "p95": 49.197,
+       "p99": 89.841,
+       "max": 91.106
+      },
+      "dispatch_ms": {
+       "count": 0,
+       "mean": null,
+       "p50": null,
+       "p95": null,
+       "p99": null,
+       "max": null
+      },
+      "service_ms": {
+       "count": 0,
+       "mean": null,
+       "p50": null,
+       "p95": null,
+       "p99": null,
+       "max": null
+      }
+     },
+     "throughput_min": 12070.0,
+     "throughput_max": 13333.3,
+     "total_s_median": 1.578,
+     "throughput_share_vs_flexiq": 104.5133,
+     "overhead_pct_throughput": -99.0,
+     "overhead_pct_total_time": -99.0,
+     "added_p99_latency_ms": -161639.2
+    },
+    "taskiq-redis": {
+     "median": {
+      "variant": "taskiq-redis",
+      "repeat": 1,
+      "tasks": 20000,
+      "enqueue_s": 8.719,
+      "total_s": 13.86,
+      "finalize_s": null,
+      "throughput_per_s": 1443.0,
+      "latency_ms": {
+       "count": 20000,
+       "mean": 2939.621,
+       "p50": 3072.652,
+       "p95": 5015.416,
+       "p99": 5226.362,
+       "max": 5314.726
+      },
+      "dispatch_ms": {
+       "count": 0,
+       "mean": null,
+       "p50": null,
+       "p95": null,
+       "p99": null,
+       "max": null
+      },
+      "service_ms": {
+       "count": 0,
+       "mean": null,
+       "p50": null,
+       "p95": null,
+       "p99": null,
+       "max": null
+      }
+     },
+     "throughput_min": 1299.5,
+     "throughput_max": 1467.9,
+     "total_s_median": 13.86,
+     "throughput_share_vs_flexiq": 11.8991,
+     "overhead_pct_throughput": -91.6,
+     "overhead_pct_total_time": -91.6,
+     "added_p99_latency_ms": -156502.6
+    },
+    "flexiq": {
+     "median": {
+      "variant": "flexiq",
+      "repeat": 2,
+      "tasks": 20000,
+      "enqueue_s": 1.39,
+      "total_s": 164.922,
+      "finalize_s": null,
+      "throughput_per_s": 121.3,
+      "latency_ms": {
+       "count": 20000,
+       "mean": 83130.78,
+       "p50": 82444.0,
+       "p95": 156356.0,
+       "p99": 161729.0,
+       "max": 163717.0
+      },
+      "dispatch_ms": {
+       "count": 20000,
+       "mean": 0.013,
+       "p50": 0.0,
+       "p95": 0.0,
+       "p99": 0.535,
+       "max": 1.578
+      },
+      "service_ms": {
+       "count": 20000,
+       "mean": 0.614,
+       "p50": 0.0,
+       "p95": 3.09,
+       "p99": 6.316,
+       "max": 35.416
+      }
+     },
+     "throughput_min": 103.4,
+     "throughput_max": 121.4,
+     "total_s_median": 164.922,
+     "throughput_share_vs_flexiq": 1.0,
+     "overhead_pct_throughput": 0.0,
+     "overhead_pct_total_time": 0.0,
+     "added_p99_latency_ms": 0.0
+    },
+    "tallyho": {
+     "median": {
+      "variant": "tallyho",
+      "repeat": 2,
+      "tasks": 20000,
+      "enqueue_s": 0.984,
+      "total_s": 172.359,
+      "finalize_s": 172.422,
+      "throughput_per_s": 116.0,
+      "latency_ms": {
+       "count": 20000,
+       "mean": 87362.671,
+       "p50": 87238.195,
+       "p95": 163828.772,
+       "p99": 170704.63,
+       "max": 172316.461
+      },
+      "dispatch_ms": {
+       "count": 19957,
+       "mean": 62.085,
+       "p50": 62.441,
+       "p95": 89.022,
+       "p99": 126.162,
+       "max": 477.149
+      },
+      "service_ms": {
+       "count": 19957,
+       "mean": 145.442,
+       "p50": 137.489,
+       "p95": 207.83,
+       "p99": 303.062,
+       "max": 664.684
+      }
+     },
+     "throughput_min": 114.8,
+     "throughput_max": 116.2,
+     "total_s_median": 172.359,
+     "throughput_share_vs_flexiq": 0.9569,
+     "overhead_pct_throughput": 4.5,
+     "overhead_pct_total_time": 4.5,
+     "added_p99_latency_ms": 8975.6
+    }
+   },
+   "completer": {
+    "tallyho": [
+     {
+      "flushes": 2353,
+      "items_mean": 17.8,
+      "duration_p50_ms": 16.0,
+      "duration_p99_ms": 78.0,
+      "span_s": 181.8
+     },
+     {
+      "flushes": 2363,
+      "items_mean": 17.8,
+      "duration_p50_ms": 16.0,
+      "duration_p99_ms": 78.0,
+      "span_s": 183.7
+     },
+     {
+      "flushes": 2347,
+      "items_mean": 17.9,
+      "duration_p50_ms": 16.0,
+      "duration_p99_ms": 63.0,
+      "span_s": 181.2
+     }
+    ]
+   },
+   "runs": [
+    {
+     "variant": "taskiq-memory",
+     "repeat": 0,
+     "tasks": 20000,
+     "enqueue_s": 1.578,
+     "total_s": 1.578,
+     "finalize_s": null,
+     "throughput_per_s": 12674.3,
+     "latency_ms": {
+      "count": 20000,
+      "mean": 36.458,
+      "p50": 34.134,
+      "p95": 49.197,
+      "p99": 89.841,
+      "max": 91.106
+     },
+     "dispatch_ms": {
+      "count": 0,
+      "mean": null,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "max": null
+     },
+     "service_ms": {
+      "count": 0,
+      "mean": null,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "max": null
+     }
+    },
+    {
+     "variant": "taskiq-memory",
+     "repeat": 1,
+     "tasks": 20000,
+     "enqueue_s": 1.5,
+     "total_s": 1.5,
+     "finalize_s": null,
+     "throughput_per_s": 13333.3,
+     "latency_ms": {
+      "count": 20000,
+      "mean": 32.551,
+      "p50": 31.676,
+      "p95": 37.715,
+      "p99": 82.513,
+      "max": 83.665
+     },
+     "dispatch_ms": {
+      "count": 0,
+      "mean": null,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "max": null
+     },
+     "service_ms": {
+      "count": 0,
+      "mean": null,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "max": null
+     }
+    },
+    {
+     "variant": "taskiq-memory",
+     "repeat": 2,
+     "tasks": 20000,
+     "enqueue_s": 1.657,
+     "total_s": 1.657,
+     "finalize_s": null,
+     "throughput_per_s": 12070.0,
+     "latency_ms": {
+      "count": 20000,
+      "mean": 36.951,
+      "p50": 33.701,
+      "p95": 55.89,
+      "p99": 86.872,
+      "max": 89.125
+     },
+     "dispatch_ms": {
+      "count": 0,
+      "mean": null,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "max": null
+     },
+     "service_ms": {
+      "count": 0,
+      "mean": null,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "max": null
+     }
+    },
+    {
+     "variant": "taskiq-redis",
+     "repeat": 0,
+     "tasks": 20000,
+     "enqueue_s": 9.875,
+     "total_s": 15.39,
+     "finalize_s": null,
+     "throughput_per_s": 1299.5,
+     "latency_ms": {
+      "count": 20000,
+      "mean": 3537.379,
+      "p50": 3531.641,
+      "p95": 5635.597,
+      "p99": 5757.317,
+      "max": 5819.858
+     },
+     "dispatch_ms": {
+      "count": 0,
+      "mean": null,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "max": null
+     },
+     "service_ms": {
+      "count": 0,
+      "mean": null,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "max": null
+     }
+    },
+    {
+     "variant": "taskiq-redis",
+     "repeat": 1,
+     "tasks": 20000,
+     "enqueue_s": 8.719,
+     "total_s": 13.86,
+     "finalize_s": null,
+     "throughput_per_s": 1443.0,
+     "latency_ms": {
+      "count": 20000,
+      "mean": 2939.621,
+      "p50": 3072.652,
+      "p95": 5015.416,
+      "p99": 5226.362,
+      "max": 5314.726
+     },
+     "dispatch_ms": {
+      "count": 0,
+      "mean": null,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "max": null
+     },
+     "service_ms": {
+      "count": 0,
+      "mean": null,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "max": null
+     }
+    },
+    {
+     "variant": "taskiq-redis",
+     "repeat": 2,
+     "tasks": 20000,
+     "enqueue_s": 8.906,
+     "total_s": 13.625,
+     "finalize_s": null,
+     "throughput_per_s": 1467.9,
+     "latency_ms": {
+      "count": 20000,
+      "mean": 2879.834,
+      "p50": 2890.402,
+      "p95": 4695.08,
+      "p99": 4818.463,
+      "max": 4910.379
+     },
+     "dispatch_ms": {
+      "count": 0,
+      "mean": null,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "max": null
+     },
+     "service_ms": {
+      "count": 0,
+      "mean": null,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "max": null
+     }
+    },
+    {
+     "variant": "flexiq",
+     "repeat": 0,
+     "tasks": 20000,
+     "enqueue_s": 1.453,
+     "total_s": 193.469,
+     "finalize_s": null,
+     "throughput_per_s": 103.4,
+     "latency_ms": {
+      "count": 20000,
+      "mean": 109367.577,
+      "p50": 111019.0,
+      "p95": 185169.0,
+      "p99": 190883.0,
+      "max": 192288.0
+     },
+     "dispatch_ms": {
+      "count": 20000,
+      "mean": 0.014,
+      "p50": 0.0,
+      "p95": 0.0,
+      "p99": 0.536,
+      "max": 4.234
+     },
+     "service_ms": {
+      "count": 20000,
+      "mean": 0.614,
+      "p50": 0.0,
+      "p95": 3.078,
+      "p99": 5.915,
+      "max": 23.127
+     }
+    },
+    {
+     "variant": "flexiq",
+     "repeat": 1,
+     "tasks": 20000,
+     "enqueue_s": 1.468,
+     "total_s": 164.765,
+     "finalize_s": null,
+     "throughput_per_s": 121.4,
+     "latency_ms": {
+      "count": 20000,
+      "mean": 82966.065,
+      "p50": 82284.0,
+      "p95": 156172.0,
+      "p99": 162227.0,
+      "max": 163449.0
+     },
+     "dispatch_ms": {
+      "count": 19931,
+      "mean": 0.014,
+      "p50": 0.0,
+      "p95": 0.0,
+      "p99": 0.535,
+      "max": 2.306
+     },
+     "service_ms": {
+      "count": 19931,
+      "mean": 0.626,
+      "p50": 0.0,
+      "p95": 3.163,
+      "p99": 6.154,
+      "max": 73.024
+     }
+    },
+    {
+     "variant": "flexiq",
+     "repeat": 2,
+     "tasks": 20000,
+     "enqueue_s": 1.39,
+     "total_s": 164.922,
+     "finalize_s": null,
+     "throughput_per_s": 121.3,
+     "latency_ms": {
+      "count": 20000,
+      "mean": 83130.78,
+      "p50": 82444.0,
+      "p95": 156356.0,
+      "p99": 161729.0,
+      "max": 163717.0
+     },
+     "dispatch_ms": {
+      "count": 20000,
+      "mean": 0.013,
+      "p50": 0.0,
+      "p95": 0.0,
+      "p99": 0.535,
+      "max": 1.578
+     },
+     "service_ms": {
+      "count": 20000,
+      "mean": 0.614,
+      "p50": 0.0,
+      "p95": 3.09,
+      "p99": 6.316,
+      "max": 35.416
+     }
+    },
+    {
+     "variant": "tallyho",
+     "repeat": 0,
+     "tasks": 20000,
+     "enqueue_s": 0.843,
+     "total_s": 172.125,
+     "finalize_s": 172.25,
+     "throughput_per_s": 116.2,
+     "latency_ms": {
+      "count": 20000,
+      "mean": 87023.803,
+      "p50": 86906.631,
+      "p95": 163284.979,
+      "p99": 170460.457,
+      "max": 172065.983
+     },
+     "dispatch_ms": {
+      "count": 19945,
+      "mean": 61.424,
+      "p50": 62.11,
+      "p95": 87.33,
+      "p99": 123.282,
+      "max": 542.113
+     },
+     "service_ms": {
+      "count": 19945,
+      "mean": 144.961,
+      "p50": 137.161,
+      "p95": 211.732,
+      "p99": 298.75,
+      "max": 857.133
+     }
+    },
+    {
+     "variant": "tallyho",
+     "repeat": 1,
+     "tasks": 20000,
+     "enqueue_s": 0.953,
+     "total_s": 174.281,
+     "finalize_s": 174.344,
+     "throughput_per_s": 114.8,
+     "latency_ms": {
+      "count": 20000,
+      "mean": 87796.616,
+      "p50": 87636.479,
+      "p95": 165344.587,
+      "p99": 172079.047,
+      "max": 174203.767
+     },
+     "dispatch_ms": {
+      "count": 19968,
+      "mean": 61.567,
+      "p50": 62.782,
+      "p95": 85.791,
+      "p99": 120.761,
+      "max": 470.812
+     },
+     "service_ms": {
+      "count": 19968,
+      "mean": 146.271,
+      "p50": 139.911,
+      "p95": 209.386,
+      "p99": 280.006,
+      "max": 688.884
+     }
+    },
+    {
+     "variant": "tallyho",
+     "repeat": 2,
+     "tasks": 20000,
+     "enqueue_s": 0.984,
+     "total_s": 172.359,
+     "finalize_s": 172.422,
+     "throughput_per_s": 116.0,
+     "latency_ms": {
+      "count": 20000,
+      "mean": 87362.671,
+      "p50": 87238.195,
+      "p95": 163828.772,
+      "p99": 170704.63,
+      "max": 172316.461
+     },
+     "dispatch_ms": {
+      "count": 19957,
+      "mean": 62.085,
+      "p50": 62.441,
+      "p95": 89.022,
+      "p99": 126.162,
+      "max": 477.149
+     },
+     "service_ms": {
+      "count": 19957,
+      "mean": 145.442,
+      "p50": 137.489,
+      "p95": 207.83,
+      "p99": 303.062,
+      "max": 664.684
+     }
+    }
+   ]
+  },
+  "after-20k-2x20": {
+   "label": "after-20k-2x20",
+   "started_at": "2026-10-06T02:36:49",
+   "duration_s": 1327.5,
+   "parameters": {
+    "tasks": 20000,
+    "repeats": 3,
+    "warmup": 1000,
+    "processes": 2,
+    "concurrency": 20,
+    "scheduler_batch": 1,
+    "completer_tick_ms": 20.0,
+    "variants": [
+     "taskiq-memory",
+     "taskiq-redis",
+     "flexiq",
+     "tallyho"
+    ]
+   },
+   "environment": {
+    "os": "Windows-10-10.0.26200-SP0",
+    "machine": "AMD64",
+    "processor": "AMD64 Family 23 Model 113 Stepping 0, AuthenticAMD",
+    "cpu_count": 16,
+    "python": "3.11.15",
+    "packages": {
+     "flexiq": "2.0.0",
+     "taskiq": "0.13.0",
+     "taskiq-redis": "1.2.4",
+     "redis": "8.1.0",
+     "sqlalchemy": "2.1.1",
+     "asyncpg": "0.31.0"
+    },
+    "postgres": "PostgreSQL 16.13 on x86_64-pc-linux-musl, compiled by gcc (Alpine 15.2.0) 15.2.0, 64-bit",
+    "postgres_settings": {
+     "fsync": "on",
+     "max_connections": "600",
+     "shared_buffers": "65536",
+     "synchronous_commit": "on"
+    },
+    "redis": "7.4.8",
+    "docker": "29.2.1",
+    "docker_info": "Docker Desktop; 6.6.87.2-microsoft-standard-WSL2; 16 CPU; 67398426624 B"
+   },
+   "summary": {
+    "taskiq-memory": {
+     "median": {
+      "variant": "taskiq-memory",
+      "repeat": 1,
+      "tasks": 20000,
+      "enqueue_s": 1.594,
+      "total_s": 1.594,
+      "finalize_s": null,
+      "throughput_per_s": 12547.1,
+      "latency_ms": {
+       "count": 20000,
+       "mean": 37.193,
+       "p50": 33.64,
+       "p95": 89.71,
+       "p99": 96.829,
+       "max": 97.915
+      },
+      "dispatch_ms": {
+       "count": 0,
+       "mean": null,
+       "p50": null,
+       "p95": null,
+       "p99": null,
+       "max": null
+      },
+      "service_ms": {
+       "count": 0,
+       "mean": null,
+       "p50": null,
+       "p95": null,
+       "p99": null,
+       "max": null
+      }
+     },
+     "throughput_min": 11961.7,
+     "throughput_max": 13054.8,
+     "total_s_median": 1.594,
+     "throughput_share_vs_flexiq": 130.803,
+     "overhead_pct_throughput": -99.2,
+     "overhead_pct_total_time": -99.2,
+     "added_p99_latency_ms": -205348.2
+    },
+    "taskiq-redis": {
+     "median": {
+      "variant": "taskiq-redis",
+      "repeat": 2,
+      "tasks": 20000,
+      "enqueue_s": 11.094,
+      "total_s": 16.719,
+      "finalize_s": null,
+      "throughput_per_s": 1196.2,
+      "latency_ms": {
+       "count": 20000,
+       "mean": 3498.865,
+       "p50": 3589.975,
+       "p95": 5776.353,
+       "p99": 5896.92,
+       "max": 5986.369
+      },
+      "dispatch_ms": {
+       "count": 0,
+       "mean": null,
+       "p50": null,
+       "p95": null,
+       "p99": null,
+       "max": null
+      },
+      "service_ms": {
+       "count": 0,
+       "mean": null,
+       "p50": null,
+       "p95": null,
+       "p99": null,
+       "max": null
+      }
+     },
+     "throughput_min": 1084.8,
+     "throughput_max": 1291.7,
+     "total_s_median": 16.719,
+     "throughput_share_vs_flexiq": 12.4708,
+     "overhead_pct_throughput": -92.0,
+     "overhead_pct_total_time": -92.0,
+     "added_p99_latency_ms": -199548.1
+    },
+    "flexiq": {
+     "median": {
+      "variant": "flexiq",
+      "repeat": 1,
+      "tasks": 20000,
+      "enqueue_s": 1.657,
+      "total_s": 208.5,
+      "finalize_s": null,
+      "throughput_per_s": 95.9,
+      "latency_ms": {
+       "count": 20000,
+       "mean": 109858.992,
+       "p50": 114940.0,
+       "p95": 199164.75,
+       "p99": 205445.0,
+       "max": 207080.0
+      },
+      "dispatch_ms": {
+       "count": 19928,
+       "mean": 0.019,
+       "p50": 0.0,
+       "p95": 0.0,
+       "p99": 0.545,
+       "max": 2.221
+      },
+      "service_ms": {
+       "count": 19928,
+       "mean": 0.842,
+       "p50": 0.0,
+       "p95": 3.846,
+       "p99": 8.044,
+       "max": 239.182
+      }
+     },
+     "throughput_min": 93.9,
+     "throughput_max": 114.1,
+     "total_s_median": 208.5,
+     "throughput_share_vs_flexiq": 1.0,
+     "overhead_pct_throughput": 0.0,
+     "overhead_pct_total_time": 0.0,
+     "added_p99_latency_ms": 0.0,
+     "added_p99_service_ms": 0.0
+    },
+    "tallyho": {
+     "median": {
+      "variant": "tallyho",
+      "repeat": 0,
+      "tasks": 20000,
+      "enqueue_s": 1.0,
+      "total_s": 193.015,
+      "finalize_s": 193.14,
+      "throughput_per_s": 103.6,
+      "latency_ms": {
+       "count": 20000,
+       "mean": 98706.085,
+       "p50": 99640.522,
+       "p95": 183511.53,
+       "p99": 191132.569,
+       "max": 192980.188
+      },
+      "dispatch_ms": {
+       "count": 19967,
+       "mean": 46.29,
+       "p50": 45.555,
+       "p95": 81.958,
+       "p99": 113.291,
+       "max": 669.881
+      },
+      "service_ms": {
+       "count": 19967,
+       "mean": 129.19,
+       "p50": 125.707,
+       "p95": 188.609,
+       "p99": 250.47,
+       "max": 937.188
+      }
+     },
+     "throughput_min": 101.2,
+     "throughput_max": 109.9,
+     "total_s_median": 193.015,
+     "throughput_share_vs_flexiq": 1.0802,
+     "overhead_pct_throughput": -7.4,
+     "overhead_pct_total_time": -7.4,
+     "added_p99_latency_ms": -14312.4,
+     "added_p99_service_ms": 242.4
+    }
+   },
+   "completer": {
+    "tallyho": [
+     {
+      "flushes": 2962,
+      "items_mean": 14.2,
+      "duration_p50_ms": 31.0,
+      "duration_p99_ms": 125.0,
+      "span_s": 206.9
+     },
+     {
+      "flushes": 3011,
+      "items_mean": 13.9,
+      "duration_p50_ms": 31.0,
+      "duration_p99_ms": 110.0,
+      "span_s": 207.7
+     },
+     {
+      "flushes": 2908,
+      "items_mean": 14.4,
+      "duration_p50_ms": 31.0,
+      "duration_p99_ms": 79.0,
+      "span_s": 191.3
+     }
+    ]
+   },
+   "runs": [
+    {
+     "variant": "taskiq-memory",
+     "repeat": 0,
+     "tasks": 20000,
+     "enqueue_s": 1.672,
+     "total_s": 1.672,
+     "finalize_s": null,
+     "throughput_per_s": 11961.7,
+     "latency_ms": {
+      "count": 20000,
+      "mean": 37.856,
+      "p50": 36.189,
+      "p95": 46.131,
+      "p99": 84.971,
+      "max": 88.159
+     },
+     "dispatch_ms": {
+      "count": 0,
+      "mean": null,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "max": null
+     },
+     "service_ms": {
+      "count": 0,
+      "mean": null,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "max": null
+     }
+    },
+    {
+     "variant": "taskiq-memory",
+     "repeat": 1,
+     "tasks": 20000,
+     "enqueue_s": 1.594,
+     "total_s": 1.594,
+     "finalize_s": null,
+     "throughput_per_s": 12547.1,
+     "latency_ms": {
+      "count": 20000,
+      "mean": 37.193,
+      "p50": 33.64,
+      "p95": 89.71,
+      "p99": 96.829,
+      "max": 97.915
+     },
+     "dispatch_ms": {
+      "count": 0,
+      "mean": null,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "max": null
+     },
+     "service_ms": {
+      "count": 0,
+      "mean": null,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "max": null
+     }
+    },
+    {
+     "variant": "taskiq-memory",
+     "repeat": 2,
+     "tasks": 20000,
+     "enqueue_s": 1.532,
+     "total_s": 1.532,
+     "finalize_s": null,
+     "throughput_per_s": 13054.8,
+     "latency_ms": {
+      "count": 20000,
+      "mean": 33.151,
+      "p50": 33.177,
+      "p95": 38.859,
+      "p99": 41.121,
+      "max": 42.924
+     },
+     "dispatch_ms": {
+      "count": 0,
+      "mean": null,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "max": null
+     },
+     "service_ms": {
+      "count": 0,
+      "mean": null,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "max": null
+     }
+    },
+    {
+     "variant": "taskiq-redis",
+     "repeat": 0,
+     "tasks": 20000,
+     "enqueue_s": 11.828,
+     "total_s": 18.437,
+     "finalize_s": null,
+     "throughput_per_s": 1084.8,
+     "latency_ms": {
+      "count": 20000,
+      "mean": 4364.798,
+      "p50": 4699.347,
+      "p95": 6674.437,
+      "p99": 6811.367,
+      "max": 6875.043
+     },
+     "dispatch_ms": {
+      "count": 0,
+      "mean": null,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "max": null
+     },
+     "service_ms": {
+      "count": 0,
+      "mean": null,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "max": null
+     }
+    },
+    {
+     "variant": "taskiq-redis",
+     "repeat": 1,
+     "tasks": 20000,
+     "enqueue_s": 9.922,
+     "total_s": 15.484,
+     "finalize_s": null,
+     "throughput_per_s": 1291.7,
+     "latency_ms": {
+      "count": 20000,
+      "mean": 3234.261,
+      "p50": 3187.888,
+      "p95": 5524.456,
+      "p99": 5709.604,
+      "max": 5802.062
+     },
+     "dispatch_ms": {
+      "count": 0,
+      "mean": null,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "max": null
+     },
+     "service_ms": {
+      "count": 0,
+      "mean": null,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "max": null
+     }
+    },
+    {
+     "variant": "taskiq-redis",
+     "repeat": 2,
+     "tasks": 20000,
+     "enqueue_s": 11.094,
+     "total_s": 16.719,
+     "finalize_s": null,
+     "throughput_per_s": 1196.2,
+     "latency_ms": {
+      "count": 20000,
+      "mean": 3498.865,
+      "p50": 3589.975,
+      "p95": 5776.353,
+      "p99": 5896.92,
+      "max": 5986.369
+     },
+     "dispatch_ms": {
+      "count": 0,
+      "mean": null,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "max": null
+     },
+     "service_ms": {
+      "count": 0,
+      "mean": null,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "max": null
+     }
+    },
+    {
+     "variant": "flexiq",
+     "repeat": 0,
+     "tasks": 20000,
+     "enqueue_s": 1.969,
+     "total_s": 213.062,
+     "finalize_s": null,
+     "throughput_per_s": 93.9,
+     "latency_ms": {
+      "count": 20000,
+      "mean": 119455.216,
+      "p50": 121782.0,
+      "p95": 202902.0,
+      "p99": 209752.0,
+      "max": 211336.0
+     },
+     "dispatch_ms": {
+      "count": 20000,
+      "mean": 0.018,
+      "p50": 0.0,
+      "p95": 0.0,
+      "p99": 0.541,
+      "max": 1.682
+     },
+     "service_ms": {
+      "count": 20000,
+      "mean": 0.74,
+      "p50": 0.0,
+      "p95": 3.403,
+      "p99": 6.524,
+      "max": 78.045
+     }
+    },
+    {
+     "variant": "flexiq",
+     "repeat": 1,
+     "tasks": 20000,
+     "enqueue_s": 1.657,
+     "total_s": 208.5,
+     "finalize_s": null,
+     "throughput_per_s": 95.9,
+     "latency_ms": {
+      "count": 20000,
+      "mean": 109858.992,
+      "p50": 114940.0,
+      "p95": 199164.75,
+      "p99": 205445.0,
+      "max": 207080.0
+     },
+     "dispatch_ms": {
+      "count": 19928,
+      "mean": 0.019,
+      "p50": 0.0,
+      "p95": 0.0,
+      "p99": 0.545,
+      "max": 2.221
+     },
+     "service_ms": {
+      "count": 19928,
+      "mean": 0.842,
+      "p50": 0.0,
+      "p95": 3.846,
+      "p99": 8.044,
+      "max": 239.182
+     }
+    },
+    {
+     "variant": "flexiq",
+     "repeat": 2,
+     "tasks": 20000,
+     "enqueue_s": 1.531,
+     "total_s": 175.297,
+     "finalize_s": null,
+     "throughput_per_s": 114.1,
+     "latency_ms": {
+      "count": 20000,
+      "mean": 88561.509,
+      "p50": 87710.0,
+      "p95": 166418.0,
+      "p99": 172418.0,
+      "max": 173973.0
+     },
+     "dispatch_ms": {
+      "count": 19955,
+      "mean": 0.016,
+      "p50": 0.0,
+      "p95": 0.0,
+      "p99": 0.539,
+      "max": 1.648
+     },
+     "service_ms": {
+      "count": 19955,
+      "mean": 0.687,
+      "p50": 0.0,
+      "p95": 3.285,
+      "p99": 6.323,
+      "max": 35.145
+     }
+    },
+    {
+     "variant": "tallyho",
+     "repeat": 0,
+     "tasks": 20000,
+     "enqueue_s": 1.0,
+     "total_s": 193.015,
+     "finalize_s": 193.14,
+     "throughput_per_s": 103.6,
+     "latency_ms": {
+      "count": 20000,
+      "mean": 98706.085,
+      "p50": 99640.522,
+      "p95": 183511.53,
+      "p99": 191132.569,
+      "max": 192980.188
+     },
+     "dispatch_ms": {
+      "count": 19967,
+      "mean": 46.29,
+      "p50": 45.555,
+      "p95": 81.958,
+      "p99": 113.291,
+      "max": 669.881
+     },
+     "service_ms": {
+      "count": 19967,
+      "mean": 129.19,
+      "p50": 125.707,
+      "p95": 188.609,
+      "p99": 250.47,
+      "max": 937.188
+     }
+    },
+    {
+     "variant": "tallyho",
+     "repeat": 1,
+     "tasks": 20000,
+     "enqueue_s": 0.922,
+     "total_s": 197.641,
+     "finalize_s": 197.766,
+     "throughput_per_s": 101.2,
+     "latency_ms": {
+      "count": 20000,
+      "mean": 101705.834,
+      "p50": 103079.697,
+      "p95": 188306.992,
+      "p99": 195108.129,
+      "max": 197597.983
+     },
+     "dispatch_ms": {
+      "count": 20000,
+      "mean": 48.703,
+      "p50": 47.143,
+      "p95": 89.6,
+      "p99": 132.111,
+      "max": 488.143
+     },
+     "service_ms": {
+      "count": 20000,
+      "mean": 135.528,
+      "p50": 129.24,
+      "p95": 206.652,
+      "p99": 316.228,
+      "max": 751.509
+     }
+    },
+    {
+     "variant": "tallyho",
+     "repeat": 2,
+     "tasks": 20000,
+     "enqueue_s": 0.922,
+     "total_s": 181.984,
+     "finalize_s": 182.047,
+     "throughput_per_s": 109.9,
+     "latency_ms": {
+      "count": 20000,
+      "mean": 92311.551,
+      "p50": 92788.791,
+      "p95": 173662.43,
+      "p99": 180262.235,
+      "max": 181914.07
+     },
+     "dispatch_ms": {
+      "count": 19982,
+      "mean": 44.869,
+      "p50": 44.187,
+      "p95": 75.102,
+      "p99": 115.758,
+      "max": 466.417
+     },
+     "service_ms": {
+      "count": 19982,
+      "mean": 122.548,
+      "p50": 119.504,
+      "p95": 176.228,
+      "p99": 244.669,
+      "max": 644.083
+     }
+    }
+   ]
+  },
+  "py314-before-100k-4x50": {
+   "label": "before-100k-4x50",
+   "started_at": "2026-10-06T00:04:41",
+   "duration_s": 2799.5,
+   "parameters": {
+    "tasks": 100000,
+    "repeats": 3,
+    "warmup": 2000,
+    "processes": 4,
+    "concurrency": 50,
+    "scheduler_batch": 50,
+    "variants": [
+     "taskiq-memory",
+     "taskiq-redis",
+     "flexiq",
+     "tallyho"
+    ]
+   },
+   "environment": {
+    "os": "Windows-11-10.0.26200-SP0",
+    "machine": "AMD64",
+    "processor": "AMD64 Family 23 Model 113 Stepping 0, AuthenticAMD",
+    "cpu_count": 16,
+    "python": "3.14.3",
+    "packages": {
+     "flexiq": "2.0.0",
+     "taskiq": "0.13.0",
+     "taskiq-redis": "1.2.4",
+     "redis": "8.1.0",
+     "sqlalchemy": "2.1.1",
+     "asyncpg": "0.31.0"
+    },
+    "postgres": "PostgreSQL 16.13 on x86_64-pc-linux-musl, compiled by gcc (Alpine 15.2.0) 15.2.0, 64-bit",
+    "postgres_settings": {
+     "fsync": "on",
+     "max_connections": "600",
+     "shared_buffers": "65536",
+     "synchronous_commit": "on"
+    },
+    "redis": "7.4.8",
+    "docker": "29.2.1",
+    "docker_info": "Docker Desktop; 6.6.87.2-microsoft-standard-WSL2; 16 CPU; 67398426624 B"
+   },
+   "summary": {
+    "taskiq-memory": {
+     "median": {
+      "variant": "taskiq-memory",
+      "repeat": 1,
+      "tasks": 100000,
+      "enqueue_s": 8.845,
+      "total_s": 8.845,
+      "finalize_s": null,
+      "throughput_per_s": 11306.1,
+      "latency_ms": {
+       "count": 100000,
+       "mean": 41.186,
+       "p50": 39.011,
+       "p95": 61.847,
+       "p99": 90.165,
+       "max": 110.872
+      },
+      "dispatch_ms": {
+       "count": 0,
+       "mean": null,
+       "p50": null,
+       "p95": null,
+       "p99": null,
+       "max": null
+      },
+      "service_ms": {
+       "count": 0,
+       "mean": null,
+       "p50": null,
+       "p95": null,
+       "p99": null,
+       "max": null
+      }
+     },
+     "throughput_min": 11198.3,
+     "throughput_max": 12646.8,
+     "total_s_median": 8.845,
+     "throughput_share_vs_flexiq": 46.9875,
+     "overhead_pct_throughput": -97.9,
+     "overhead_pct_total_time": -97.9,
+     "added_p99_latency_ms": -396120.8
+    },
+    "taskiq-redis": {
+     "median": {
+      "variant": "taskiq-redis",
+      "repeat": 1,
+      "tasks": 100000,
+      "enqueue_s": 61.499,
+      "total_s": 61.807,
+      "finalize_s": null,
+      "throughput_per_s": 1617.9,
+      "latency_ms": {
+       "count": 100000,
+       "mean": 495.352,
+       "p50": 398.906,
+       "p95": 1273.493,
+       "p99": 1880.787,
+       "max": 2196.349
+      },
+      "dispatch_ms": {
+       "count": 0,
+       "mean": null,
+       "p50": null,
+       "p95": null,
+       "p99": null,
+       "max": null
+      },
+      "service_ms": {
+       "count": 0,
+       "mean": null,
+       "p50": null,
+       "p95": null,
+       "p99": null,
+       "max": null
+      }
+     },
+     "throughput_min": 1567.3,
+     "throughput_max": 1763.4,
+     "total_s_median": 61.807,
+     "throughput_share_vs_flexiq": 6.724,
+     "overhead_pct_throughput": -85.1,
+     "overhead_pct_total_time": -85.1,
+     "added_p99_latency_ms": -394330.2
+    },
+    "flexiq": {
+     "median": {
+      "variant": "flexiq",
+      "repeat": 1,
+      "tasks": 100000,
+      "enqueue_s": 16.898,
+      "total_s": 415.593,
+      "finalize_s": null,
+      "throughput_per_s": 240.6,
+      "latency_ms": {
+       "count": 100000,
+       "mean": 211753.97,
+       "p50": 209378.0,
+       "p95": 379173.0,
+       "p99": 396211.0,
+       "max": 399089.0
+      },
+      "dispatch_ms": {
+       "count": 100000,
+       "mean": 0.023,
+       "p50": 0.022,
+       "p95": 0.039,
+       "p99": 0.084,
+       "max": 2.048
+      },
+      "service_ms": {
+       "count": 100000,
+       "mean": 1.228,
+       "p50": 0.302,
+       "p95": 4.639,
+       "p99": 9.556,
+       "max": 345.423
+      }
+     },
+     "throughput_min": 205.6,
+     "throughput_max": 268.9,
+     "total_s_median": 415.593,
+     "throughput_share_vs_flexiq": 1.0,
+     "overhead_pct_throughput": 0.0,
+     "overhead_pct_total_time": 0.0,
+     "added_p99_latency_ms": 0.0
+    },
+    "tallyho": {
+     "median": {
+      "variant": "tallyho",
+      "repeat": 1,
+      "tasks": 100000,
+      "enqueue_s": 4.183,
+      "total_s": 397.215,
+      "finalize_s": 397.43,
+      "throughput_per_s": 251.8,
+      "latency_ms": {
+       "count": 100000,
+       "mean": 212436.211,
+       "p50": 215728.391,
+       "p95": 380237.951,
+       "p99": 393347.981,
+       "max": 397127.591
+      },
+      "dispatch_ms": {
+       "count": 100000,
+       "mean": 74.964,
+       "p50": 72.184,
+       "p95": 123.041,
+       "p99": 206.008,
+       "max": 1745.545
+      },
+      "service_ms": {
+       "count": 100000,
+       "mean": 249.302,
+       "p50": 233.796,
+       "p95": 402.457,
+       "p99": 599.732,
+       "max": 2565.653
+      }
+     },
+     "throughput_min": 245.1,
+     "throughput_max": 260.4,
+     "total_s_median": 397.215,
+     "throughput_share_vs_flexiq": 1.0463,
+     "overhead_pct_throughput": -4.4,
+     "overhead_pct_total_time": -4.4,
+     "added_p99_latency_ms": -2863.0
+    }
+   },
+   "completer": {
+    "tallyho": [
+     {
+      "flushes": 4363,
+      "items_mean": 46.8,
+      "duration_p50_ms": 34.1,
+      "duration_p99_ms": 163.9,
+      "span_s": 417.8
+     },
+     {
+      "flushes": 4311,
+      "items_mean": 47.3,
+      "duration_p50_ms": 31.9,
+      "duration_p99_ms": 145.6,
+      "span_s": 407.8
+     },
+     {
+      "flushes": 4247,
+      "items_mean": 48.0,
+      "duration_p50_ms": 31.7,
+      "duration_p99_ms": 137.0,
+      "span_s": 393.8
+     }
+    ]
+   },
+   "runs": [
+    {
+     "variant": "taskiq-memory",
+     "repeat": 0,
+     "tasks": 100000,
+     "enqueue_s": 8.93,
+     "total_s": 8.93,
+     "finalize_s": null,
+     "throughput_per_s": 11198.3,
+     "latency_ms": {
+      "count": 100000,
+      "mean": 42.598,
+      "p50": 39.884,
+      "p95": 65.041,
+      "p99": 78.88,
+      "max": 107.943
+     },
+     "dispatch_ms": {
+      "count": 0,
+      "mean": null,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "max": null
+     },
+     "service_ms": {
+      "count": 0,
+      "mean": null,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "max": null
+     }
+    },
+    {
+     "variant": "taskiq-memory",
+     "repeat": 1,
+     "tasks": 100000,
+     "enqueue_s": 8.845,
+     "total_s": 8.845,
+     "finalize_s": null,
+     "throughput_per_s": 11306.1,
+     "latency_ms": {
+      "count": 100000,
+      "mean": 41.186,
+      "p50": 39.011,
+      "p95": 61.847,
+      "p99": 90.165,
+      "max": 110.872
+     },
+     "dispatch_ms": {
+      "count": 0,
+      "mean": null,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "max": null
+     },
+     "service_ms": {
+      "count": 0,
+      "mean": null,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "max": null
+     }
+    },
+    {
+     "variant": "taskiq-memory",
+     "repeat": 2,
+     "tasks": 100000,
+     "enqueue_s": 7.907,
+     "total_s": 7.907,
+     "finalize_s": null,
+     "throughput_per_s": 12646.8,
+     "latency_ms": {
+      "count": 100000,
+      "mean": 37.078,
+      "p50": 35.601,
+      "p95": 53.62,
+      "p99": 80.962,
+      "max": 101.372
+     },
+     "dispatch_ms": {
+      "count": 0,
+      "mean": null,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "max": null
+     },
+     "service_ms": {
+      "count": 0,
+      "mean": null,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "max": null
+     }
+    },
+    {
+     "variant": "taskiq-redis",
+     "repeat": 0,
+     "tasks": 100000,
+     "enqueue_s": 63.621,
+     "total_s": 63.802,
+     "finalize_s": null,
+     "throughput_per_s": 1567.3,
+     "latency_ms": {
+      "count": 100000,
+      "mean": 472.18,
+      "p50": 429.862,
+      "p95": 880.257,
+      "p99": 1103.916,
+      "max": 1343.736
+     },
+     "dispatch_ms": {
+      "count": 0,
+      "mean": null,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "max": null
+     },
+     "service_ms": {
+      "count": 0,
+      "mean": null,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "max": null
+     }
+    },
+    {
+     "variant": "taskiq-redis",
+     "repeat": 1,
+     "tasks": 100000,
+     "enqueue_s": 61.499,
+     "total_s": 61.807,
+     "finalize_s": null,
+     "throughput_per_s": 1617.9,
+     "latency_ms": {
+      "count": 100000,
+      "mean": 495.352,
+      "p50": 398.906,
+      "p95": 1273.493,
+      "p99": 1880.787,
+      "max": 2196.349
+     },
+     "dispatch_ms": {
+      "count": 0,
+      "mean": null,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "max": null
+     },
+     "service_ms": {
+      "count": 0,
+      "mean": null,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "max": null
+     }
+    },
+    {
+     "variant": "taskiq-redis",
+     "repeat": 2,
+     "tasks": 100000,
+     "enqueue_s": 56.528,
+     "total_s": 56.708,
+     "finalize_s": null,
+     "throughput_per_s": 1763.4,
+     "latency_ms": {
+      "count": 100000,
+      "mean": 388.872,
+      "p50": 359.286,
+      "p95": 740.555,
+      "p99": 914.55,
+      "max": 1256.033
+     },
+     "dispatch_ms": {
+      "count": 0,
+      "mean": null,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "max": null
+     },
+     "service_ms": {
+      "count": 0,
+      "mean": null,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "max": null
+     }
+    },
+    {
+     "variant": "flexiq",
+     "repeat": 0,
+     "tasks": 100000,
+     "enqueue_s": 13.538,
+     "total_s": 486.457,
+     "finalize_s": null,
+     "throughput_per_s": 205.6,
+     "latency_ms": {
+      "count": 100000,
+      "mean": 230096.192,
+      "p50": 234255.0,
+      "p95": 453053.0,
+      "p99": 469076.0,
+      "max": 473089.0
+     },
+     "dispatch_ms": {
+      "count": 100000,
+      "mean": 0.026,
+      "p50": 0.023,
+      "p95": 0.048,
+      "p99": 0.103,
+      "max": 2.517
+     },
+     "service_ms": {
+      "count": 100000,
+      "mean": 1.355,
+      "p50": 0.32,
+      "p95": 5.601,
+      "p99": 11.848,
+      "max": 307.887
+     }
+    },
+    {
+     "variant": "flexiq",
+     "repeat": 1,
+     "tasks": 100000,
+     "enqueue_s": 16.898,
+     "total_s": 415.593,
+     "finalize_s": null,
+     "throughput_per_s": 240.6,
+     "latency_ms": {
+      "count": 100000,
+      "mean": 211753.97,
+      "p50": 209378.0,
+      "p95": 379173.0,
+      "p99": 396211.0,
+      "max": 399089.0
+     },
+     "dispatch_ms": {
+      "count": 100000,
+      "mean": 0.023,
+      "p50": 0.022,
+      "p95": 0.039,
+      "p99": 0.084,
+      "max": 2.048
+     },
+     "service_ms": {
+      "count": 100000,
+      "mean": 1.228,
+      "p50": 0.302,
+      "p95": 4.639,
+      "p99": 9.556,
+      "max": 345.423
+     }
+    },
+    {
+     "variant": "flexiq",
+     "repeat": 2,
+     "tasks": 100000,
+     "enqueue_s": 11.927,
+     "total_s": 371.927,
+     "finalize_s": null,
+     "throughput_per_s": 268.9,
+     "latency_ms": {
+      "count": 100000,
+      "mean": 177245.97,
+      "p50": 175508.0,
+      "p95": 340379.0,
+      "p99": 356070.0,
+      "max": 359852.0
+     },
+     "dispatch_ms": {
+      "count": 100000,
+      "mean": 0.022,
+      "p50": 0.021,
+      "p95": 0.036,
+      "p99": 0.069,
+      "max": 1.195
+     },
+     "service_ms": {
+      "count": 100000,
+      "mean": 1.13,
+      "p50": 0.293,
+      "p95": 4.435,
+      "p99": 8.295,
+      "max": 53.305
+     }
+    },
+    {
+     "variant": "tallyho",
+     "repeat": 0,
+     "tasks": 100000,
+     "enqueue_s": 4.809,
+     "total_s": 407.955,
+     "finalize_s": 408.183,
+     "throughput_per_s": 245.1,
+     "latency_ms": {
+      "count": 100000,
+      "mean": 207373.366,
+      "p50": 207739.016,
+      "p95": 387196.21,
+      "p99": 403260.982,
+      "max": 407897.824
+     },
+     "dispatch_ms": {
+      "count": 100000,
+      "mean": 77.932,
+      "p50": 75.607,
+      "p95": 127.108,
+      "p99": 223.151,
+      "max": 1553.451
+     },
+     "service_ms": {
+      "count": 100000,
+      "mean": 262.173,
+      "p50": 247.833,
+      "p95": 414.251,
+      "p99": 587.17,
+      "max": 2121.744
+     }
+    },
+    {
+     "variant": "tallyho",
+     "repeat": 1,
+     "tasks": 100000,
+     "enqueue_s": 4.183,
+     "total_s": 397.215,
+     "finalize_s": 397.43,
+     "throughput_per_s": 251.8,
+     "latency_ms": {
+      "count": 100000,
+      "mean": 212436.211,
+      "p50": 215728.391,
+      "p95": 380237.951,
+      "p99": 393347.981,
+      "max": 397127.591
+     },
+     "dispatch_ms": {
+      "count": 100000,
+      "mean": 74.964,
+      "p50": 72.184,
+      "p95": 123.041,
+      "p99": 206.008,
+      "max": 1745.545
+     },
+     "service_ms": {
+      "count": 100000,
+      "mean": 249.302,
+      "p50": 233.796,
+      "p95": 402.457,
+      "p99": 599.732,
+      "max": 2565.653
+     }
+    },
+    {
+     "variant": "tallyho",
+     "repeat": 2,
+     "tasks": 100000,
+     "enqueue_s": 4.074,
+     "total_s": 383.988,
+     "finalize_s": 384.125,
+     "throughput_per_s": 260.4,
+     "latency_ms": {
+      "count": 100000,
+      "mean": 194367.846,
+      "p50": 192539.274,
+      "p95": 365852.341,
+      "p99": 380591.775,
+      "max": 383929.324
+     },
+     "dispatch_ms": {
+      "count": 100000,
+      "mean": 73.715,
+      "p50": 71.687,
+      "p95": 121.79,
+      "p99": 190.661,
+      "max": 1137.599
+     },
+     "service_ms": {
+      "count": 100000,
+      "mean": 244.984,
+      "p50": 230.669,
+      "p95": 394.483,
+      "p99": 599.208,
+      "max": 1857.764
+     }
+    }
+   ]
+  },
+  "py314-before-20k-2x20": {
+   "label": "before-20k-2x20",
+   "started_at": "2026-10-06T00:52:06",
+   "duration_s": 1411.2,
+   "parameters": {
+    "tasks": 20000,
+    "repeats": 3,
+    "warmup": 1000,
+    "processes": 2,
+    "concurrency": 20,
+    "scheduler_batch": 1,
+    "variants": [
+     "taskiq-memory",
+     "taskiq-redis",
+     "flexiq",
+     "tallyho"
+    ]
+   },
+   "environment": {
+    "os": "Windows-11-10.0.26200-SP0",
+    "machine": "AMD64",
+    "processor": "AMD64 Family 23 Model 113 Stepping 0, AuthenticAMD",
+    "cpu_count": 16,
+    "python": "3.14.3",
+    "packages": {
+     "flexiq": "2.0.0",
+     "taskiq": "0.13.0",
+     "taskiq-redis": "1.2.4",
+     "redis": "8.1.0",
+     "sqlalchemy": "2.1.1",
+     "asyncpg": "0.31.0"
+    },
+    "postgres": "PostgreSQL 16.13 on x86_64-pc-linux-musl, compiled by gcc (Alpine 15.2.0) 15.2.0, 64-bit",
+    "postgres_settings": {
+     "fsync": "on",
+     "max_connections": "600",
+     "shared_buffers": "65536",
+     "synchronous_commit": "on"
+    },
+    "redis": "7.4.8",
+    "docker": "29.2.1",
+    "docker_info": "Docker Desktop; 6.6.87.2-microsoft-standard-WSL2; 16 CPU; 67398426624 B"
+   },
+   "summary": {
+    "taskiq-memory": {
+     "median": {
+      "variant": "taskiq-memory",
+      "repeat": 1,
+      "tasks": 20000,
+      "enqueue_s": 1.745,
+      "total_s": 1.745,
+      "finalize_s": null,
+      "throughput_per_s": 11462.1,
+      "latency_ms": {
+       "count": 20000,
+       "mean": 39.287,
+       "p50": 37.237,
+       "p95": 60.316,
+       "p99": 78.044,
+       "max": 86.427
+      },
+      "dispatch_ms": {
+       "count": 0,
+       "mean": null,
+       "p50": null,
+       "p95": null,
+       "p99": null,
+       "max": null
+      },
+      "service_ms": {
+       "count": 0,
+       "mean": null,
+       "p50": null,
+       "p95": null,
+       "p99": null,
+       "max": null
+      }
+     },
+     "throughput_min": 9160.1,
+     "throughput_max": 13783.0,
+     "total_s_median": 1.745,
+     "throughput_share_vs_flexiq": 114.8217,
+     "overhead_pct_throughput": -99.1,
+     "overhead_pct_total_time": -99.1,
+     "added_p99_latency_ms": -197024.0
+    },
+    "taskiq-redis": {
+     "median": {
+      "variant": "taskiq-redis",
+      "repeat": 1,
+      "tasks": 20000,
+      "enqueue_s": 9.679,
+      "total_s": 16.191,
+      "finalize_s": null,
+      "throughput_per_s": 1235.2,
+      "latency_ms": {
+       "count": 20000,
+       "mean": 3785.205,
+       "p50": 4244.696,
+       "p95": 6365.049,
+       "p99": 6624.396,
+       "max": 6711.175
+      },
+      "dispatch_ms": {
+       "count": 0,
+       "mean": null,
+       "p50": null,
+       "p95": null,
+       "p99": null,
+       "max": null
+      },
+      "service_ms": {
+       "count": 0,
+       "mean": null,
+       "p50": null,
+       "p95": null,
+       "p99": null,
+       "max": null
+      }
+     },
+     "throughput_min": 909.6,
+     "throughput_max": 1255.1,
+     "total_s_median": 16.191,
+     "throughput_share_vs_flexiq": 12.3741,
+     "overhead_pct_throughput": -91.9,
+     "overhead_pct_total_time": -91.9,
+     "added_p99_latency_ms": -190477.6
+    },
+    "flexiq": {
+     "median": {
+      "variant": "flexiq",
+      "repeat": 0,
+      "tasks": 20000,
+      "enqueue_s": 1.938,
+      "total_s": 200.351,
+      "finalize_s": null,
+      "throughput_per_s": 99.8,
+      "latency_ms": {
+       "count": 20000,
+       "mean": 102294.116,
+       "p50": 104244.0,
+       "p95": 189620.0,
+       "p99": 197102.0,
+       "max": 198825.0
+      },
+      "dispatch_ms": {
+       "count": 19962,
+       "mean": 0.02,
+       "p50": 0.019,
+       "p95": 0.032,
+       "p99": 0.059,
+       "max": 0.472
+      },
+      "service_ms": {
+       "count": 19962,
+       "mean": 0.848,
+       "p50": 0.261,
+       "p95": 3.473,
+       "p99": 7.356,
+       "max": 46.03
+      }
+     },
+     "throughput_min": 98.1,
+     "throughput_max": 100.0,
+     "total_s_median": 200.351,
+     "throughput_share_vs_flexiq": 1.0,
+     "overhead_pct_throughput": 0.0,
+     "overhead_pct_total_time": 0.0,
+     "added_p99_latency_ms": 0.0
+    },
+    "tallyho": {
+     "median": {
+      "variant": "tallyho",
+      "repeat": 0,
+      "tasks": 20000,
+      "enqueue_s": 1.05,
+      "total_s": 206.671,
+      "finalize_s": 206.734,
+      "throughput_per_s": 96.8,
+      "latency_ms": {
+       "count": 20000,
+       "mean": 107215.68,
+       "p50": 108549.581,
+       "p95": 196970.404,
+       "p99": 204556.587,
+       "max": 206599.464
+      },
+      "dispatch_ms": {
+       "count": 19955,
+       "mean": 66.713,
+       "p50": 65.416,
+       "p95": 99.3,
+       "p99": 190.47,
+       "max": 580.72
+      },
+      "service_ms": {
+       "count": 19955,
+       "mean": 156.01,
+       "p50": 145.438,
+       "p95": 243.323,
+       "p99": 344.505,
+       "max": 742.738
+      }
+     },
+     "throughput_min": 86.3,
+     "throughput_max": 102.0,
+     "total_s_median": 206.671,
+     "throughput_share_vs_flexiq": 0.9694,
+     "overhead_pct_throughput": 3.2,
+     "overhead_pct_total_time": 3.2,
+     "added_p99_latency_ms": 7454.6
+    }
+   },
+   "completer": {
+    "tallyho": [
+     {
+      "flushes": 2330,
+      "items_mean": 18.0,
+      "duration_p50_ms": 24.9,
+      "duration_p99_ms": 110.6,
+      "span_s": 218.2
+     },
+     {
+      "flushes": 2323,
+      "items_mean": 18.1,
+      "duration_p50_ms": 24.0,
+      "duration_p99_ms": 100.6,
+      "span_s": 207.6
+     },
+     {
+      "flushes": 2400,
+      "items_mean": 17.5,
+      "duration_p50_ms": 23.9,
+      "duration_p99_ms": 96.3,
+      "span_s": 242.9
+     }
+    ]
+   },
+   "runs": [
+    {
+     "variant": "taskiq-memory",
+     "repeat": 0,
+     "tasks": 20000,
+     "enqueue_s": 2.183,
+     "total_s": 2.183,
+     "finalize_s": null,
+     "throughput_per_s": 9160.1,
+     "latency_ms": {
+      "count": 20000,
+      "mean": 51.16,
+      "p50": 49.099,
+      "p95": 74.106,
+      "p99": 79.449,
+      "max": 83.91
+     },
+     "dispatch_ms": {
+      "count": 0,
+      "mean": null,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "max": null
+     },
+     "service_ms": {
+      "count": 0,
+      "mean": null,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "max": null
+     }
+    },
+    {
+     "variant": "taskiq-memory",
+     "repeat": 1,
+     "tasks": 20000,
+     "enqueue_s": 1.745,
+     "total_s": 1.745,
+     "finalize_s": null,
+     "throughput_per_s": 11462.1,
+     "latency_ms": {
+      "count": 20000,
+      "mean": 39.287,
+      "p50": 37.237,
+      "p95": 60.316,
+      "p99": 78.044,
+      "max": 86.427
+     },
+     "dispatch_ms": {
+      "count": 0,
+      "mean": null,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "max": null
+     },
+     "service_ms": {
+      "count": 0,
+      "mean": null,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "max": null
+     }
+    },
+    {
+     "variant": "taskiq-memory",
+     "repeat": 2,
+     "tasks": 20000,
+     "enqueue_s": 1.451,
+     "total_s": 1.451,
+     "finalize_s": null,
+     "throughput_per_s": 13783.0,
+     "latency_ms": {
+      "count": 20000,
+      "mean": 35.044,
+      "p50": 34.283,
+      "p95": 43.038,
+      "p99": 61.975,
+      "max": 63.682
+     },
+     "dispatch_ms": {
+      "count": 0,
+      "mean": null,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "max": null
+     },
+     "service_ms": {
+      "count": 0,
+      "mean": null,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "max": null
+     }
+    },
+    {
+     "variant": "taskiq-redis",
+     "repeat": 0,
+     "tasks": 20000,
+     "enqueue_s": 10.919,
+     "total_s": 21.988,
+     "finalize_s": null,
+     "throughput_per_s": 909.6,
+     "latency_ms": {
+      "count": 20000,
+      "mean": 5977.177,
+      "p50": 5944.232,
+      "p95": 10913.903,
+      "p99": 11208.653,
+      "max": 11334.426
+     },
+     "dispatch_ms": {
+      "count": 0,
+      "mean": null,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "max": null
+     },
+     "service_ms": {
+      "count": 0,
+      "mean": null,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "max": null
+     }
+    },
+    {
+     "variant": "taskiq-redis",
+     "repeat": 1,
+     "tasks": 20000,
+     "enqueue_s": 9.679,
+     "total_s": 16.191,
+     "finalize_s": null,
+     "throughput_per_s": 1235.2,
+     "latency_ms": {
+      "count": 20000,
+      "mean": 3785.205,
+      "p50": 4244.696,
+      "p95": 6365.049,
+      "p99": 6624.396,
+      "max": 6711.175
+     },
+     "dispatch_ms": {
+      "count": 0,
+      "mean": null,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "max": null
+     },
+     "service_ms": {
+      "count": 0,
+      "mean": null,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "max": null
+     }
+    },
+    {
+     "variant": "taskiq-redis",
+     "repeat": 2,
+     "tasks": 20000,
+     "enqueue_s": 9.515,
+     "total_s": 15.935,
+     "finalize_s": null,
+     "throughput_per_s": 1255.1,
+     "latency_ms": {
+      "count": 20000,
+      "mean": 3727.554,
+      "p50": 3802.32,
+      "p95": 6300.223,
+      "p99": 6463.107,
+      "max": 6588.07
+     },
+     "dispatch_ms": {
+      "count": 0,
+      "mean": null,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "max": null
+     },
+     "service_ms": {
+      "count": 0,
+      "mean": null,
+      "p50": null,
+      "p95": null,
+      "p99": null,
+      "max": null
+     }
+    },
+    {
+     "variant": "flexiq",
+     "repeat": 0,
+     "tasks": 20000,
+     "enqueue_s": 1.938,
+     "total_s": 200.351,
+     "finalize_s": null,
+     "throughput_per_s": 99.8,
+     "latency_ms": {
+      "count": 20000,
+      "mean": 102294.116,
+      "p50": 104244.0,
+      "p95": 189620.0,
+      "p99": 197102.0,
+      "max": 198825.0
+     },
+     "dispatch_ms": {
+      "count": 19962,
+      "mean": 0.02,
+      "p50": 0.019,
+      "p95": 0.032,
+      "p99": 0.059,
+      "max": 0.472
+     },
+     "service_ms": {
+      "count": 19962,
+      "mean": 0.848,
+      "p50": 0.261,
+      "p95": 3.473,
+      "p99": 7.356,
+      "max": 46.03
+     }
+    },
+    {
+     "variant": "flexiq",
+     "repeat": 1,
+     "tasks": 20000,
+     "enqueue_s": 2.003,
+     "total_s": 203.822,
+     "finalize_s": null,
+     "throughput_per_s": 98.1,
+     "latency_ms": {
+      "count": 20000,
+      "mean": 99481.808,
+      "p50": 95578.5,
+      "p95": 192988.0,
+      "p99": 200590.0,
+      "max": 202147.0
+     },
+     "dispatch_ms": {
+      "count": 19965,
+      "mean": 0.021,
+      "p50": 0.02,
+      "p95": 0.034,
+      "p99": 0.065,
+      "max": 1.02
+     },
+     "service_ms": {
+      "count": 19965,
+      "mean": 0.867,
+      "p50": 0.268,
+      "p95": 3.545,
+      "p99": 7.281,
+      "max": 50.623
+     }
+    },
+    {
+     "variant": "flexiq",
+     "repeat": 2,
+     "tasks": 20000,
+     "enqueue_s": 1.94,
+     "total_s": 200.039,
+     "finalize_s": null,
+     "throughput_per_s": 100.0,
+     "latency_ms": {
+      "count": 20000,
+      "mean": 97749.239,
+      "p50": 95410.0,
+      "p95": 190655.0,
+      "p99": 196949.0,
+      "max": 198482.0
+     },
+     "dispatch_ms": {
+      "count": 19959,
+      "mean": 0.02,
+      "p50": 0.02,
+      "p95": 0.033,
+      "p99": 0.057,
+      "max": 0.565
+     },
+     "service_ms": {
+      "count": 19959,
+      "mean": 0.827,
+      "p50": 0.26,
+      "p95": 3.406,
+      "p99": 6.743,
+      "max": 69.616
+     }
+    },
+    {
+     "variant": "tallyho",
+     "repeat": 0,
+     "tasks": 20000,
+     "enqueue_s": 1.05,
+     "total_s": 206.671,
+     "finalize_s": 206.734,
+     "throughput_per_s": 96.8,
+     "latency_ms": {
+      "count": 20000,
+      "mean": 107215.68,
+      "p50": 108549.581,
+      "p95": 196970.404,
+      "p99": 204556.587,
+      "max": 206599.464
+     },
+     "dispatch_ms": {
+      "count": 19955,
+      "mean": 66.713,
+      "p50": 65.416,
+      "p95": 99.3,
+      "p99": 190.47,
+      "max": 580.72
+     },
+     "service_ms": {
+      "count": 19955,
+      "mean": 156.01,
+      "p50": 145.438,
+      "p95": 243.323,
+      "p99": 344.505,
+      "max": 742.738
+     }
+    },
+    {
+     "variant": "tallyho",
+     "repeat": 1,
+     "tasks": 20000,
+     "enqueue_s": 1.026,
+     "total_s": 195.989,
+     "finalize_s": 196.113,
+     "throughput_per_s": 102.0,
+     "latency_ms": {
+      "count": 20000,
+      "mean": 100826.193,
+      "p50": 102621.34,
+      "p95": 186878.06,
+      "p99": 194183.27,
+      "max": 195956.006
+     },
+     "dispatch_ms": {
+      "count": 19977,
+      "mean": 64.945,
+      "p50": 63.923,
+      "p95": 95.457,
+      "p99": 175.818,
+      "max": 582.674
+     },
+     "service_ms": {
+      "count": 19977,
+      "mean": 150.79,
+      "p50": 142.368,
+      "p95": 228.681,
+      "p99": 293.52,
+      "max": 707.198
+     }
+    },
+    {
+     "variant": "tallyho",
+     "repeat": 2,
+     "tasks": 20000,
+     "enqueue_s": 1.007,
+     "total_s": 231.73,
+     "finalize_s": 231.79,
+     "throughput_per_s": 86.3,
+     "latency_ms": {
+      "count": 20000,
+      "mean": 132871.608,
+      "p50": 133552.835,
+      "p95": 222078.395,
+      "p99": 229680.181,
+      "max": 231661.434
+     },
+     "dispatch_ms": {
+      "count": 19978,
+      "mean": 64.038,
+      "p50": 63.806,
+      "p95": 90.85,
+      "p99": 146.208,
+      "max": 553.842
+     },
+     "service_ms": {
+      "count": 19978,
+      "mean": 150.362,
+      "p50": 141.675,
+      "p95": 224.776,
+      "p99": 302.149,
+      "max": 763.798
+     }
+    }
+   ]
+  }
+ },
+ "ab_before_after": {
+  "2x20-flexiq-ref-r1": {
+   "started_at": "2026-10-06T04:00:13",
+   "parameters": {
+    "tasks": 20000,
+    "repeats": 1,
+    "warmup": 1000,
+    "processes": 2,
+    "concurrency": 20,
+    "scheduler_batch": 1,
+    "completer_tick_ms": 20.0,
+    "variants": [
+     "flexiq"
+    ]
+   },
+   "runs": [
+    {
+     "variant": "flexiq",
+     "repeat": 0,
+     "tasks": 20000,
+     "enqueue_s": 1.812,
+     "total_s": 166.156,
+     "finalize_s": null,
+     "throughput_per_s": 120.4,
+     "latency_ms": {
+      "count": 20000,
+      "mean": 83787.295,
+      "p50": 83207.0,
+      "p95": 156802.0,
+      "p99": 163086.0,
+      "max": 164722.0
+     },
+     "dispatch_ms": {
+      "count": 20000,
+      "mean": 0.014,
+      "p50": 0.0,
+      "p95": 0.0,
+      "p99": 0.534,
+      "max": 1.759
+     },
+     "service_ms": {
+      "count": 20000,
+      "mean": 0.618,
+      "p50": 0.0,
+      "p95": 3.159,
+      "p99": 6.118,
+      "max": 32.694
+     }
+    }
+   ],
+   "completer": {}
+  },
+  "2x20-flexiq-ref-r2": {
+   "started_at": "2026-10-06T04:13:55",
+   "parameters": {
+    "tasks": 20000,
+    "repeats": 1,
+    "warmup": 1000,
+    "processes": 2,
+    "concurrency": 20,
+    "scheduler_batch": 1,
+    "completer_tick_ms": 20.0,
+    "variants": [
+     "flexiq"
+    ]
+   },
+   "runs": [
+    {
+     "variant": "flexiq",
+     "repeat": 0,
+     "tasks": 20000,
+     "enqueue_s": 1.437,
+     "total_s": 165.359,
+     "finalize_s": null,
+     "throughput_per_s": 120.9,
+     "latency_ms": {
+      "count": 20000,
+      "mean": 83306.839,
+      "p50": 82536.0,
+      "p95": 156670.0,
+      "p99": 162436.0,
+      "max": 164209.0
+     },
+     "dispatch_ms": {
+      "count": 19998,
+      "mean": 0.013,
+      "p50": 0.0,
+      "p95": 0.0,
+      "p99": 0.534,
+      "max": 1.843
+     },
+     "service_ms": {
+      "count": 19998,
+      "mean": 0.613,
+      "p50": 0.0,
+      "p95": 3.102,
+      "p99": 5.794,
+      "max": 22.081
+     }
+    }
+   ],
+   "completer": {}
+  },
+  "2x20-flexiq-ref-r3": {
+   "started_at": "2026-10-06T04:27:37",
+   "parameters": {
+    "tasks": 20000,
+    "repeats": 1,
+    "warmup": 1000,
+    "processes": 2,
+    "concurrency": 20,
+    "scheduler_batch": 1,
+    "completer_tick_ms": 20.0,
+    "variants": [
+     "flexiq"
+    ]
+   },
+   "runs": [
+    {
+     "variant": "flexiq",
+     "repeat": 0,
+     "tasks": 20000,
+     "enqueue_s": 1.468,
+     "total_s": 164.093,
+     "finalize_s": null,
+     "throughput_per_s": 121.9,
+     "latency_ms": {
+      "count": 20000,
+      "mean": 82664.483,
+      "p50": 81744.0,
+      "p95": 155334.0,
+      "p99": 161568.0,
+      "max": 162867.0
+     },
+     "dispatch_ms": {
+      "count": 20000,
+      "mean": 0.014,
+      "p50": 0.0,
+      "p95": 0.0,
+      "p99": 0.535,
+      "max": 1.588
+     },
+     "service_ms": {
+      "count": 20000,
+      "mean": 0.62,
+      "p50": 0.0,
+      "p95": 3.057,
+      "p99": 6.516,
+      "max": 21.518
+     }
+    }
+   ],
+   "completer": {}
+  },
+  "2x20-tallyho-after-r1": {
+   "started_at": "2026-10-06T04:06:38",
+   "parameters": {
+    "tasks": 20000,
+    "repeats": 1,
+    "warmup": 1000,
+    "processes": 2,
+    "concurrency": 20,
+    "scheduler_batch": 1,
+    "completer_tick_ms": 20.0,
+    "variants": [
+     "tallyho"
+    ]
+   },
+   "runs": [
+    {
+     "variant": "tallyho",
+     "repeat": 0,
+     "tasks": 20000,
+     "enqueue_s": 0.859,
+     "total_s": 172.562,
+     "finalize_s": 172.703,
+     "throughput_per_s": 115.9,
+     "latency_ms": {
+      "count": 20000,
+      "mean": 87307.001,
+      "p50": 87346.67,
+      "p95": 164090.073,
+      "p99": 170977.822,
+      "max": 172524.483
+     },
+     "dispatch_ms": {
+      "count": 20000,
+      "mean": 43.011,
+      "p50": 42.962,
+      "p95": 73.089,
+      "p99": 115.495,
+      "max": 492.349
+     },
+     "service_ms": {
+      "count": 20000,
+      "mean": 116.855,
+      "p50": 113.993,
+      "p95": 163.33,
+      "p99": 241.676,
+      "max": 684.631
+     }
+    }
+   ],
+   "completer": {
+    "tallyho": [
+     {
+      "flushes": 2823,
+      "items_mean": 14.9,
+      "duration_p50_ms": 16.0,
+      "duration_p99_ms": 94.0,
+      "span_s": 182.3
+     }
+    ]
+   }
+  },
+  "2x20-tallyho-after-r2": {
+   "started_at": "2026-10-06T04:20:17",
+   "parameters": {
+    "tasks": 20000,
+    "repeats": 1,
+    "warmup": 1000,
+    "processes": 2,
+    "concurrency": 20,
+    "scheduler_batch": 1,
+    "completer_tick_ms": 20.0,
+    "variants": [
+     "tallyho"
+    ]
+   },
+   "runs": [
+    {
+     "variant": "tallyho",
+     "repeat": 0,
+     "tasks": 20000,
+     "enqueue_s": 0.922,
+     "total_s": 173.953,
+     "finalize_s": 174.016,
+     "throughput_per_s": 115.0,
+     "latency_ms": {
+      "count": 20000,
+      "mean": 87705.15,
+      "p50": 87355.897,
+      "p95": 165587.494,
+      "p99": 172350.138,
+      "max": 173907.016
+     },
+     "dispatch_ms": {
+      "count": 19961,
+      "mean": 41.889,
+      "p50": 42.654,
+      "p95": 70.691,
+      "p99": 93.106,
+      "max": 237.738
+     },
+     "service_ms": {
+      "count": 19961,
+      "mean": 116.378,
+      "p50": 115.223,
+      "p95": 163.703,
+      "p99": 209.878,
+      "max": 352.58
+     }
+    }
+   ],
+   "completer": {
+    "tallyho": [
+     {
+      "flushes": 2843,
+      "items_mean": 14.8,
+      "duration_p50_ms": 16.0,
+      "duration_p99_ms": 79.0,
+      "span_s": 184.0
+     }
+    ]
+   }
+  },
+  "2x20-tallyho-after-r3": {
+   "started_at": "2026-10-06T04:33:57",
+   "parameters": {
+    "tasks": 20000,
+    "repeats": 1,
+    "warmup": 1000,
+    "processes": 2,
+    "concurrency": 20,
+    "scheduler_batch": 1,
+    "completer_tick_ms": 20.0,
+    "variants": [
+     "tallyho"
+    ]
+   },
+   "runs": [
+    {
+     "variant": "tallyho",
+     "repeat": 0,
+     "tasks": 20000,
+     "enqueue_s": 0.89,
+     "total_s": 172.171,
+     "finalize_s": 172.296,
+     "throughput_per_s": 116.2,
+     "latency_ms": {
+      "count": 20000,
+      "mean": 87443.087,
+      "p50": 87476.571,
+      "p95": 163885.789,
+      "p99": 170646.282,
+      "max": 172140.679
+     },
+     "dispatch_ms": {
+      "count": 19959,
+      "mean": 42.46,
+      "p50": 42.544,
+      "p95": 69.149,
+      "p99": 107.074,
+      "max": 481.939
+     },
+     "service_ms": {
+      "count": 19959,
+      "mean": 116.804,
+      "p50": 114.64,
+      "p95": 166.177,
+      "p99": 216.332,
+      "max": 587.598
+     }
+    }
+   ],
+   "completer": {
+    "tallyho": [
+     {
+      "flushes": 2859,
+      "items_mean": 14.7,
+      "duration_p50_ms": 16.0,
+      "duration_p99_ms": 93.0,
+      "span_s": 182.0
+     }
+    ]
+   }
+  },
+  "2x20-tallyho-before-r1": {
+   "started_at": "2026-10-06T04:03:19",
+   "parameters": {
+    "tasks": 20000,
+    "repeats": 1,
+    "warmup": 1000,
+    "processes": 2,
+    "concurrency": 20,
+    "scheduler_batch": 1,
+    "variants": [
+     "tallyho"
+    ]
+   },
+   "runs": [
+    {
+     "variant": "tallyho",
+     "repeat": 0,
+     "tasks": 20000,
+     "enqueue_s": 0.875,
+     "total_s": 174.641,
+     "finalize_s": 174.766,
+     "throughput_per_s": 114.5,
+     "latency_ms": {
+      "count": 20000,
+      "mean": 88927.539,
+      "p50": 88931.362,
+      "p95": 166243.808,
+      "p99": 172889.924,
+      "max": 174590.659
+     },
+     "dispatch_ms": {
+      "count": 19959,
+      "mean": 61.207,
+      "p50": 62.009,
+      "p95": 85.653,
+      "p99": 120.628,
+      "max": 485.086
+     },
+     "service_ms": {
+      "count": 19959,
+      "mean": 145.263,
+      "p50": 138.52,
+      "p95": 206.271,
+      "p99": 296.848,
+      "max": 734.421
+     }
+    }
+   ],
+   "completer": {
+    "tallyho": [
+     {
+      "flushes": 2352,
+      "items_mean": 17.9,
+      "duration_p50_ms": 16.0,
+      "duration_p99_ms": 78.0,
+      "span_s": 184.5
+     }
+    ]
+   }
+  },
+  "2x20-tallyho-before-r2": {
+   "started_at": "2026-10-06T04:17:01",
+   "parameters": {
+    "tasks": 20000,
+    "repeats": 1,
+    "warmup": 1000,
+    "processes": 2,
+    "concurrency": 20,
+    "scheduler_batch": 1,
+    "variants": [
+     "tallyho"
+    ]
+   },
+   "runs": [
+    {
+     "variant": "tallyho",
+     "repeat": 0,
+     "tasks": 20000,
+     "enqueue_s": 1.109,
+     "total_s": 171.796,
+     "finalize_s": 171.906,
+     "throughput_per_s": 116.4,
+     "latency_ms": {
+      "count": 20000,
+      "mean": 86954.265,
+      "p50": 86791.635,
+      "p95": 163344.447,
+      "p99": 169730.289,
+      "max": 171767.497
+     },
+     "dispatch_ms": {
+      "count": 19955,
+      "mean": 60.602,
+      "p50": 62.002,
+      "p95": 85.694,
+      "p99": 114.631,
+      "max": 452.0
+     },
+     "service_ms": {
+      "count": 19955,
+      "mean": 142.804,
+      "p50": 137.608,
+      "p95": 199.669,
+      "p99": 261.7,
+      "max": 721.457
+     }
+    }
+   ],
+   "completer": {
+    "tallyho": [
+     {
+      "flushes": 2361,
+      "items_mean": 17.8,
+      "duration_p50_ms": 16.0,
+      "duration_p99_ms": 78.0,
+      "span_s": 182.1
+     }
+    ]
+   }
+  },
+  "2x20-tallyho-before-r3": {
+   "started_at": "2026-10-06T04:30:41",
+   "parameters": {
+    "tasks": 20000,
+    "repeats": 1,
+    "warmup": 1000,
+    "processes": 2,
+    "concurrency": 20,
+    "scheduler_batch": 1,
+    "variants": [
+     "tallyho"
+    ]
+   },
+   "runs": [
+    {
+     "variant": "tallyho",
+     "repeat": 0,
+     "tasks": 20000,
+     "enqueue_s": 1.25,
+     "total_s": 172.0,
+     "finalize_s": 172.062,
+     "throughput_per_s": 116.3,
+     "latency_ms": {
+      "count": 20000,
+      "mean": 86987.213,
+      "p50": 87108.348,
+      "p95": 163342.203,
+      "p99": 169857.717,
+      "max": 171955.0
+     },
+     "dispatch_ms": {
+      "count": 20000,
+      "mean": 60.76,
+      "p50": 61.996,
+      "p95": 85.269,
+      "p99": 110.213,
+      "max": 456.685
+     },
+     "service_ms": {
+      "count": 20000,
+      "mean": 143.4,
+      "p50": 136.981,
+      "p95": 206.627,
+      "p99": 258.207,
+      "max": 659.478
+     }
+    }
+   ],
+   "completer": {
+    "tallyho": [
+     {
+      "flushes": 2365,
+      "items_mean": 17.8,
+      "duration_p50_ms": 16.0,
+      "duration_p99_ms": 63.0,
+      "span_s": 182.2
+     }
+    ]
+   }
+  },
+  "4x50-flexiq-ref-r1": {
+   "started_at": "2026-10-06T04:09:55",
+   "parameters": {
+    "tasks": 20000,
+    "repeats": 1,
+    "warmup": 1000,
+    "processes": 4,
+    "concurrency": 50,
+    "scheduler_batch": 50,
+    "completer_tick_ms": 20.0,
+    "variants": [
+     "flexiq"
+    ]
+   },
+   "runs": [
+    {
+     "variant": "flexiq",
+     "repeat": 0,
+     "tasks": 20000,
+     "enqueue_s": 1.828,
+     "total_s": 61.343,
+     "finalize_s": null,
+     "throughput_per_s": 326.0,
+     "latency_ms": {
+      "count": 20000,
+      "mean": 30498.011,
+      "p50": 30335.0,
+      "p95": 57195.0,
+      "p99": 59398.0,
+      "max": 59568.0
+     },
+     "dispatch_ms": {
+      "count": 20000,
+      "mean": 0.017,
+      "p50": 0.0,
+      "p95": 0.0,
+      "p99": 0.54,
+      "max": 1.688
+     },
+     "service_ms": {
+      "count": 20000,
+      "mean": 0.824,
+      "p50": 0.0,
+      "p95": 3.743,
+      "p99": 7.097,
+      "max": 35.141
+     }
+    }
+   ],
+   "completer": {}
+  },
+  "4x50-flexiq-ref-r2": {
+   "started_at": "2026-10-06T04:23:35",
+   "parameters": {
+    "tasks": 20000,
+    "repeats": 1,
+    "warmup": 1000,
+    "processes": 4,
+    "concurrency": 50,
+    "scheduler_batch": 50,
+    "completer_tick_ms": 20.0,
+    "variants": [
+     "flexiq"
+    ]
+   },
+   "runs": [
+    {
+     "variant": "flexiq",
+     "repeat": 0,
+     "tasks": 20000,
+     "enqueue_s": 1.812,
+     "total_s": 60.703,
+     "finalize_s": null,
+     "throughput_per_s": 329.5,
+     "latency_ms": {
+      "count": 20000,
+      "mean": 30100.675,
+      "p50": 29975.0,
+      "p95": 56732.0,
+      "p99": 58896.0,
+      "max": 58938.0
+     },
+     "dispatch_ms": {
+      "count": 20000,
+      "mean": 0.018,
+      "p50": 0.0,
+      "p95": 0.0,
+      "p99": 0.542,
+      "max": 1.87
+     },
+     "service_ms": {
+      "count": 20000,
+      "mean": 0.826,
+      "p50": 0.0,
+      "p95": 3.737,
+      "p99": 6.947,
+      "max": 33.844
+     }
+    }
+   ],
+   "completer": {}
+  },
+  "4x50-flexiq-ref-r3": {
+   "started_at": "2026-10-06T04:37:14",
+   "parameters": {
+    "tasks": 20000,
+    "repeats": 1,
+    "warmup": 1000,
+    "processes": 4,
+    "concurrency": 50,
+    "scheduler_batch": 50,
+    "completer_tick_ms": 20.0,
+    "variants": [
+     "flexiq"
+    ]
+   },
+   "runs": [
+    {
+     "variant": "flexiq",
+     "repeat": 0,
+     "tasks": 20000,
+     "enqueue_s": 1.735,
+     "total_s": 60.625,
+     "finalize_s": null,
+     "throughput_per_s": 329.9,
+     "latency_ms": {
+      "count": 20000,
+      "mean": 29783.628,
+      "p50": 29725.0,
+      "p95": 56517.0,
+      "p99": 58716.03,
+      "max": 58875.0
+     },
+     "dispatch_ms": {
+      "count": 20000,
+      "mean": 0.017,
+      "p50": 0.0,
+      "p95": 0.0,
+      "p99": 0.541,
+      "max": 2.063
+     },
+     "service_ms": {
+      "count": 20000,
+      "mean": 0.807,
+      "p50": 0.0,
+      "p95": 3.654,
+      "p99": 6.951,
+      "max": 28.141
+     }
+    }
+   ],
+   "completer": {}
+  },
+  "4x50-tallyho-after-r1": {
+   "started_at": "2026-10-06T04:12:33",
+   "parameters": {
+    "tasks": 20000,
+    "repeats": 1,
+    "warmup": 1000,
+    "processes": 4,
+    "concurrency": 50,
+    "scheduler_batch": 50,
+    "completer_tick_ms": 20.0,
+    "variants": [
+     "tallyho"
+    ]
+   },
+   "runs": [
+    {
+     "variant": "tallyho",
+     "repeat": 0,
+     "tasks": 20000,
+     "enqueue_s": 1.031,
+     "total_s": 63.031,
+     "finalize_s": 63.156,
+     "throughput_per_s": 317.3,
+     "latency_ms": {
+      "count": 20000,
+      "mean": 32562.738,
+      "p50": 32534.078,
+      "p95": 60534.287,
+      "p99": 62809.496,
+      "max": 62988.288
+     },
+     "dispatch_ms": {
+      "count": 19900,
+      "mean": 60.772,
+      "p50": 48.394,
+      "p95": 139.671,
+      "p99": 261.245,
+      "max": 1233.95
+     },
+     "service_ms": {
+      "count": 19900,
+      "mean": 201.172,
+      "p50": 196.746,
+      "p95": 315.486,
+      "p99": 481.581,
+      "max": 1668.504
+     }
+    }
+   ],
+   "completer": {
+    "tallyho": [
+     {
+      "flushes": 1408,
+      "items_mean": 29.8,
+      "duration_p50_ms": 32.0,
+      "duration_p99_ms": 265.0,
+      "span_s": 66.9
+     }
+    ]
+   }
+  },
+  "4x50-tallyho-after-r2": {
+   "started_at": "2026-10-06T04:26:15",
+   "parameters": {
+    "tasks": 20000,
+    "repeats": 1,
+    "warmup": 1000,
+    "processes": 4,
+    "concurrency": 50,
+    "scheduler_batch": 50,
+    "completer_tick_ms": 20.0,
+    "variants": [
+     "tallyho"
+    ]
+   },
+   "runs": [
+    {
+     "variant": "tallyho",
+     "repeat": 0,
+     "tasks": 20000,
+     "enqueue_s": 1.032,
+     "total_s": 64.204,
+     "finalize_s": 64.266,
+     "throughput_per_s": 311.5,
+     "latency_ms": {
+      "count": 20000,
+      "mean": 32912.597,
+      "p50": 32680.284,
+      "p95": 60754.233,
+      "p99": 63425.34,
+      "max": 64120.463
+     },
+     "dispatch_ms": {
+      "count": 20000,
+      "mean": 68.731,
+      "p50": 48.6,
+      "p95": 152.147,
+      "p99": 468.867,
+      "max": 1281.103
+     },
+     "service_ms": {
+      "count": 20000,
+      "mean": 210.446,
+      "p50": 198.296,
+      "p95": 323.717,
+      "p99": 760.676,
+      "max": 1965.131
+     }
+    }
+   ],
+   "completer": {
+    "tallyho": [
+     {
+      "flushes": 1410,
+      "items_mean": 29.8,
+      "duration_p50_ms": 32.0,
+      "duration_p99_ms": 312.0,
+      "span_s": 68.3
+     }
+    ]
+   }
+  },
+  "4x50-tallyho-after-r3": {
+   "started_at": "2026-10-06T04:39:52",
+   "parameters": {
+    "tasks": 20000,
+    "repeats": 1,
+    "warmup": 1000,
+    "processes": 4,
+    "concurrency": 50,
+    "scheduler_batch": 50,
+    "completer_tick_ms": 20.0,
+    "variants": [
+     "tallyho"
+    ]
+   },
+   "runs": [
+    {
+     "variant": "tallyho",
+     "repeat": 0,
+     "tasks": 20000,
+     "enqueue_s": 0.985,
+     "total_s": 63.969,
+     "finalize_s": 64.11,
+     "throughput_per_s": 312.7,
+     "latency_ms": {
+      "count": 20000,
+      "mean": 32636.692,
+      "p50": 32507.168,
+      "p95": 60860.518,
+      "p99": 63158.467,
+      "max": 63861.741
+     },
+     "dispatch_ms": {
+      "count": 19919,
+      "mean": 65.299,
+      "p50": 48.931,
+      "p95": 158.085,
+      "p99": 308.396,
+      "max": 1119.87
+     },
+     "service_ms": {
+      "count": 19919,
+      "mean": 207.167,
+      "p50": 199.893,
+      "p95": 323.099,
+      "p99": 722.045,
+      "max": 1517.866
+     }
+    }
+   ],
+   "completer": {
+    "tallyho": [
+     {
+      "flushes": 1420,
+      "items_mean": 29.6,
+      "duration_p50_ms": 46.0,
+      "duration_p99_ms": 313.0,
+      "span_s": 68.5
+     }
+    ]
+   }
+  },
+  "4x50-tallyho-before-r1": {
+   "started_at": "2026-10-06T04:11:12",
+   "parameters": {
+    "tasks": 20000,
+    "repeats": 1,
+    "warmup": 1000,
+    "processes": 4,
+    "concurrency": 50,
+    "scheduler_batch": 50,
+    "variants": [
+     "tallyho"
+    ]
+   },
+   "runs": [
+    {
+     "variant": "tallyho",
+     "repeat": 0,
+     "tasks": 20000,
+     "enqueue_s": 1.016,
+     "total_s": 62.969,
+     "finalize_s": 63.094,
+     "throughput_per_s": 317.6,
+     "latency_ms": {
+      "count": 20000,
+      "mean": 32368.538,
+      "p50": 32252.001,
+      "p95": 60067.461,
+      "p99": 62514.701,
+      "max": 62927.979
+     },
+     "dispatch_ms": {
+      "count": 19833,
+      "mean": 79.403,
+      "p50": 78.923,
+      "p95": 127.476,
+      "p99": 226.781,
+      "max": 1180.033
+     },
+     "service_ms": {
+      "count": 19833,
+      "mean": 250.4,
+      "p50": 253.304,
+      "p95": 369.828,
+      "p99": 509.981,
+      "max": 1505.058
+     }
+    }
+   ],
+   "completer": {
+    "tallyho": [
+     {
+      "flushes": 1037,
+      "items_mean": 40.5,
+      "duration_p50_ms": 31.0,
+      "duration_p99_ms": 171.0,
+      "span_s": 67.2
+     }
+    ]
+   }
+  },
+  "4x50-tallyho-before-r2": {
+   "started_at": "2026-10-06T04:24:51",
+   "parameters": {
+    "tasks": 20000,
+    "repeats": 1,
+    "warmup": 1000,
+    "processes": 4,
+    "concurrency": 50,
+    "scheduler_batch": 50,
+    "variants": [
+     "tallyho"
+    ]
+   },
+   "runs": [
+    {
+     "variant": "tallyho",
+     "repeat": 0,
+     "tasks": 20000,
+     "enqueue_s": 1.0,
+     "total_s": 64.5,
+     "finalize_s": 64.563,
+     "throughput_per_s": 310.1,
+     "latency_ms": {
+      "count": 20000,
+      "mean": 33169.363,
+      "p50": 32988.635,
+      "p95": 61404.418,
+      "p99": 63825.808,
+      "max": 64435.146
+     },
+     "dispatch_ms": {
+      "count": 19889,
+      "mean": 84.567,
+      "p50": 80.832,
+      "p95": 126.176,
+      "p99": 352.354,
+      "max": 1073.327
+     },
+     "service_ms": {
+      "count": 19889,
+      "mean": 261.647,
+      "p50": 260.165,
+      "p95": 395.195,
+      "p99": 663.103,
+      "max": 1630.58
+     }
+    }
+   ],
+   "completer": {
+    "tallyho": [
+     {
+      "flushes": 1038,
+      "items_mean": 40.5,
+      "duration_p50_ms": 31.0,
+      "duration_p99_ms": 156.0,
+      "span_s": 69.7
+     }
+    ]
+   }
+  },
+  "4x50-tallyho-before-r3": {
+   "started_at": "2026-10-06T04:38:30",
+   "parameters": {
+    "tasks": 20000,
+    "repeats": 1,
+    "warmup": 1000,
+    "processes": 4,
+    "concurrency": 50,
+    "scheduler_batch": 50,
+    "variants": [
+     "tallyho"
+    ]
+   },
+   "runs": [
+    {
+     "variant": "tallyho",
+     "repeat": 0,
+     "tasks": 20000,
+     "enqueue_s": 1.016,
+     "total_s": 63.531,
+     "finalize_s": 63.672,
+     "throughput_per_s": 314.8,
+     "latency_ms": {
+      "count": 20000,
+      "mean": 32589.599,
+      "p50": 32457.302,
+      "p95": 60505.705,
+      "p99": 62793.275,
+      "max": 63485.173
+     },
+     "dispatch_ms": {
+      "count": 19900,
+      "mean": 80.544,
+      "p50": 79.97,
+      "p95": 128.268,
+      "p99": 214.06,
+      "max": 1176.795
+     },
+     "service_ms": {
+      "count": 19900,
+      "mean": 252.375,
+      "p50": 252.667,
+      "p95": 387.611,
+      "p99": 485.424,
+      "max": 1471.501
+     }
+    }
+   ],
+   "completer": {
+    "tallyho": [
+     {
+      "flushes": 1036,
+      "items_mean": 40.5,
+      "duration_p50_ms": 31.0,
+      "duration_p99_ms": 141.0,
+      "span_s": 67.6
+     }
+    ]
+   }
+  }
+ },
+ "ab_perf3": {
+  "2x20-after-r1": {
+   "started_at": "2026-10-06T04:51:04",
+   "parameters": {
+    "tasks": 20000,
+    "repeats": 1,
+    "warmup": 1000,
+    "processes": 2,
+    "concurrency": 20,
+    "scheduler_batch": 1,
+    "completer_tick_ms": 20.0,
+    "variants": [
+     "tallyho"
+    ]
+   },
+   "runs": [
+    {
+     "variant": "tallyho",
+     "repeat": 0,
+     "tasks": 20000,
+     "enqueue_s": 0.937,
+     "total_s": 172.875,
+     "finalize_s": 172.937,
+     "throughput_per_s": 115.7,
+     "latency_ms": {
+      "count": 20000,
+      "mean": 86882.243,
+      "p50": 86218.03,
+      "p95": 164454.21,
+      "p99": 171216.179,
+      "max": 172791.984
+     },
+     "dispatch_ms": {
+      "count": 19993,
+      "mean": 42.753,
+      "p50": 42.562,
+      "p95": 73.429,
+      "p99": 103.725,
+      "max": 467.103
+     },
+     "service_ms": {
+      "count": 19993,
+      "mean": 116.461,
+      "p50": 114.267,
+      "p95": 167.791,
+      "p99": 218.075,
+      "max": 576.053
+     }
+    }
+   ],
+   "completer": {
+    "tallyho": [
+     {
+      "flushes": 2864,
+      "items_mean": 14.7,
+      "duration_p50_ms": 16.0,
+      "duration_p99_ms": 79.0,
+      "span_s": 183.0
+     }
+    ]
+   }
+  },
+  "2x20-after-r2": {
+   "started_at": "2026-10-06T05:00:23",
+   "parameters": {
+    "tasks": 20000,
+    "repeats": 1,
+    "warmup": 1000,
+    "processes": 2,
+    "concurrency": 20,
+    "scheduler_batch": 1,
+    "completer_tick_ms": 20.0,
+    "variants": [
+     "tallyho"
+    ]
+   },
+   "runs": [
+    {
+     "variant": "tallyho",
+     "repeat": 0,
+     "tasks": 20000,
+     "enqueue_s": 1.109,
+     "total_s": 172.015,
+     "finalize_s": 172.14,
+     "throughput_per_s": 116.3,
+     "latency_ms": {
+      "count": 20000,
+      "mean": 86964.314,
+      "p50": 86917.032,
+      "p95": 163248.296,
+      "p99": 170076.575,
+      "max": 171979.955
+     },
+     "dispatch_ms": {
+      "count": 19973,
+      "mean": 42.246,
+      "p50": 43.099,
+      "p95": 68.419,
+      "p99": 90.577,
+      "max": 500.504
+     },
+     "service_ms": {
+      "count": 19973,
+      "mean": 114.898,
+      "p50": 113.925,
+      "p95": 160.89,
+      "p99": 206.412,
+      "max": 713.089
+     }
+    }
+   ],
+   "completer": {
+    "tallyho": [
+     {
+      "flushes": 2850,
+      "items_mean": 14.7,
+      "duration_p50_ms": 16.0,
+      "duration_p99_ms": 78.0,
+      "span_s": 181.6
+     }
+    ]
+   }
+  },
+  "2x20-after-r3": {
+   "started_at": "2026-10-06T05:09:42",
+   "parameters": {
+    "tasks": 20000,
+    "repeats": 1,
+    "warmup": 1000,
+    "processes": 2,
+    "concurrency": 20,
+    "scheduler_batch": 1,
+    "completer_tick_ms": 20.0,
+    "variants": [
+     "tallyho"
+    ]
+   },
+   "runs": [
+    {
+     "variant": "tallyho",
+     "repeat": 0,
+     "tasks": 20000,
+     "enqueue_s": 0.89,
+     "total_s": 172.718,
+     "finalize_s": 172.781,
+     "throughput_per_s": 115.8,
+     "latency_ms": {
+      "count": 20000,
+      "mean": 87367.997,
+      "p50": 87424.584,
+      "p95": 164153.028,
+      "p99": 170525.833,
+      "max": 172636.824
+     },
+     "dispatch_ms": {
+      "count": 19954,
+      "mean": 42.134,
+      "p50": 43.091,
+      "p95": 67.346,
+      "p99": 93.959,
+      "max": 427.003
+     },
+     "service_ms": {
+      "count": 19954,
+      "mean": 116.236,
+      "p50": 114.861,
+      "p95": 161.748,
+      "p99": 210.094,
+      "max": 534.478
+     }
+    }
+   ],
+   "completer": {
+    "tallyho": [
+     {
+      "flushes": 2802,
+      "items_mean": 15.0,
+      "duration_p50_ms": 16.0,
+      "duration_p99_ms": 94.0,
+      "span_s": 182.6
+     }
+    ]
+   }
+  },
+  "2x20-noperf3-r1": {
+   "started_at": "2026-10-06T04:47:47",
+   "parameters": {
+    "tasks": 20000,
+    "repeats": 1,
+    "warmup": 1000,
+    "processes": 2,
+    "concurrency": 20,
+    "scheduler_batch": 1,
+    "completer_tick_ms": 20.0,
+    "variants": [
+     "tallyho"
+    ]
+   },
+   "runs": [
+    {
+     "variant": "tallyho",
+     "repeat": 0,
+     "tasks": 20000,
+     "enqueue_s": 0.938,
+     "total_s": 173.094,
+     "finalize_s": 173.157,
+     "throughput_per_s": 115.5,
+     "latency_ms": {
+      "count": 20000,
+      "mean": 87859.202,
+      "p50": 88072.811,
+      "p95": 164543.252,
+      "p99": 171577.165,
+      "max": 173030.918
+     },
+     "dispatch_ms": {
+      "count": 19954,
+      "mean": 44.347,
+      "p50": 44.673,
+      "p95": 78.113,
+      "p99": 113.662,
+      "max": 505.08
+     },
+     "service_ms": {
+      "count": 19954,
+      "mean": 119.897,
+      "p50": 117.276,
+      "p95": 166.533,
+      "p99": 206.447,
+      "max": 663.26
+     }
+    }
+   ],
+   "completer": {
+    "tallyho": [
+     {
+      "flushes": 2559,
+      "items_mean": 16.4,
+      "duration_p50_ms": 16.0,
+      "duration_p99_ms": 78.0,
+      "span_s": 183.1
+     }
+    ]
+   }
+  },
+  "2x20-noperf3-r2": {
+   "started_at": "2026-10-06T04:57:07",
+   "parameters": {
+    "tasks": 20000,
+    "repeats": 1,
+    "warmup": 1000,
+    "processes": 2,
+    "concurrency": 20,
+    "scheduler_batch": 1,
+    "completer_tick_ms": 20.0,
+    "variants": [
+     "tallyho"
+    ]
+   },
+   "runs": [
+    {
+     "variant": "tallyho",
+     "repeat": 0,
+     "tasks": 20000,
+     "enqueue_s": 0.937,
+     "total_s": 172.281,
+     "finalize_s": 172.437,
+     "throughput_per_s": 116.1,
+     "latency_ms": {
+      "count": 20000,
+      "mean": 87173.802,
+      "p50": 87173.808,
+      "p95": 163935.064,
+      "p99": 170714.683,
+      "max": 172213.02
+     },
+     "dispatch_ms": {
+      "count": 19949,
+      "mean": 44.859,
+      "p50": 44.73,
+      "p95": 80.627,
+      "p99": 112.002,
+      "max": 262.927
+     },
+     "service_ms": {
+      "count": 19949,
+      "mean": 119.252,
+      "p50": 116.379,
+      "p95": 165.917,
+      "p99": 221.044,
+      "max": 362.696
+     }
+    }
+   ],
+   "completer": {
+    "tallyho": [
+     {
+      "flushes": 2619,
+      "items_mean": 16.0,
+      "duration_p50_ms": 16.0,
+      "duration_p99_ms": 78.0,
+      "span_s": 182.0
+     }
+    ]
+   }
+  },
+  "2x20-noperf3-r3": {
+   "started_at": "2026-10-06T05:06:25",
+   "parameters": {
+    "tasks": 20000,
+    "repeats": 1,
+    "warmup": 1000,
+    "processes": 2,
+    "concurrency": 20,
+    "scheduler_batch": 1,
+    "completer_tick_ms": 20.0,
+    "variants": [
+     "tallyho"
+    ]
+   },
+   "runs": [
+    {
+     "variant": "tallyho",
+     "repeat": 0,
+     "tasks": 20000,
+     "enqueue_s": 0.891,
+     "total_s": 173.235,
+     "finalize_s": 173.297,
+     "throughput_per_s": 115.5,
+     "latency_ms": {
+      "count": 20000,
+      "mean": 87284.648,
+      "p50": 87198.769,
+      "p95": 164153.5,
+      "p99": 171442.154,
+      "max": 173176.922
+     },
+     "dispatch_ms": {
+      "count": 19980,
+      "mean": 45.806,
+      "p50": 44.923,
+      "p95": 83.097,
+      "p99": 113.741,
+      "max": 460.084
+     },
+     "service_ms": {
+      "count": 19980,
+      "mean": 120.897,
+      "p50": 118.259,
+      "p95": 165.774,
+      "p99": 228.416,
+      "max": 639.457
+     }
+    }
+   ],
+   "completer": {
+    "tallyho": [
+     {
+      "flushes": 2616,
+      "items_mean": 16.1,
+      "duration_p50_ms": 16.0,
+      "duration_p99_ms": 78.0,
+      "span_s": 183.5
+     }
+    ]
+   }
+  },
+  "4x50-after-r1": {
+   "started_at": "2026-10-06T04:46:25",
+   "parameters": {
+    "tasks": 20000,
+    "repeats": 1,
+    "warmup": 1000,
+    "processes": 4,
+    "concurrency": 50,
+    "scheduler_batch": 50,
+    "completer_tick_ms": 20.0,
+    "variants": [
+     "tallyho"
+    ]
+   },
+   "runs": [
+    {
+     "variant": "tallyho",
+     "repeat": 0,
+     "tasks": 20000,
+     "enqueue_s": 1.0,
+     "total_s": 63.141,
+     "finalize_s": 63.204,
+     "throughput_per_s": 316.8,
+     "latency_ms": {
+      "count": 20000,
+      "mean": 32553.26,
+      "p50": 32317.877,
+      "p95": 60328.266,
+      "p99": 62659.367,
+      "max": 63001.152
+     },
+     "dispatch_ms": {
+      "count": 20000,
+      "mean": 61.818,
+      "p50": 46.118,
+      "p95": 144.6,
+      "p99": 285.2,
+      "max": 1154.253
+     },
+     "service_ms": {
+      "count": 20000,
+      "mean": 200.669,
+      "p50": 191.454,
+      "p95": 321.3,
+      "p99": 556.272,
+      "max": 1600.825
+     }
+    }
+   ],
+   "completer": {
+    "tallyho": [
+     {
+      "flushes": 1393,
+      "items_mean": 30.2,
+      "duration_p50_ms": 32.0,
+      "duration_p99_ms": 281.0,
+      "span_s": 67.1
+     }
+    ]
+   }
+  },
+  "4x50-after-r2": {
+   "started_at": "2026-10-06T04:55:44",
+   "parameters": {
+    "tasks": 20000,
+    "repeats": 1,
+    "warmup": 1000,
+    "processes": 4,
+    "concurrency": 50,
+    "scheduler_batch": 50,
+    "completer_tick_ms": 20.0,
+    "variants": [
+     "tallyho"
+    ]
+   },
+   "runs": [
+    {
+     "variant": "tallyho",
+     "repeat": 0,
+     "tasks": 20000,
+     "enqueue_s": 1.0,
+     "total_s": 64.453,
+     "finalize_s": 64.656,
+     "throughput_per_s": 310.3,
+     "latency_ms": {
+      "count": 20000,
+      "mean": 33474.918,
+      "p50": 33638.241,
+      "p95": 61282.086,
+      "p99": 63803.24,
+      "max": 64383.763
+     },
+     "dispatch_ms": {
+      "count": 19840,
+      "mean": 63.228,
+      "p50": 48.077,
+      "p95": 158.218,
+      "p99": 282.801,
+      "max": 1137.13
+     },
+     "service_ms": {
+      "count": 19840,
+      "mean": 204.368,
+      "p50": 197.266,
+      "p95": 331.42,
+      "p99": 533.977,
+      "max": 1519.954
+     }
+    }
+   ],
+   "completer": {
+    "tallyho": [
+     {
+      "flushes": 1405,
+      "items_mean": 29.9,
+      "duration_p50_ms": 32.0,
+      "duration_p99_ms": 297.0,
+      "span_s": 68.5
+     }
+    ]
+   }
+  },
+  "4x50-after-r3": {
+   "started_at": "2026-10-06T05:05:01",
+   "parameters": {
+    "tasks": 20000,
+    "repeats": 1,
+    "warmup": 1000,
+    "processes": 4,
+    "concurrency": 50,
+    "scheduler_batch": 50,
+    "completer_tick_ms": 20.0,
+    "variants": [
+     "tallyho"
+    ]
+   },
+   "runs": [
+    {
+     "variant": "tallyho",
+     "repeat": 0,
+     "tasks": 20000,
+     "enqueue_s": 1.031,
+     "total_s": 64.359,
+     "finalize_s": 64.484,
+     "throughput_per_s": 310.8,
+     "latency_ms": {
+      "count": 20000,
+      "mean": 32592.556,
+      "p50": 32225.356,
+      "p95": 61246.543,
+      "p99": 63913.768,
+      "max": 64249.41
+     },
+     "dispatch_ms": {
+      "count": 20000,
+      "mean": 62.994,
+      "p50": 50.971,
+      "p95": 149.499,
+      "p99": 232.789,
+      "max": 1182.7
+     },
+     "service_ms": {
+      "count": 20000,
+      "mean": 207.943,
+      "p50": 206.685,
+      "p95": 316.26,
+      "p99": 430.268,
+      "max": 1839.289
+     }
+    }
+   ],
+   "completer": {
+    "tallyho": [
+     {
+      "flushes": 1426,
+      "items_mean": 29.5,
+      "duration_p50_ms": 47.0,
+      "duration_p99_ms": 344.0,
+      "span_s": 69.1
+     }
+    ]
+   }
+  },
+  "4x50-noperf3-r1": {
+   "started_at": "2026-10-06T04:45:01",
+   "parameters": {
+    "tasks": 20000,
+    "repeats": 1,
+    "warmup": 1000,
+    "processes": 4,
+    "concurrency": 50,
+    "scheduler_batch": 50,
+    "completer_tick_ms": 20.0,
+    "variants": [
+     "tallyho"
+    ]
+   },
+   "runs": [
+    {
+     "variant": "tallyho",
+     "repeat": 0,
+     "tasks": 20000,
+     "enqueue_s": 1.016,
+     "total_s": 64.25,
+     "finalize_s": 64.36,
+     "throughput_per_s": 311.3,
+     "latency_ms": {
+      "count": 20000,
+      "mean": 33003.01,
+      "p50": 33021.897,
+      "p95": 61090.266,
+      "p99": 63816.738,
+      "max": 64204.055
+     },
+     "dispatch_ms": {
+      "count": 19848,
+      "mean": 74.777,
+      "p50": 68.351,
+      "p95": 161.957,
+      "p99": 249.061,
+      "max": 811.828
+     },
+     "service_ms": {
+      "count": 19848,
+      "mean": 210.402,
+      "p50": 206.651,
+      "p95": 317.007,
+      "p99": 450.005,
+      "max": 1171.933
+     }
+    }
+   ],
+   "completer": {
+    "tallyho": [
+     {
+      "flushes": 1246,
+      "items_mean": 33.7,
+      "duration_p50_ms": 31.0,
+      "duration_p99_ms": 141.0,
+      "span_s": 68.7
+     }
+    ]
+   }
+  },
+  "4x50-noperf3-r2": {
+   "started_at": "2026-10-06T04:54:22",
+   "parameters": {
+    "tasks": 20000,
+    "repeats": 1,
+    "warmup": 1000,
+    "processes": 4,
+    "concurrency": 50,
+    "scheduler_batch": 50,
+    "completer_tick_ms": 20.0,
+    "variants": [
+     "tallyho"
+    ]
+   },
+   "runs": [
+    {
+     "variant": "tallyho",
+     "repeat": 0,
+     "tasks": 20000,
+     "enqueue_s": 0.938,
+     "total_s": 63.485,
+     "finalize_s": 63.547,
+     "throughput_per_s": 315.0,
+     "latency_ms": {
+      "count": 20000,
+      "mean": 32566.416,
+      "p50": 32503.772,
+      "p95": 60327.558,
+      "p99": 62680.533,
+      "max": 63408.729
+     },
+     "dispatch_ms": {
+      "count": 19951,
+      "mean": 81.676,
+      "p50": 67.055,
+      "p95": 169.661,
+      "p99": 415.979,
+      "max": 1217.195
+     },
+     "service_ms": {
+      "count": 19951,
+      "mean": 218.522,
+      "p50": 206.648,
+      "p95": 338.812,
+      "p99": 617.782,
+      "max": 1498.465
+     }
+    }
+   ],
+   "completer": {
+    "tallyho": [
+     {
+      "flushes": 1240,
+      "items_mean": 33.9,
+      "duration_p50_ms": 31.0,
+      "duration_p99_ms": 157.0,
+      "span_s": 67.8
+     }
+    ]
+   }
+  },
+  "4x50-noperf3-r3": {
+   "started_at": "2026-10-06T05:03:39",
+   "parameters": {
+    "tasks": 20000,
+    "repeats": 1,
+    "warmup": 1000,
+    "processes": 4,
+    "concurrency": 50,
+    "scheduler_batch": 50,
+    "completer_tick_ms": 20.0,
+    "variants": [
+     "tallyho"
+    ]
+   },
+   "runs": [
+    {
+     "variant": "tallyho",
+     "repeat": 0,
+     "tasks": 20000,
+     "enqueue_s": 1.141,
+     "total_s": 63.907,
+     "finalize_s": 63.969,
+     "throughput_per_s": 313.0,
+     "latency_ms": {
+      "count": 20000,
+      "mean": 32958.761,
+      "p50": 33142.58,
+      "p95": 60606.447,
+      "p99": 63242.242,
+      "max": 63830.518
+     },
+     "dispatch_ms": {
+      "count": 19930,
+      "mean": 77.086,
+      "p50": 66.356,
+      "p95": 160.147,
+      "p99": 260.901,
+      "max": 1077.453
+     },
+     "service_ms": {
+      "count": 19930,
+      "mean": 211.431,
+      "p50": 204.718,
+      "p95": 319.425,
+      "p99": 415.161,
+      "max": 1342.747
+     }
+    }
+   ],
+   "completer": {
+    "tallyho": [
+     {
+      "flushes": 1230,
+      "items_mean": 34.1,
+      "duration_p50_ms": 31.0,
+      "duration_p99_ms": 157.0,
+      "span_s": 68.3
+     }
+    ]
+   }
+  }
+ }
+}

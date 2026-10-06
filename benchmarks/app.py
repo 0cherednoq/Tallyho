@@ -105,6 +105,9 @@ class AppConfig:
         schemas: схемы tallyho, flexiq и домена.
         variant: ``tallyho`` или «голый» ``flexiq``.
         concurrency: ``workers`` и ``async_concurrency`` flexiq одного процесса.
+        scheduler_batch: ``scheduler_batch_size`` flexiq: сколько джоб планировщик берёт за
+            один круг опроса (по умолчанию flexiq — 1).
+        completer_tick_ms: ``completer_tick`` tallyho, миллисекунды.
         seed: seed «сети» и выбора удерживаемых транзакций.
         sleep_min: нижняя граница «сети» в задаче S1, секунды.
         sleep_max: верхняя граница «сети» в задаче S1, секунды.
@@ -126,6 +129,8 @@ class AppConfig:
     schemas: Schemas
     variant: Variant = Variant.TALLYHO
     concurrency: int = 10
+    scheduler_batch: int = 1
+    completer_tick_ms: float = 20.0
     seed: int = 1
     sleep_min: float = 0.0
     sleep_max: float = 0.0
@@ -167,6 +172,8 @@ class AppConfig:
             schemas=Schemas(**schemas),
             variant=Variant(str(data["variant"])),
             concurrency=int(number("concurrency")),
+            scheduler_batch=int(number("scheduler_batch")),
+            completer_tick_ms=number("completer_tick_ms"),
             seed=int(number("seed")),
             sleep_min=number("sleep_min"),
             sleep_max=number("sleep_max"),
@@ -400,6 +407,7 @@ def _queue(config: AppConfig, stats: WorkerStats) -> Queue:
         workers=config.concurrency,
         async_concurrency=config.concurrency,
         drain_timeout=5,
+        scheduler_batch_size=config.scheduler_batch,
         middleware=middleware,
         middleware_timeout=0,
     )
@@ -592,6 +600,7 @@ def build_app(config: AppConfig) -> BenchApp:
         schema=config.schemas.tallyho,
         observer=_StatsObserver(stats),
         sweep_interval=timedelta(seconds=config.sweep_interval),
+        completer_tick=timedelta(milliseconds=config.completer_tick_ms),
     )
     th.install(adapter)
     env = _Env(

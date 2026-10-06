@@ -222,6 +222,8 @@ class Finalizer:
             ``False``, если батч не готов, уже финализирован, хук отсутствует
             или хук завершился ошибкой.
         """
+        if await self._has_pending(batch_id):
+            return False
         settings = TxSettings(statement_timeout=self.settings.hook_timeout)
         for _ in range(_SNAPSHOT_RETRIES):
             try:
@@ -247,6 +249,23 @@ class Finalizer:
                 _ = await self.try_finalize(candidate)
             return True
         return False
+
+    async def _has_pending(self, batch_id: UUID) -> bool:
+        """Есть ли у батча незавершённые Items — одним чтением, без своей транзакции.
+
+        Completer зовёт ``try_finalize`` после каждой групповой транзакции с
+        завершениями, и почти всегда батч ещё не готов. ``pending != 0`` и
+        внутри транзакции даёт «не готов» (:meth:`_verdict`), а снимок здесь
+        не старше commit вызывающего: последний завершивший Item видит
+        ``pending = 0`` и идёт в полную проверку под блокировкой (T11.6).
+
+        Returns:
+            ``True``, если финализировать батч точно рано.
+        """
+        async with self.engine.connect() as conn:
+            totals = await read_counters(conn, self.tables, [batch_id])
+        current = totals.get(batch_id)
+        return current is not None and current.pending != 0
 
     async def _attempt(self, conn: AsyncConnection, batch_id: UUID) -> _Committed:
         target = await self._read_batch(conn, batch_id)

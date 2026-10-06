@@ -8,7 +8,7 @@ from datetime import timedelta
 from typing import TYPE_CHECKING
 
 import pytest
-from sqlalchemy import delete, select, text, update
+from sqlalchemy import delete, event, select, text, update
 from typing_extensions import override
 
 from tallyho.engine.finalizer import Finalizer, FinalizerSettings
@@ -74,6 +74,26 @@ def finalizer(
         ids=env.producer.ids,
         hooks=registry,
         progress=progress,
+    )
+
+
+class _NoPrecheck(Finalizer):
+    """Finalizer без чтения pending до транзакции: гонки внутри неё."""
+
+    @override
+    async def _has_pending(self, batch_id: UUID) -> bool:
+        _ = batch_id
+        return False
+
+
+def without_precheck(env: Env, registry: HookRegistry) -> Finalizer:
+    """Finalizer, сразу открывающий транзакцию финализации."""
+    return _NoPrecheck(
+        tables=env.tables,
+        engine=schema_engine(env),
+        clock=SystemClock(),
+        ids=env.producer.ids,
+        hooks=registry,
     )
 
 
@@ -615,7 +635,9 @@ async def test_cancel_between_batch_read_and_counters_finalizes_cancelled(
     counter = f'"{env.schema}"."{env.tables.counter.name}"'
     async with env.connection() as watcher, env.transaction() as holder:
         _ = await holder.execute(text(f"LOCK TABLE {counter} IN ACCESS EXCLUSIVE MODE"))
-        running = asyncio.create_task(finalizer(env, registry).try_finalize(root.id))
+        # Гонка — внутри транзакции финализации: предварительное чтение pending
+        # (Perf-5) здесь выключено, иначе блокировку ждало бы оно.
+        running = asyncio.create_task(without_precheck(env, registry).try_finalize(root.id))
         await wait_blocked_by(watcher, await backend_pid(holder))
         async with env.transaction() as conn:
             assert await Operations(tables=env.tables, clock=SystemClock()).cancel(conn, root.id)
@@ -744,3 +766,33 @@ def test_finalizer_settings_validate_ranges() -> None:
         _ = FinalizerSettings(slot=-1)
     with pytest.raises(ConfigurationError, match="hook_timeout"):
         _ = FinalizerSettings(hook_timeout=timedelta(0))
+
+
+async def test_batch_with_pending_items_is_rejected_by_one_read(
+    env: Env, registry: HookRegistry
+) -> None:
+    # Completer зовёт try_finalize после каждой групповой транзакции; пока Items
+    # не завершены, хватает одного чтения счётчиков без своей транзакции (T11.6).
+    async with env.transaction() as conn:
+        root = await env.producer.create_root(conn, RootSpec(kind="mail"))
+        _ = await env.producer.add_items(
+            conn, root.id, [TaskCall(task_name="send", args=(1,), kwargs={})]
+        )
+        _ = await env.producer.seal(conn, root.id)
+    subject = finalizer(env, registry)
+    statements: list[str] = []
+
+    def record(*args: object) -> None:
+        statements.append(str(args[2]))
+
+    event.listen(subject.engine.sync_engine, "before_cursor_execute", record)
+    try:
+        assert not await subject.try_finalize(root.id)
+    finally:
+        event.remove(subject.engine.sync_engine, "before_cursor_execute", record)
+    assert len(statements) == 1
+    assert "set_config" not in statements[0]
+    batch = env.tables.batch
+    async with env.connection() as conn:
+        state = await conn.scalar(select(batch.c.state).where(batch.c.id == root.id))
+    assert state == BatchState.SEALED

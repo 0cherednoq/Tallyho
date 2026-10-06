@@ -1,11 +1,19 @@
 """Completer: групповой коммит операций воркера (ARCHITECTURE UC-03, UC-04, §9.2).
 
 Обёртка задачи не пишет в БД сама: она отдаёт операцию (claim, heartbeat,
-release, позже finish) в буфер процесса и ждёт future. Completer раз в тик
-(20 мс) или при наборе ``max_batch`` (500) операций выполняет **одну** короткую
-транзакцию (:func:`~tallyho.storage.tx.run_transaction`, повтор на дедлоке и
-``lock_timeout``) и резолвит futures только после commit. Когда в буфере
-``backpressure`` операций (10 000), новые ждут места (как River).
+release, позже finish) в буфер процесса и ждёт future. Completer не позже чем
+через тик (20 мс) после первой операции в буфере или при наборе ``max_batch``
+(500) операций выполняет **одну** короткую транзакцию
+(:func:`~tallyho.storage.tx.run_transaction`, повтор на дедлоке и
+``lock_timeout``) и резолвит futures только после commit. Операции, пришедшие,
+пока шла предыдущая транзакция, уже прождали тик и уходят следующей пачкой
+сразу. Когда в буфере ``backpressure`` операций (10 000), новые ждут места
+(как River).
+
+После commit работа с БД — подсказка ``watch``, оценка политик и
+``try_finalize`` — идёт в одной фоновой задаче и не задерживает следующую
+транзакцию; пока она занята, батчи следующих транзакций копятся и
+обрабатываются одним следующим проходом (T11.6).
 
 Completer привязывается к event loop при первой операции (лениво создаёт
 задачу сброса): он живёт в loop исполнителя async-задач брокера (§11.3).
@@ -207,7 +215,9 @@ class CompleterSettings:
     Attributes:
         worker_id: Идентификатор процесса-воркера в ``th_lease.worker_id``.
         slot: Слот ``th_counter`` процесса.
-        tick: Сколько ждать новые операции после первой в буфере.
+        tick: Сколько самое большее ждать новые операции после первой в буфере
+            (от её прихода: операция, прождавшая тик за предыдущей транзакцией,
+            уходит сразу).
         max_batch: Операций в одной транзакции.
         backpressure: Операций в буфере, после которого новые ждут места.
         lease_ttl: Срок lease от claim и от каждого heartbeat.
@@ -1498,6 +1508,12 @@ class Completer:
         self._flushing = False
         self._idle = asyncio.Event()
         self._idle.set()
+        self._oldest = 0.0
+        """``clock.monotonic()`` прихода первой операции в пустой буфер."""
+        self._deferred_progress: set[UUID] = set()
+        self._deferred_finalize: set[UUID] = set()
+        self._after_task: asyncio.Task[None] | None = None
+        """Фоновая работа после commit групповых транзакций (одна на Completer)."""
 
     # --- публичные операции ------------------------------------------------------------
 
@@ -1789,6 +1805,8 @@ class Completer:
             tasks.add(self._task)
         await self._stop(tasks, cancel=True)
         self._task = None
+        self._deferred_progress.clear()
+        self._deferred_finalize.clear()
         buffered, self._buffer = self._buffer, []
         self._fail(buffered, _ABORTED)
         self._held.clear()
@@ -1943,6 +1961,8 @@ class Completer:
         if self._closing:
             future.cancel()
             raise ClosedError(_CLOSED)
+        if not self._buffer:
+            self._oldest = self.clock.monotonic()
         self._buffer.append(op)
         self._idle.clear()
         self._notify_buffer()
@@ -1962,10 +1982,13 @@ class Completer:
                 self._wakeup.clear()
                 _ = await self._wakeup.wait()
                 continue
-            if len(self._buffer) < self.settings.max_batch and not self._closing:
+            # Тик отсчитывается от прихода первой операции пачки: если она
+            # прождала его за предыдущей транзакцией, пачка уходит сразу.
+            remaining = self._oldest + tick - self.clock.monotonic()
+            if len(self._buffer) < self.settings.max_batch and not self._closing and remaining > 0:
                 self._full.clear()
                 with contextlib.suppress(TimeoutError):
-                    async with asyncio.timeout(tick):
+                    async with asyncio.timeout(remaining):
                         _ = await self._full.wait()
             self._flushing = True
             ops = self._buffer[: self.settings.max_batch]
@@ -1996,7 +2019,7 @@ class Completer:
             return
         self._resolve(ops, applied)
         self._notify(len(ops), self.clock.monotonic() - started, applied)
-        await self._after_commit(applied)
+        self._defer(applied)
 
     async def _apply(self, conn: AsyncConnection, ops: Sequence[_Op]) -> _Applied:
         tx = _Tx(self, conn)
@@ -2122,7 +2145,41 @@ class Completer:
         except Exception:  # ruff: ignore[blind-except]  # observer must not affect accounting
             _log.exception("Observer.completer_buffer failed")
 
+    def _defer(self, applied: _Applied) -> None:
+        """Действия после commit групповой транзакции, не задерживая следующую.
+
+        Сброс кеша дерева, лог и ``kick`` relay — сразу (в памяти). Работа с
+        БД — подсказка ``watch``, политика, ``try_finalize`` — копится и идёт в
+        одной фоновой задаче: следующая транзакция её не ждёт, а пока задача
+        занята, батчи последующих транзакций обрабатываются одним проходом.
+        """
+        self._after_commit_now(applied)
+        self._deferred_progress.update(applied.progress)
+        self._deferred_finalize.update(applied.finalize)
+        if not (self._deferred_progress or self._deferred_finalize):
+            return
+        if self._after_task is not None and not self._after_task.done():
+            return
+        # Вызывается из цикла сброса — в loop, к которому привязан Completer.
+        task = asyncio.get_running_loop().create_task(
+            self._drain_deferred(), name="tallyho-completer-after-commit"
+        )
+        self._after_task = task
+        self._background.add(task)
+        self._idle.clear()
+        task.add_done_callback(self._background_done)
+
+    async def _drain_deferred(self) -> None:
+        while self._deferred_progress or self._deferred_finalize:
+            progress, self._deferred_progress = self._deferred_progress, set()
+            finalize, self._deferred_finalize = self._deferred_finalize, set()
+            await self._after_commit_db(progress, finalize)
+
     async def _after_commit(self, applied: _Applied) -> None:
+        self._after_commit_now(applied)
+        await self._after_commit_db(applied.progress, applied.finalize)
+
+    def _after_commit_now(self, applied: _Applied) -> None:
         if self.triggers.tree_cache is not None:
             for root_id in applied.invalidate_trees:
                 self.triggers.tree_cache.invalidate(root_id)
@@ -2133,8 +2190,10 @@ class Completer:
             )
         if self.triggers.relay is not None and applied.kick:
             self.triggers.relay.kick(sorted(applied.kick))
-        await self._publish_progress(applied.progress)
-        candidates = set(applied.finalize)
+
+    async def _after_commit_db(self, progress: Iterable[UUID], finalize: Iterable[UUID]) -> None:
+        await self._publish_progress(progress)
+        candidates = set(finalize)
         if self.triggers.policy is not None and candidates:
             try:
                 candidates.update(await self.triggers.policy.evaluate(candidates))

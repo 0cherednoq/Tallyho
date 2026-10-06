@@ -35,6 +35,7 @@ if TYPE_CHECKING:
     from benchmarks.stand import Schemas
 
 __all__ = [
+    "Completion",
     "FlexiqVariant",
     "LoadVariant",
     "OverheadSpec",
@@ -69,6 +70,8 @@ class OverheadSpec:
         repeats: повторов; итог — медиана по пропускной способности.
         timeout: предел ожидания одного повтора, секунды.
         print_output: задача печатает ``task {i}`` (T11.6), вывод воркеров — в их лог.
+        scheduler_batch: ``scheduler_batch_size`` flexiq (сколько джоб за круг опроса).
+        completer_tick_ms: ``completer_tick`` tallyho, миллисекунды.
     """
 
     tasks: int
@@ -78,6 +81,8 @@ class OverheadSpec:
     repeats: int
     timeout: float
     print_output: bool = False
+    scheduler_batch: int = 1
+    completer_tick_ms: float = 20.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -269,6 +274,8 @@ class _Base:
             schemas=self.schemas,
             variant=variant,
             concurrency=spec.concurrency,
+            scheduler_batch=spec.scheduler_batch,
+            completer_tick_ms=spec.completer_tick_ms,
             print_output=spec.print_output,
             record_bodies=True,
         )
