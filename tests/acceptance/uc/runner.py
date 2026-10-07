@@ -16,7 +16,7 @@ from tests.acceptance.chaos.runner import host_app
 from tests.acceptance.chaos.stand import Stand, StandSettings
 from tests.acceptance.chaos.verdict import Expectation, OracleInput, run_oracle, wait_quiescent
 from tests.acceptance.uc.context import UcContext
-from tests.acceptance.uc.scenarios import SCENARIOS, STAND_VARIANTS
+from tests.acceptance.uc.scenarios import SCENARIOS, STAND_VARIANTS, StandVariant
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -84,15 +84,17 @@ def _write_json(path: Path, value: object) -> None:
 
 
 def _settings(config: UcConfig) -> StandSettings:
-    variant = STAND_VARIANTS.get(config.uc, {})
+    variant = STAND_VARIANTS.get(config.uc, StandVariant())
     return StandSettings(
         seed=config.seed,
         pages=config.pages,
-        empty_pdfs=variant.get("empty_pdfs", False),
+        empty_pdfs=variant.empty_pdfs,
         threads=config.threads,
         lease_ttl=config.lease_ttl,
         heartbeat_every=config.heartbeat_every,
         sweep_interval=config.sweep_interval,
+        transient_rate=variant.transient_rate,
+        permanent_rate=variant.permanent_rate,
     )
 
 

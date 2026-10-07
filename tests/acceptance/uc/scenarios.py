@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 from tests.acceptance.uc import export, extra, mandatory
@@ -11,7 +12,17 @@ if TYPE_CHECKING:
 
     from tests.acceptance.uc.context import UcContext
 
-__all__ = ["SCENARIOS", "STAND_VARIANTS"]
+__all__ = ["SCENARIOS", "STAND_VARIANTS", "StandVariant"]
+
+
+@dataclass(frozen=True, slots=True)
+class StandVariant:
+    """Отличия стенда конкретного сценария от общего fault-профиля."""
+
+    empty_pdfs: bool = False
+    transient_rate: float = 0.05
+    permanent_rate: float = 0.01
+
 
 SCENARIOS: Mapping[str, Callable[[UcContext], Awaitable[None]]] = {
     "A-UC-01": mandatory.uc01,
@@ -38,7 +49,10 @@ SCENARIOS: Mapping[str, Callable[[UcContext], Awaitable[None]]] = {
     "A-UC-22": export.uc22,
 }
 
-STAND_VARIANTS: Mapping[str, Mapping[str, bool]] = {
+STAND_VARIANTS: Mapping[str, StandVariant] = {
+    # Эти сценарии проверяют полное раскрытие S2; ошибки доставки задаются адресами.
+    "A-UC-02": StandVariant(transient_rate=0.0, permanent_rate=0.0),
+    "A-UC-03": StandVariant(transient_rate=0.0, permanent_rate=0.0),
     # Каталог без единого PDF: пустой этап (ACCEPTANCE §3.2, A-UC-05).
-    "A-UC-05": {"empty_pdfs": True},
+    "A-UC-05": StandVariant(empty_pdfs=True),
 }

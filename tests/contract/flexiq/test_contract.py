@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from collections import Counter
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -697,12 +698,14 @@ async def test_a_fq_12_broker_and_tallyho_concurrency_limits_compose(
 
     async with app.th.batch("a-fq-12-rate", key="rate") as rate_batch:
         await rate_batch.add_calls(
-            [app.th.call(app.tasks["rate_limited"], str(index)) for index in range(4)]
+            [app.th.call(app.tasks["rate_limited"], str(index)) for index in range(6)]
         )
-    rate_events = await flexiq_contract.wait_events("rate", count=4, timeout_seconds=10)
+    rate_events = await flexiq_contract.wait_events("rate", count=6, timeout_seconds=10)
     _ = await flexiq_contract.wait_terminal(rate_batch.handle)
     rate_times = [float(cast("float", row["at"])) for row in rate_events]
-    assert max(rate_times) - min(rate_times) >= 0.9
+    rate_windows = Counter(int(at) for at in rate_times)
+    assert len(rate_windows) >= 3
+    assert max(rate_windows.values()) <= 2
 
 
 async def test_a_fq_13_middleware_injection_and_predicate_are_preserved(

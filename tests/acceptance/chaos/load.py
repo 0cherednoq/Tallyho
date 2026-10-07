@@ -97,14 +97,17 @@ def plan_load(
 def audience_for(seed: int, campaign_id: int, size: int) -> tuple[str, ...]:
     """Адреса кампании S2: 1% дублей, часть адресов с 503 и отказом провайдера."""
     rng = rng_for(seed, campaign_id, namespace="chaos-audience")
+    duplicate_count = size // 100
+    duplicate_indexes = set(rng.sample(range(1, size), k=min(duplicate_count, size - 1)))
     addresses: list[str] = []
     for index in range(size):
-        roll = rng.random()
-        if addresses and roll < 0.01:
+        if index in duplicate_indexes:
             addresses.append(rng.choice(addresses).upper())
-        elif roll < 0.04:
+            continue
+        roll = rng.random()
+        if roll < 0.03:
             addresses.append(f"retry-{campaign_id}-{index}@example.test")
-        elif roll < 0.05:
+        elif roll < 0.04:
             addresses.append(f"reject-{campaign_id}-{index}@example.test")
         else:
             addresses.append(f"user-{campaign_id}-{index}@example.test")

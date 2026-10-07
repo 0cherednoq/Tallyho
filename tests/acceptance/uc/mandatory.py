@@ -157,10 +157,11 @@ async def uc02(ctx: UcContext) -> None:
         f"снимков={len(announced)}, первые={[p.expected for p in announced[:3]]}",
     )
     send = final.children["send"].progress
+    expected_duplicates = audience // 100
     ctx.expect(
-        "дубли около 1% аудитории",
-        0 < send.duplicates <= max(1, audience // 50),
-        f"duplicates={send.duplicates}, audience={audience}",
+        "дубли составляют ровно 1% аудитории",
+        send.duplicates == expected_duplicates,
+        f"duplicates={send.duplicates}, expected={expected_duplicates}, audience={audience}",
     )
 
 

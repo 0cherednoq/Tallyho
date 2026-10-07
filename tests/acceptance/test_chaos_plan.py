@@ -236,7 +236,7 @@ def test_audience_is_seeded_and_contains_duplicates() -> None:
     assert first == audience_for(1, 3, 400)
     assert first != audience_for(2, 3, 400)
     unique = {address.strip().casefold() for address in first}
-    assert 0 < len(first) - len(unique) < 20
+    assert len(first) - len(unique) == len(first) // 100
     assert any(address.startswith("retry-") for address in first)
 
 

@@ -32,3 +32,19 @@ def test_pages_and_names() -> None:
     assert UcConfig(seed=7, uc="A-UC-05").pages == 5
     assert config.name == "a-uc-04-seed7"
     assert config.project == "tallyho-uc04-seed7"
+
+
+def test_s2_contracts_disable_unrelated_fault_injection() -> None:
+    for uc in ("A-UC-02", "A-UC-03"):
+        variant = STAND_VARIANTS[uc]
+
+        assert variant.transient_rate == pytest.approx(0.0)
+        assert variant.permanent_rate == pytest.approx(0.0)
+
+
+def test_other_stand_variants_keep_default_fault_injection() -> None:
+    variant = STAND_VARIANTS["A-UC-05"]
+
+    assert variant.empty_pdfs
+    assert variant.transient_rate == pytest.approx(0.05)
+    assert variant.permanent_rate == pytest.approx(0.01)
