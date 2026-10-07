@@ -1,7 +1,7 @@
 # PR-уровень приёмки (ACCEPTANCE §11): бюджет ≤ 15 минут по времени на часах.
-# Полный набор тестов разбит на части, которые идут параллельно на каждой паре
-# «Python × PostgreSQL»; покрытие частей объединяет job `coverage` (≥ 95% на каждой паре).
-# Nightly-уровень — nightly.yml.
+# Полный набор тестов разбит на четыре параллельные части на базовой паре
+# Python 3.11 × PostgreSQL 16; покрытие частей объединяет job `coverage` (≥ 95%).
+# Остальные поддерживаемые версии получают короткий smoke на PR и полный прогон в nightly.yml.
 name: CI
 
 on:
@@ -59,27 +59,20 @@ jobs:
           tests/unit/storage/test_migrations.py
           --no-cov
 
-  # Части набора (A-NF-10: Python 3.11/3.12/3.13, плюс 3.14 из classifiers). Последняя часть
-  # берёт всё, что не взяли остальные (`--ignore`), поэтому новый каталог тестов не потеряется.
+  # Полный набор на базовой паре. Последняя часть берёт всё, что не взяли остальные
+  # (`--ignore`), поэтому новый каталог тестов не потеряется.
   # Тесты с маркером flexiq (контракты и эталонное приложение) — в job `flexiq`.
   #
   # Части подобраны по замеру `pytest --durations` (T12.2): engine — 312 интеграционных тестов
   # движка; examples — исполняемые примеры (самый долгий тест — mailing, ~8 мин на загруженной
   # машине); storage — storage + stress; rest — юнит, архитектура и прочая интеграция.
   test:
-    name: Tests ${{ matrix.part }} (py${{ matrix.combo.python }}, pg${{ matrix.combo.postgres }})
+    name: Tests ${{ matrix.part }} (py3.11, pg16)
     runs-on: ubuntu-latest
     timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
-        combo:
-          - { python: "3.11", postgres: "16" }
-          - { python: "3.12", postgres: "16" }
-          - { python: "3.13", postgres: "16" }
-          - { python: "3.14", postgres: "16" }
-          - { python: "3.11", postgres: "14" }
-          - { python: "3.14", postgres: "17" }
         part: [engine, examples, storage, rest]
         include:
           - part: engine
@@ -94,7 +87,7 @@ jobs:
               --ignore=tests/integration/storage --ignore=tests/integration/stress
     services:
       postgres:
-        image: postgres:${{ matrix.combo.postgres }}-alpine
+        image: postgres:16-alpine
         env:
           POSTGRES_USER: tallyho
           POSTGRES_PASSWORD: tallyho
@@ -105,13 +98,13 @@ jobs:
           --health-interval 5s --health-timeout 5s --health-retries 10
     env:
       TALLYHO_TEST_DSN: postgresql+asyncpg://tallyho:tallyho@localhost:5432/tallyho
-      COVERAGE_ID: py${{ matrix.combo.python }}-pg${{ matrix.combo.postgres }}-${{ matrix.part }}
+      COVERAGE_ID: py3.11-pg16-${{ matrix.part }}
     steps:
       - uses: actions/checkout@v5
       - uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
-          python-version: ${{ matrix.combo.python }}
+          python-version: "3.11"
       - run: uv sync --all-extras
       # Порог покрытия проверяет job `coverage` по сумме частей.
       - run: uv run pytest ${{ matrix.paths }} -m "not flexiq" -n auto --cov-fail-under=0 --cov-report=
@@ -125,7 +118,7 @@ jobs:
           retention-days: 3
 
   coverage:
-    name: Coverage ≥ 95% (each Python × PostgreSQL)
+    name: Coverage ≥ 95% (py3.11, pg16)
     needs: test
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -158,6 +151,52 @@ jobs:
         with:
           name: coverage
           path: coverage.xml
+
+  # A-NF-10 и границы поддержки БД: на PR проверяем ключевые unit/DB пути на каждой
+  # дополнительной версии. Полный набор на этих комбинациях выполняет nightly.
+  compatibility:
+    name: Compatibility smoke (py${{ matrix.python }}, pg${{ matrix.postgres }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { python: "3.12", postgres: "16" }
+          - { python: "3.13", postgres: "16" }
+          - { python: "3.14", postgres: "16" }
+          - { python: "3.11", postgres: "14" }
+          - { python: "3.14", postgres: "17" }
+    services:
+      postgres:
+        image: postgres:${{ matrix.postgres }}-alpine
+        env:
+          POSTGRES_USER: tallyho
+          POSTGRES_PASSWORD: tallyho
+          POSTGRES_DB: tallyho
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U tallyho"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      TALLYHO_TEST_DSN: postgresql+asyncpg://tallyho:tallyho@localhost:5432/tallyho
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          python-version: ${{ matrix.python }}
+      - run: uv sync --all-extras
+      - name: Run representative unit and database tests
+        run: >-
+          uv run pytest
+          tests/unit
+          tests/integration/test_db_helpers.py
+          tests/integration/storage/test_migrations.py
+          tests/integration/engine/test_completion.py
+          tests/integration/api/test_batch.py
+          tests/integration/acceptance_db/test_foreign_connection.py
+          -n auto --no-cov
 
   # A-FQ на flexiq 2.0.x из uv.lock, эталонное приложение S1/S2/S3 (малый объём) и юнит-тесты
   # стенда приёмки. Контракты на последнем патче 2.0.x и на master — в nightly.yml.

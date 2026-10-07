@@ -1,6 +1,7 @@
 # Nightly-уровень приёмки (ACCEPTANCE §11): A-CH по 10 минут на комбинацию «сценарий × отказ»,
-# все A-UC на функциональном объёме, контракты flexiq на 2.0.x и master, мутационный gate CAS,
-# заготовка бенчмарков P-01/P-04. Бюджет — 4 часа: тяжёлое разнесено по параллельным job,
+# все A-UC на функциональном объёме, полная матрица совместимости, контракты flexiq на 2.0.x
+# и master, мутационный gate CAS, заготовка бенчмарков P-01/P-04. Бюджет — 4 часа:
+# тяжёлое разнесено по параллельным job,
 # ожидаемое время прогона — около часа (хаос-матрица 36 × ~15 мин при 12 параллельных стендах).
 #
 # Seed: по умолчанию дата запуска (UTC, YYYYMMDD), так ночи различаются. Seed и команда
@@ -91,6 +92,43 @@ jobs:
           assert sorted(ucs) == sorted(UC_IDS), sorted(set(ucs) ^ set(UC_IDS))
           print("matrices ok")
           EOF
+
+  # Полный набор на дополнительных Python/PostgreSQL. На каждом PR эти же комбинации
+  # проходят короткий compatibility smoke, чтобы не умножать четыре полных shard на шесть.
+  compatibility:
+    name: Full compatibility (py${{ matrix.python }}, pg${{ matrix.postgres }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { python: "3.12", postgres: "16" }
+          - { python: "3.13", postgres: "16" }
+          - { python: "3.14", postgres: "16" }
+          - { python: "3.11", postgres: "14" }
+          - { python: "3.14", postgres: "17" }
+    services:
+      postgres:
+        image: postgres:${{ matrix.postgres }}-alpine
+        env:
+          POSTGRES_USER: tallyho
+          POSTGRES_PASSWORD: tallyho
+          POSTGRES_DB: tallyho
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U tallyho"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      TALLYHO_TEST_DSN: postgresql+asyncpg://tallyho:tallyho@localhost:5432/tallyho
+    steps:
+      - uses: actions/checkout@v5
+      - uses: astral-sh/setup-uv@v7
+        with:
+          enable-cache: true
+          python-version: ${{ matrix.python }}
+      - run: uv sync --all-extras
+      - run: uv run pytest -m "not flexiq" -n auto --no-cov
 
   # ---------------------------------------------------------------------------
   # A-CH (ACCEPTANCE §6): одна ячейка «отказ × сценарий» на runner, один compose-стенд.
