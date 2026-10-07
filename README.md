@@ -1,8 +1,9 @@
 # tallyho
 
 [![CI](https://github.com/0cherednoq/tallyho/actions/workflows/ci.yml/badge.svg)](https://github.com/0cherednoq/tallyho/actions/workflows/ci.yml)
-[![PyPI](https://img.shields.io/pypi/v/tallyho.svg)](https://pypi.org/project/tallyho/)
-[![Python](https://img.shields.io/pypi/pyversions/tallyho.svg)](https://pypi.org/project/tallyho/)
+[![Documentation](https://img.shields.io/badge/docs-GitHub%20Pages-blue.svg)](https://0cherednoq.github.io/Tallyho/)
+[![PyPI](https://img.shields.io/pypi/v/tallyho.svg?cacheSeconds=300)](https://pypi.org/project/tallyho/)
+[![Python](https://img.shields.io/pypi/pyversions/tallyho.svg?cacheSeconds=300)](https://pypi.org/project/tallyho/)
 
 Async-библиотека для Python и PostgreSQL. Она добавляет к брокеру задач то, чего в нём обычно
 нет: учёт группы задач (батчи, вложенные батчи, прогресс, финализация ровно один раз), задачи,
@@ -10,7 +11,7 @@ Async-библиотека для Python и PostgreSQL. Она добавляе�
 транзакцией.
 
 > Статус: pre-alpha, версия 1.0 ещё не выпущена. Документация собирается в сайт из
-> [docs/](docs/index.md) и публикуется на [GitHub Pages](https://0cherednoq.github.io/tallyho/). Как библиотека
+> [docs/](docs/index.md) и публикуется на [GitHub Pages](https://0cherednoq.github.io/Tallyho/). Как библиотека
 > устроена внутри, описано в [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## Что это даёт

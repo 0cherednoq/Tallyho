@@ -53,7 +53,7 @@ tallyho = "tallyho.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/0cherednoq/tallyho"
-Documentation = "https://github.com/0cherednoq/tallyho/tree/main/docs"
+Documentation = "https://0cherednoq.github.io/Tallyho/"
 Repository = "https://github.com/0cherednoq/tallyho"
 Issues = "https://github.com/0cherednoq/tallyho/issues"
 Changelog = "https://github.com/0cherednoq/tallyho/blob/main/CHANGELOG.md"
