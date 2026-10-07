@@ -217,7 +217,7 @@ class Stand:
             build = await run_command(
                 "docker",
                 "build",
-                "-q",
+                "--progress=plain",
                 "-t",
                 self.settings.image,
                 "-f",

@@ -14,7 +14,17 @@ WORKDIR /app
 COPY pyproject.toml README.md LICENSE ./
 COPY src ./src
 
-RUN python -m pip install --no-cache-dir -e ".[asyncpg,flexiq]" "aiohttp>=3.12"
+RUN set -eu; \
+    for attempt in 1 2 3; do \
+        if python -m pip install --no-cache-dir --retries 10 --timeout 60 \
+            -e ".[asyncpg,flexiq]" "aiohttp>=3.12"; then \
+            exit 0; \
+        fi; \
+        if [ "$attempt" -eq 3 ]; then \
+            exit 1; \
+        fi; \
+        sleep $((attempt * 5)); \
+    done
 
 # Тесты копируются последними: их правка не пересобирает слой с зависимостями.
 COPY tests ./tests
