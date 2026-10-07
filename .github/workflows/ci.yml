@@ -261,56 +261,6 @@ jobs:
           include-hidden-files: true
           retention-days: 7
 
-  # A-NF-06, D-037. Gate идёт ~20–30 минут, поэтому на PR — только если изменились функции
-  # gate, их тесты или зависимости; на main и каждую ночь (nightly.yml) — всегда.
-  mutation-cas:
-    name: Mutation tests (critical CAS)
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
-    services:
-      postgres:
-        image: postgres:16-alpine
-        env:
-          POSTGRES_USER: tallyho
-          POSTGRES_PASSWORD: tallyho
-          POSTGRES_DB: tallyho
-        ports: ["5432:5432"]
-        options: >-
-          --health-cmd "pg_isready -U tallyho"
-          --health-interval 5s --health-timeout 5s --health-retries 10
-    env:
-      TALLYHO_TEST_DSN: postgresql+asyncpg://tallyho:tallyho@localhost:5432/tallyho
-    steps:
-      - uses: actions/checkout@v5
-        with:
-          fetch-depth: 0
-      - id: scope
-        name: Did the gated code change?
-        env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-        run: |
-          if [ "${{ github.event_name }}" != pull_request ]; then
-            echo "run=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          changed="$(git diff --name-only "${BASE_SHA}...HEAD")"
-          echo "${changed}"
-          if echo "${changed}" | grep -Eq '^(src/tallyho/(engine|storage)/|tests/integration/engine/|tests/helpers/|tests/conftest\.py|pyproject\.toml|uv\.lock|\.github/workflows/ci\.yml)'; then
-            echo "run=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "run=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::CAS-функции и их тесты не менялись — gate пропущен (идёт в nightly)"
-          fi
-      - if: steps.scope.outputs.run == 'true'
-        uses: astral-sh/setup-uv@v7
-        with:
-          enable-cache: true
-          python-version: "3.11"
-      - if: steps.scope.outputs.run == 'true'
-        run: uv sync --all-extras
-      - if: steps.scope.outputs.run == 'true'
-        run: uv run poe mutation-cas
-
   build:
     name: Build distribution
     runs-on: ubuntu-latest

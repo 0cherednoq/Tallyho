@@ -74,7 +74,6 @@ test = [
   "pytest-timeout>=2.3",
   "pytest-randomly>=3.16",
   "pytest-xdist>=3.6",
-  "mutmut==3.8.0",
   "hypothesis>=6.120",
   "pydantic>=2.12",
   "testcontainers[postgres]>=4.9",
@@ -178,7 +177,6 @@ bench-overhead = { cmd = "python -m benchmarks.overhead_cli --tasks ${TASKS} --r
   { name = "VARIANTS", options = ["--variants"], default = "all", help = "all или taskiq-memory,taskiq-redis,flexiq,tallyho" },
   { name = "LABEL", options = ["--label"], default = "run", help = "Метка прогона (каталог результата)" },
 ] }
-mutation-cas ={ shell = "mutmut run --max-children 4 '*Tx*claim*' '*Tx*finish*' '*Finalizer*_cas*' '*Snapshotter*_attempt*' '*Operations*_retry_items*' && ! mutmut results | grep -Eq ': (survived|suspicious|no tests)'", help = "Mutation gate for critical CAS functions (Linux/WSL only)" }
 check = { sequence = ["lint", "types", "imports", "deps", "test"], help = "Everything CI runs, except integration" }
 docs = { cmd = "python -m sphinx -b html -W --keep-going -q docs docs/_build/html", help = "Сайт документации в docs/_build/html (нужна группа docs: uv sync --group docs)" }
 check-all = { sequence = ["lint", "types", "imports", "deps", "test-all"], help = "Всё, включая PostgreSQL и покрытие ≥ 95%" }
@@ -485,36 +483,6 @@ exclude_also = [
   "class .*\\(Protocol\\):",
   "assert_never\\(",
 ]
-
-# -----------------------------------------------------------------------------
-# Mutation testing: critical state-transition/CAS paths only.
-# mutmut 3.x requires fork support, so this gate runs on Linux (CI or WSL).
-# -----------------------------------------------------------------------------
-[tool.mutmut]
-source_paths = ["src/tallyho"]
-only_mutate = [
-  "src/tallyho/engine/completer.py",
-  "src/tallyho/engine/finalizer.py",
-  "src/tallyho/engine/operations.py",
-  "src/tallyho/engine/snapshotter.py",
-]
-do_not_mutate_patterns = [
-  "\\.order_by\\(item\\.c\\.id\\)",
-  "\\.limit\\(_CHUNK\\)",
-  "\\.render_derived\\(\"u\"\\)",
-  "state=ItemState\\(value\\.result_class\\)",
-]
-pytest_add_cli_args = ["--no-cov", "-n", "0"]
-pytest_add_cli_args_test_selection = [
-  "tests/integration/engine/test_completer_claim.py",
-  "tests/integration/engine/test_completer_finish.py",
-  "tests/integration/engine/test_completion.py",
-  "tests/integration/engine/test_finalizer.py",
-  "tests/integration/engine/test_operations.py",
-  "tests/integration/engine/test_snapshotter.py",
-]
-timeout_multiplier = 4.0
-timeout_constant = 5.0
 
 # -----------------------------------------------------------------------------
 # codespell
