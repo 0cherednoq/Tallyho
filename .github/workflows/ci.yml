@@ -116,7 +116,7 @@ jobs:
       # Порог покрытия проверяет job `coverage` по сумме частей.
       - run: uv run pytest ${{ matrix.paths }} -m "not flexiq" -n auto --cov-fail-under=0 --cov-report=
       - run: mv .coverage ".coverage.${COVERAGE_ID}"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: coverage-data-${{ env.COVERAGE_ID }}
           path: .coverage.${{ env.COVERAGE_ID }}
@@ -153,7 +153,7 @@ jobs:
           done
           uv run coverage xml --data-file=.coverage.py3.11-pg16 -o coverage.xml
           exit "${status}"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: ${{ !cancelled() }}
         with:
           name: coverage
@@ -213,7 +213,7 @@ jobs:
         run: |
           echo "Воспроизвести: uv run poe acceptance-uc --uc ${{ matrix.uc }} --seed ${SEED} --scale 0.1"
           uv run poe acceptance-uc --uc "${{ matrix.uc }}" --seed "${SEED}" --scale 0.1 --jobs 0
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: failure()
         with:
           name: a-uc-pr-${{ strategy.job-index }}-seed-${{ env.SEED }}

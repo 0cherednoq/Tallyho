@@ -127,7 +127,7 @@ jobs:
           uv run poe acceptance --seed "${SEED}" --scenario "${{ matrix.scenario }}" \
             --chaos "${{ matrix.chaos }}" --duration "${DURATION}" --jobs 0
       # Журнал хаоса, oracle.json, containers.log — отчёт прогона (ACCEPTANCE §11).
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: ${{ !cancelled() }}
         with:
           name: a-ch-${{ matrix.chaos }}-${{ matrix.scenario }}-seed-${{ env.SEED }}
@@ -173,7 +173,7 @@ jobs:
           echo "seed=${SEED}"
           echo "Воспроизвести: uv run poe acceptance-uc --uc ${{ matrix.uc }} --seed ${SEED} --scale 0.1 --jobs 2"
           uv run poe acceptance-uc --uc "${{ matrix.uc }}" --seed "${SEED}" --scale 0.1 --jobs 2
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: ${{ !cancelled() }}
         with:
           name: a-uc-part-${{ matrix.part }}-seed-${{ env.SEED }}
@@ -301,7 +301,7 @@ jobs:
       - if: steps.harness.outputs.present == 'true'
         run: uv run poe bench --id "${{ matrix.id }}" --profile nightly
       - if: steps.harness.outputs.present == 'true' && !cancelled()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: bench-${{ matrix.id }}-seed-${{ needs.setup.outputs.seed }}
           path: .work-tmp/bench/
