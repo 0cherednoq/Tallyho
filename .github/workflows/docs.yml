@@ -39,7 +39,7 @@ jobs:
       # Справочник API импортирует пакет вместе с адаптером flexiq и наблюдателем OpenTelemetry.
       - run: uv sync --all-extras --group docs
       - run: uv run poe docs
-      - uses: actions/upload-pages-artifact@v4
+      - uses: actions/upload-pages-artifact@v5
         with:
           path: docs/_build/html
 
