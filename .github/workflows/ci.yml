@@ -136,7 +136,7 @@ jobs:
           enable-cache: true
           python-version: "3.11"
       - run: uv sync --all-extras
-      - uses: actions/download-artifact@v5
+      - uses: actions/download-artifact@v8
         with:
           pattern: coverage-data-*
           path: coverage-data
