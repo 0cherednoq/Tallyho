@@ -82,9 +82,12 @@ async def _update_crosswise(
         await conn.execute(update(probe).where(probe.c.id == order[1]).values(v=1))
     finally:
         await conn.rollback()
-        # Опубликовать статистику backend'а сразу, а не через интервал pgstat.
-        await conn.execute(text("SELECT pg_stat_force_next_flush()"))
-        await conn.commit()
+        # PostgreSQL 15+ умеет публиковать статистику backend'а немедленно.
+        # На PostgreSQL 14 функции ещё нет: цикл ожидания ниже дождётся pgstat.
+        server_version = conn.dialect.server_version_info
+        if server_version is not None and server_version >= (15,):
+            await conn.execute(text("SELECT pg_stat_force_next_flush()"))
+            await conn.commit()
 
 
 async def test_deadlock_count_grows_after_deadlock(

@@ -87,7 +87,11 @@ class UcConfig:
     @property
     def pages(self) -> int:
         """Страниц каталога S3 (ACCEPTANCE: 50 на функциональном стенде)."""
-        return self.volume(50, floor=3)
+        # A-UC-04 проверяет фактическое перекрытие stages. При пяти страницах и
+        # 32 потоках весь pages успевает завершиться до первой cards, поэтому
+        # функциональный прогон использует заданные ACCEPTANCE 50 страниц.
+        floor = 50 if self.uc == "A-UC-04" else 3
+        return self.volume(50, floor=floor)
 
 
 @dataclass(slots=True)

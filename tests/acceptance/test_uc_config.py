@@ -27,7 +27,8 @@ def test_volume_scales_acceptance_table_with_floor(scale: float, base: int, expe
 def test_pages_and_names() -> None:
     config = UcConfig(seed=7, uc="A-UC-04")
 
-    assert config.pages == 5
+    assert config.pages == 50
     assert UcConfig(seed=7, uc="A-UC-04", scale=1.0).pages == 50
+    assert UcConfig(seed=7, uc="A-UC-05").pages == 5
     assert config.name == "a-uc-04-seed7"
     assert config.project == "tallyho-uc04-seed7"

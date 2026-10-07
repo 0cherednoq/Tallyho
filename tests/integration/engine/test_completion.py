@@ -492,6 +492,24 @@ async def test_close_right_after_commit_still_settles_complete_in(
     assert await env.count(env.tables.counter_delta) == 0
 
 
+async def test_settled_right_after_commit_delivers_complete_in(
+    env: Env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """settled() подхватывает callback внешнего COMMIT до проверки idle."""
+    pause_commit_polling(monkeypatch)
+    seeded = await seed(env, 1)
+    ref = seeded.refs[0]
+    async with open_completer(env) as completer:
+        assert (await completer.claim(ref)).run
+        async with env.transaction() as conn:
+            assert await complete_in(conn, ref, OK, completer=completer, attempt=0)
+        await asyncio.wait_for(completer.settled(), timeout=5)
+
+        assert await _state(env, ref.id) is ItemState.OK
+        assert await lease_row(env, ref.id) is None
+        assert await env.count(env.tables.counter_delta) == 0
+
+
 async def test_complete_in_expired_but_unclaimed_lease_still_owns_item(env: Env) -> None:
     seeded = await seed(env, 1)
     ref = seeded.refs[0]

@@ -201,7 +201,8 @@ jobs:
       matrix:
         uc: [A-UC-02, A-UC-01, "A-UC-04,A-UC-21,A-UC-22"]
     env:
-      SEED: ${{ github.run_number }}
+      # PR-gate должен воспроизводиться при rerun; разнообразие seed даёт nightly.
+      SEED: "5"
     steps:
       - uses: actions/checkout@v5
       - uses: astral-sh/setup-uv@v7
