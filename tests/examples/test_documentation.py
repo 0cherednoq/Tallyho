@@ -78,6 +78,7 @@ EXPECTED = {
     "guide-batches-operations",
     "guide-batches-listing",
     "guide-hooks-domain",
+    "guide-hooks-lazy-modules",
     "guide-hooks-retry",
     "guide-hooks-lease-lost",
     "guide-hooks-release",
