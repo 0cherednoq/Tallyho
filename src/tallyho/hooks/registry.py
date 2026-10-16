@@ -14,6 +14,7 @@ import importlib
 from dataclasses import dataclass
 from datetime import timedelta
 from enum import StrEnum
+from threading import RLock
 from typing import TYPE_CHECKING, Protocol, TypeVar
 
 from tallyho.model.errors import ConfigurationError, HookMissingError
@@ -101,11 +102,46 @@ _BAD_EVERY = "every у on_progress должен быть положительн�
 class HookRegistry:
     """Хуки процесса по ``kind``; один хук каждого вида на ``kind``."""
 
-    def __init__(self) -> None:
-        """Пустой реестр."""
+    _hook_modules: tuple[str, ...]
+    _hooks_installed: bool
+    _hooks_installing: bool
+    _hook_install_error: Exception | None
+    _install_lock: RLock
+
+    def __init__(self, hook_modules: Iterable[str] = ()) -> None:
+        """Создать реестр с лениво импортируемыми модулями хуков."""
+        self._hook_modules = tuple(hook_modules)
+        self._hooks_installed = False
+        self._hooks_installing = False
+        self._hook_install_error = None
+        self._install_lock = RLock()
         self._finalized: dict[str, FinalizedHook] = {}
         self._progress: dict[str, ProgressRegistration] = {}
         self._breach: dict[str, PolicyBreachHook] = {}
+
+    def install_hooks(self) -> None:
+        """Однократно импортировать настроенные модули хуков.
+
+        Повторный вход возникает штатно: импортируемый модуль обращается к
+        декораторам этого же реестра. Другие потоки дожидаются завершения
+        импорта и видят либо готовый реестр, либо ту же ошибку настройки.
+
+        """
+        with self._install_lock:
+            if self._hooks_installed or self._hooks_installing:
+                return
+            if self._hook_install_error is not None:
+                raise self._hook_install_error
+            self._hooks_installing = True
+            try:
+                import_hook_modules(self._hook_modules)
+            except Exception as exc:
+                self._hook_install_error = exc
+                raise
+            else:
+                self._hooks_installed = True
+            finally:
+                self._hooks_installing = False
 
     # --- регистрация -------------------------------------------------------
 
@@ -115,6 +151,7 @@ class HookRegistry:
         Returns:
             Декоратор, который регистрирует хук и возвращает его без изменений.
         """
+        self.install_hooks()
         self._check_new(kind, HookName.FINALIZED, registered=kind in self._finalized)
 
         def register(hook: FinalizedT) -> FinalizedT:
@@ -134,6 +171,7 @@ class HookRegistry:
             ConfigurationError: ``every`` не положительный ``timedelta``, пустой
                 ``kind`` или хук для ``kind`` уже есть.
         """
+        self.install_hooks()
         if every <= timedelta(0):
             raise ConfigurationError(_BAD_EVERY)
         self._check_new(kind, HookName.PROGRESS, registered=kind in self._progress)
@@ -151,6 +189,7 @@ class HookRegistry:
         Returns:
             Декоратор, который регистрирует хук и возвращает его без изменений.
         """
+        self.install_hooks()
         self._check_new(kind, HookName.POLICY_BREACH, registered=kind in self._breach)
 
         def register(hook: PolicyBreachT) -> PolicyBreachT:
@@ -168,6 +207,7 @@ class HookRegistry:
         Returns:
             Имена для ``th_batch.hooks`` в порядке :class:`HookName`.
         """
+        self.install_hooks()
         present = {
             HookName.FINALIZED: kind in self._finalized,
             HookName.PROGRESS: kind in self._progress,
@@ -181,6 +221,7 @@ class HookRegistry:
         Returns:
             Зарегистрированный ``on_finalized`` или ``None``.
         """
+        self.install_hooks()
         return self._finalized.get(kind)
 
     def progress(self, kind: str) -> ProgressRegistration | None:
@@ -189,6 +230,7 @@ class HookRegistry:
         Returns:
             ``on_progress`` вместе с ``every`` или ``None``.
         """
+        self.install_hooks()
         return self._progress.get(kind)
 
     def policy_breach(self, kind: str, *, root_kind: str | None = None) -> PolicyBreachHook | None:
@@ -199,6 +241,7 @@ class HookRegistry:
         Returns:
             Хук батча, иначе хук корня, иначе ``None``.
         """
+        self.install_hooks()
         hook = self._breach.get(kind)
         if hook is None and root_kind is not None:
             hook = self._breach.get(root_kind)

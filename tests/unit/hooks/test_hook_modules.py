@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+from importlib import import_module
 from typing import TYPE_CHECKING
 
 import pytest
@@ -73,3 +74,22 @@ def test_broken_dependency_is_configuration_error(module_dir: Path) -> None:
     _write(module_dir, "th_hooks_broken", "import th_hooks_no_such_dependency\n")
     with pytest.raises(ConfigurationError, match="th_hooks_broken"):
         import_hook_modules(["th_hooks_broken"])
+
+
+def test_client_module_loads_circular_hooks_lazily() -> None:
+    modules = (
+        "tests.fixtures.circular_hooks.hooks",
+        "tests.fixtures.circular_hooks.client",
+    )
+    for name in modules:
+        sys.modules.pop(name, None)
+    try:
+        client = import_module("tests.fixtures.circular_hooks.client")
+
+        assert "tests.fixtures.circular_hooks.hooks" not in sys.modules
+        assert client.th.hooks.required_hooks("circular") == ("finalized",)
+        assert "tests.fixtures.circular_hooks.hooks" in sys.modules
+        client.th.install_hooks()
+    finally:
+        for name in modules:
+            sys.modules.pop(name, None)
