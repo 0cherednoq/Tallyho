@@ -442,6 +442,8 @@ erDiagram
         int weight
         jsonb result "NULL"
         jsonb error "NULL"
+        smallint defers "число defer"
+        timestamptz first_deferred_at "NULL"
         timestamptz created_at
         timestamptz finished_at "NULL"
         int generation "поколение отправки"
@@ -455,6 +457,7 @@ erDiagram
         bytea payload "NULL"
         jsonb options "NULL, опции колбэка"
         timestamptz available_at
+        text defer_reason "NULL"
         smallint attempts
     }
     TH_LEASE {
@@ -526,7 +529,7 @@ erDiagram
 
 `th_meta(key PK, value)` хранит версию схемы (`schema_version`) и курсор сверки с DLQ брокера (`dead_letter_cursor`, UC-15); на диаграмме не показана.
 
-`th_item.generation` — **поколение отправки**: сколько раз Item возвращался в outbox после первой отправки. Растёт на 1 в той же транзакции, что вставляет новую запись outbox: возврат по истёкшему lease (sweeper), `release` после подтверждённого дубля, `close(requeue_held=True)`, claim при паузе, `retry_failed()`. Это редкие пути: первая отправка и обычное завершение колонку не трогают, индекса на ней нет, finish остаётся HOT. Relay кладёт поколение в сообщение, адаптер — в служебный маркер джобы. По нему сверка с DLQ отличает мёртвую джобу текущей отправки от джобы, после которой Item уже переотправлен (UC-15).
+`th_item.generation` — **поколение отправки**: сколько раз Item возвращался в outbox после первой отправки. Растёт на 1 в той же транзакции, что вставляет новую запись outbox: возврат по истёкшему lease (sweeper), `release` после подтверждённого дубля, `close(requeue_held=True)`, claim при паузе, `retry_failed()`, `defer()`. Это редкие пути: первая отправка и обычное завершение колонку не трогают, индекса на ней нет, finish остаётся HOT. `defer()` возвращает Item в outbox, поэтому также начинает новое поколение отправки (UC-15). Relay кладёт поколение в сообщение, адаптер — в служебный маркер джобы. По нему сверка с DLQ отличает мёртвую джобу текущей отправки от джобы, после которой Item уже переотправлен (UC-15).
 
 Доменного состояния у батча нет: колонок `status` и `data` не существует, статус и данные живут у пользователя. Есть только неизменяемый контекст корреляции — `attributes` и `memo` корня. Он хранится в side-таблице `th_batch_attr`, а не в `th_batch`: строка батча часто обновляется (состояние, `snap_seq`, `updated_at`), и каждое не-HOT обновление заново писало бы jsonb в GIN-индекс. Строка `th_batch_attr` пишется один раз в транзакции создания корня и удаляется retention вместе с деревом; для корня без атрибутов и `memo` её нет.
 
@@ -551,6 +554,7 @@ erDiagram
 | th_batch | `(parent_id) WHERE parent_id IS NOT NULL` | каскад pause/cancel, дерево | O(log n + k) |
 | th_batch | `(updated_at) WHERE state IN (open, sealed, finalizing)` | sweeper: зависшие батчи, повтор хуков | размер = активные |
 | th_batch | `(deadline_at) WHERE deadline_at IS NOT NULL AND state IN (open, sealed)` | sweeper: дедлайны | размер = активные |
+| th_batch | `(kind) WHERE state IN (open, sealed)` | `th.demand()`: активные корни и под-батчи требуемых видов | размер = активные |
 | th_batch | `(id) WHERE state IN (open, sealed) AND 'progress' = ANY(hooks)` | Snapshotter: активные батчи со снимками | размер = активные с хуком |
 | th_batch | `(finished_at) WHERE id = root_id AND finished_at IS NOT NULL AND retention IS NOT NULL AND (NOT release_required OR released_at IS NOT NULL)` | retention деревьями | размер = готовые к удалению |
 | th_batch | `(kind, id) WHERE parent_id IS NULL` | `th.list_batches(kinds=…)`: корни одного `kind`, keyset по `id DESC` | O(log n + k) |
@@ -561,6 +565,7 @@ erDiagram
 | th_item | `UNIQUE (batch_id, key) WHERE key IS NOT NULL` | дедуп spawn/add | O(log n) |
 | th_outbox | `(available_at)` | relay | размер = неотправленное |
 | th_outbox | `(batch_id, available_at)` | pause/resume/cancel/reschedule; окно `max_in_flight`: запаркованные (`∞`) и готовые записи батча | размер = неотправленное |
+| th_outbox | `(batch_id) WHERE defer_reason IS NOT NULL` | гейдж и причины `deferred`, `th.demand()`, sweeper потолка отложений | размер = отложенные сейчас |
 | th_window | PK `(item_id)`, `(batch_id)` | окно `max_in_flight`: сколько Items батча отправлено и не завершено | размер ≤ сумма окон активных батчей |
 | th_lease | PK, `(lease_until)` | claim, истёкшие lease | размер = in-flight |
 | th_lease | `(batch_id)` | `handle.in_flight()`, `in_flight` в прогрессе | размер = in-flight |
@@ -638,8 +643,9 @@ stateDiagram-v2
 
 | Производное состояние | Признак |
 |---|---|
-| queued | `state=active`, есть в `th_outbox`, `available_at ≤ now` |
-| parked | `state=active`, есть в `th_outbox`, `available_at` в будущем (start_at) или `∞` (пауза, окно `max_in_flight`) |
+| queued | `state=active`, есть в `th_outbox`, `defer_reason IS NULL`, `available_at ≤ now` |
+| parked | `state=active`, есть в `th_outbox`, `defer_reason IS NULL`, `available_at` в будущем (start_at) или `∞` (пауза, окно `max_in_flight`) |
+| deferred | `state=active`, есть в `th_outbox`, `defer_reason IS NOT NULL` |
 | dispatched | `state=active`, нет ни в outbox, ни в lease |
 | running | `state=active`, есть в `th_lease` |
 | terminal | `state ∈ {ok, skip, error, cancelled}` + `label` |
@@ -653,6 +659,8 @@ stateDiagram-v2
     queued --> dispatched : relay.dispatch
     dispatched --> running : claim (lease)
     dispatched --> parked : claim при паузе
+    running --> deferred : defer(reason, delay / until)
+    deferred --> dispatched : наступил срок, relay.dispatch
     running --> dispatched : ошибка, брокер повторит
     running --> queued : lease истёк, attempt меньше max
     running --> queued : ошибка после подтверждённого дубля, брокер не повторит
@@ -1518,7 +1526,7 @@ GROUP BY d.total, d.ok, ...;
 
 ### 9.4 Модель прогресса
 
-Прогресс батча — это `Progress` (§3.4), который собирается в Python из уже прочитанных строк счётчиков. Дополнительных запросов к БД нет, кроме `in_flight` (count по индексу `th_lease(batch_id)`).
+Прогресс батча — это `Progress` (§3.4), который собирается в Python из уже прочитанных строк счётчиков. `Progress.deferred` — гейдж числа Item, отложенных сейчас: `count(*)` по строкам `th_outbox` с `defer_reason IS NOT NULL`. Он считается как `in_flight` (гейдж по узкой side-таблице), а не через `th_counter` / `th_counter_delta`; поэтому `defer()` не пишет дельты счётчиков. `view()` / `watch()` получают `deferred` и разбивку по причинам одним `GROUP BY` по частичному индексу `th_outbox(batch_id) WHERE defer_reason IS NOT NULL`, рядом с запросом `in_flight` по `th_lease(batch_id)`.
 
 **Ожидаемый итог (`expected`)** — по правилам, от точного к оценке:
 
@@ -1664,9 +1672,9 @@ await th.migrate()  # или ревизия Alembic: upgrade(..., version=1)
 |---|---|
 | Батч | `th.batch(kind, key=, seal=, start_at=, on_succeeded=, on_completed_with_errors=, on_failed=, on_cancelled=, on_finalized_task=, failure_policy=, max_in_flight=, expected_total=, max_items=, deadline=, retention=, release_required=, attributes=, memo=, session=)` → `BatchBuilder`: `add`, `map`, `add_calls`, `sub_batch`, `expect`, `seal` |
 | Под-батч / этап | `builder.sub_batch(key, fed_by=[...], on_feeder_failed="seal" или "cancel", max_in_flight=, max_depth=, expected_total=, failure_policy=, on_...=)` — те же параметры, что у батча, плюс `kind=`, кроме `retention`/`release_required`/`max_items`/`attributes`/`memo` (задаются только у корня) и `seal`/`session` (действуют на весь builder корня) |
-| Поиск | `th.handle(batch_id)`, `th.find(kind, key)`, `handle.child(key)`, `th.list_batches(kinds=, states=, attributes=, created_after=, created_before=, limit=, cursor=)` → `BatchPage` |
-| Handle | `view`, `watch`, `wait`, `in_flight(limit=)`, `reschedule`, `pause`, `resume`, `cancel`, `retry_failed(labels=)`, `retry_finalize`, `release`, `items(states=, labels=)` |
-| Задача | `from tallyho import item`: `item.id()`, `spawn(fn, *args, **kwargs)`, `spawn(fn, *args, into=, key=)`, `spawn_call(call, into=)`, `sub_batch(key, kind=, start_at=, deadline=, failure_policy=, max_in_flight=, expected_total=, max_depth=, on_...=)`, `expect(n, into=)`, `progress(done, total)`, `incr`, `ok(label=, result=)`, `skip(label)`, `error(label, detail=)`, `complete_in(session)`, `cancelled()`, `current()` |
+| Поиск | `th.handle(batch_id)`, `th.find(kind, key)`, `handle.child(key)`, `th.list_batches(kinds=, states=, attributes=, created_after=, created_before=, limit=, cursor=)` → `BatchPage`; `th.demand(kinds, attributes=, limit=)` → `list[BatchDemand]` |
+| Handle | `view`, `watch`, `wait`, `in_flight(limit=)`, `reschedule`, `pause`, `resume`, `set_max_in_flight(limit, session=, reason=)`, `clear_max_in_flight()`, `cancel`, `retry_failed(labels=)`, `retry_finalize`, `release`, `items(states=, labels=)` |
+| Задача | `from tallyho import item`: `item.id()`, `spawn(fn, *args, **kwargs)`, `spawn(fn, *args, into=, key=)`, `spawn_call(call, into=)`, `sub_batch(key, kind=, start_at=, deadline=, failure_policy=, max_in_flight=, expected_total=, max_depth=, on_...=)`, `expect(n, into=)`, `progress(done, total)`, `incr`, `defer(reason=, delay=, until=)`, `ok(label=, result=)`, `skip(label)`, `error(label, detail=)`, `complete_in(session)`, `cancelled()`, `current()` |
 | Колбэк | `from tallyho import callback`: `callback.current()` → `CallbackContext(callback_id, batch_id)`; `None` вне колбэк-задачи |
 | Вызовы | `th.call(fn, *args, **kwargs).opts(key=, weight=, queue=)` — типизировано через `ParamSpec` |
 | Tx-хуки | `@th.on_finalized(kind)`, `@th.on_progress(kind, every=)`, `@th.on_policy_breach(kind)` |
@@ -1680,9 +1688,11 @@ await th.migrate()  # или ревизия Alembic: upgrade(..., version=1)
 
 **Потоковое добавление.** `th.batch(..., seal=False)`: выход из `async with` коммитит добавленное, но не закрывает ни корень, ни под-батчи этого builder. Следующий вход с тем же `(kind, key)` находит открытый батч и добавляет в него в новой транзакции; закрывает батч вход без `seal=False` или явный `await builder.seal()`. Сценарий и правила — UC-02.
 
-`max_in_flight` действует **на этот экземпляр батча**. Глобальный лимит на тип задачи для всех батчей сразу — это забота брокера (flexiq `max_concurrent`, `rate_limit`). Это разделение важно: у Airflow `max_active_tis_per_dag` неожиданно действует на все запуски.
+`max_in_flight` действует **на этот экземпляр батча**. `NULL` означает, что окна нет, `0` — окно закрыто: новая работа паркуется, а уже выполняющаяся заканчивает работу. Пауза и окно независимы: `resume()` не снимает окно, изменение окна не снимает паузу. `BatchHandle.set_max_in_flight(limit, *, session=None, reason=None)` принимает абсолютное значение `limit >= 0` и идемпотентен; `clear_max_in_flight()` отдельно возвращает `NULL`. При `session=` изменение через `set_max_in_flight` входит в транзакцию вызывающего, а пинок relay выполняется после commit; `reason` сохраняется в `th_batch.options` для наблюдаемости. Глобальный лимит на тип задачи для всех батчей сразу — это забота брокера (flexiq `max_concurrent`, `rate_limit`). Это разделение важно: у Airflow `max_active_tis_per_dag` неожиданно действует на все запуски.
 
-Окно считается по узкой таблице `th_window`: relay при захвате записи outbox вставляет строку `(item_id, batch_id)`, завершение Item её удаляет и возвращает в очередь столько запаркованных записей батча, сколько мест освободилось. Захват по батчу с окном сериализуется `pg_try_advisory_xact_lock`: занятый батч relay пропускает до следующего прохода. Записи сверх окна паркуются (`available_at = ∞`), scan relay страхует возврат мест. Строка окна ключом по `item_id`, поэтому повторный захват после падения relay место не удваивает.
+Окно считается по узкой таблице `th_window`: relay при захвате записи outbox вставляет строку `(item_id, batch_id)`, завершение Item её удаляет и возвращает в очередь столько запаркованных записей батча, сколько мест освободилось. Любая распарковка учитывает текущее свободное место и `paused_at`; при окне `0` она не выпускает ничего. Захват по батчу с окном сериализуется `pg_try_advisory_xact_lock`: занятый батч relay пропускает до следующего прохода. Записи сверх окна паркуются (`available_at = ∞`), scan relay страхует возврат мест. Строка окна ключом по `item_id`, поэтому повторный захват после падения relay место не удваивает.
+
+`th.demand(kinds, *, attributes=None, limit=1000)` возвращает активные (`open` / `sealed`) корни и под-батчи указанных видов как `BatchDemand`: `id`, `kind`, `key`, атрибуты корня, `pending`, `in_flight`, `deferred`, `max_in_flight`, `paused`, `truncated`. `kinds` обязателен; `attributes` фильтрует по неизменяемым атрибутам корня, в том числе для под-батчей. Значения `pending` учитывают несвёрнутые `th_counter_delta`, `in_flight` читается из `th_lease`, `deferred` — из `th_outbox`; один составной запрос с `LATERAL` имеет фиксированное число SQL-запросов, но стоимость O(активные батчи × слоты счётчиков). Упор в `limit` отмечается флагом `truncated`.
 
 `item.complete_in(session)` бросает `LeaseLostError`, если попытка больше не владеет Item (UC-08). Вне отслеживаемой задачи это no-op, как и остальные методы `item`, кроме `sub_batch`: он возвращает builder и вне задачи бросает `ConfigurationError`.
 
