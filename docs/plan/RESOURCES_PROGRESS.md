@@ -6,7 +6,7 @@
 ## Текущее состояние
 
 * **Ветка:** `docs/resource-management-plan` (план), код — по протоколу PLAN.md §0
-* **Текущая волна:** — (набор не начат)
+* **Текущая волна:** 1 — RM0.1, RM0.2, RM3.1, RM5.1
 * **Последний зелёный коммит:** c45df64 (до начала работ)
 * **Готово:** 0 из 12
 
@@ -14,17 +14,17 @@
 
 | ID | Задача | Зависит | Статус | Коммиты |
 |---|---|---|---|---|
-| RM0.1 | relay: развести `NULL` и `0` в арифметике окна | — | todo | |
-| RM0.2 | ARCHITECTURE и COUNTERS под `defer` и окно 0 | — | todo | |
+| RM0.1 | relay: развести `NULL` и `0` в арифметике окна | — | in_progress | |
+| RM0.2 | ARCHITECTURE и COUNTERS под `defer` и окно 0 | — | in_progress | |
 | RM1.1 | `set_max_in_flight` / `clear_max_in_flight`, ноль разрешён | RM0.1, RM0.2 | todo | |
 | RM1.2 | Окно-aware распарковка (`resume` и relay) | RM1.1 | todo | |
 | RM2.1 | Миграция: `defer_reason`, `defers`, `first_deferred_at`, индекс | RM0.2 | todo | |
 | RM2.2 | `item.defer()`: API и транзакция | RM2.1, RM1.1 | todo | |
 | RM2.3 | Потолки `max_defers` / `max_deferred_for` + sweeper | RM2.2 | todo | |
 | RM2.4 | `Progress.deferred`, `deferred_reasons`, событие | RM2.2 | todo | |
-| RM3.1 | Ленивый импорт `hook_modules` + `install_hooks()` | — | todo | |
+| RM3.1 | Ленивый импорт `hook_modules` + `install_hooks()` | — | in_progress | |
 | RM4.1 | `th.demand()` и `BatchDemand` | RM0.2, RM2.1 | todo | |
-| RM5.1 | Решение «подпул = батч» вместо `requires=` (только документы) | — | todo | |
+| RM5.1 | Решение «подпул = батч» вместо `requires=` (только документы) | — | in_progress | |
 | RM6.1 | `deadline_mode="active"` | RM1.1 | todo | |
 | RM7.1 | Приёмка A-RM: 0 сгоревших ретраев | RM1.2, RM2.3, RM2.4, RM4.1 | todo | |
 
