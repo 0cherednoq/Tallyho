@@ -14,7 +14,7 @@ from tallyho.engine.public import (
     create_engine_facade,
     load_worker_factory,
 )
-from tallyho.hooks.registry import HookRegistry, import_hook_modules
+from tallyho.hooks.registry import HookRegistry
 from tallyho.model.attributes import AttributeLimits, normalize_attributes, normalize_memo
 from tallyho.model.errors import ConfigurationError
 from tallyho.model.policy import FailurePolicy as FailurePolicyModel
@@ -248,7 +248,7 @@ class Tallyho:
         self.id_factory = id_factory or UuidV7Factory()
         self.observer = observer or NullObserver()
         self.serializer = serializer
-        self.hooks = HookRegistry()
+        self.hooks = HookRegistry(self.hook_modules)
         self._adapter: Dispatcher | None = None
         self._installed = False
         self._engine: EngineFacade = create_engine_facade(
@@ -262,7 +262,16 @@ class Tallyho:
             hooks=self.hooks,
             settings=self.settings.engine_settings(),
         )
-        import_hook_modules(self.hook_modules)
+
+    def install_hooks(self) -> None:
+        """Сразу импортировать ``hook_modules`` и проверить конфигурацию.
+
+        Без явного вызова модули загружаются лениво при первом обращении к
+        реестру хуков. На старте приложения этот метод позволяет обнаружить
+        неверное имя модуля до обработки работы.
+
+        """
+        self.hooks.install_hooks()
 
     def install(self, adapter: Dispatcher | None) -> None:
         """Связать producer/worker/maintenance с broker adapter.

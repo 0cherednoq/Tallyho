@@ -697,6 +697,37 @@ finally:
     await th.aclose()
 ```
 
+## guide-hooks-lazy-modules
+
+Страница: `docs/guide/hooks.md`.
+
+<!-- tallyho-example: guide-hooks-lazy-modules -->
+```python
+import asyncio
+import sys
+from importlib import import_module
+
+modules = (
+    "tests.fixtures.circular_hooks.hooks",
+    "tests.fixtures.circular_hooks.client",
+)
+for name in modules:
+    sys.modules.pop(name, None)
+
+try:
+    client = import_module("tests.fixtures.circular_hooks.client")
+    assert "tests.fixtures.circular_hooks.hooks" not in sys.modules
+
+    # Fail-fast вызывается уже после присваивания th в модуле клиента.
+    client.th.install_hooks()
+    assert client.th.hooks.required_hooks("circular") == ("finalized",)
+finally:
+    for name in modules:
+        sys.modules.pop(name, None)
+
+await asyncio.sleep(0)
+```
+
 ## guide-hooks-domain
 
 Страница: `docs/guide/hooks.md`.

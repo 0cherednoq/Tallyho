@@ -69,6 +69,16 @@ def _client() -> Tallyho:
     return Tallyho(engine)
 
 
+def test_hook_modules_are_lazy_and_install_hooks_is_fail_fast() -> None:
+    engine = cast("AsyncEngine", cast("object", FakeEngine()))
+    client = Tallyho(engine, hook_modules=["tallyho_hook_module_does_not_exist"])
+
+    with pytest.raises(ConfigurationError, match="tallyho_hook_module_does_not_exist"):
+        client.install_hooks()
+    with pytest.raises(ConfigurationError, match="tallyho_hook_module_does_not_exist"):
+        client.hooks.required_hooks("unused")
+
+
 def test_defaults_match_architecture_table() -> None:
     value = Settings()
     expected = {
