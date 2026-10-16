@@ -642,7 +642,13 @@ class Relay:
                 )
             )
         )
-        room = (rows[0].max_in_flight or 0) - used
+        limit = rows[0].max_in_flight
+        if limit is None:
+            # Защитная ветка: отсутствие окна не ограничивает отправку. Обычно
+            # такие строки отсеиваются до _fit_window, но NULL нельзя смешивать
+            # с закрытым окном 0 в арифметике.
+            return rows, []
+        room = limit - used
         allowed: list[_Row] = []
         fresh: list[_Row] = []
         for row in rows:
@@ -835,7 +841,7 @@ async def refill_window(conn: AsyncConnection, tables: Tables) -> int:
     )
     room: Counter[UUID] = Counter()
     for batch_id, max_in_flight in candidates:
-        limit = max_in_flight or 0
+        limit = max_in_flight
         in_window = await _bounded_count(
             conn,
             tables.window.c.batch_id == batch_id,

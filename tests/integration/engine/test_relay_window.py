@@ -75,6 +75,38 @@ async def test_window_limits_dispatch_and_parks_rest(rel: RelayEnv) -> None:
     assert (await rel.env.counters(batch_id)).dispatched == 3
 
 
+async def test_missing_window_dispatches_every_item_without_parking(rel: RelayEnv) -> None:
+    async with rel.env.transaction() as conn:
+        root = await rel.producer.create_root(conn, RootSpec(kind="unlimited"))
+        _ = await rel.producer.add_items(
+            conn, root.id, [TaskCall(task_name="render", args=(i,)) for i in range(10)]
+        )
+    rel.clock.advance(GRACE)
+
+    assert await rel.relay.scan_once() == 10
+    assert await rel.window_size(root.id) == 0
+    assert await parked(rel, root.id) == 0
+
+
+async def test_zero_window_parks_every_item(rel: RelayEnv) -> None:
+    async with rel.env.transaction() as conn:
+        root = await rel.producer.create_root(conn, RootSpec(kind="closed"))
+        _ = await rel.producer.add_items(
+            conn, root.id, [TaskCall(task_name="render", args=(i,)) for i in range(5)]
+        )
+        _ = await conn.execute(
+            update(rel.tables.batch).where(rel.tables.batch.c.id == root.id).values(max_in_flight=0)
+        )
+    rel.clock.advance(GRACE)
+
+    assert await rel.relay.scan_once() == 0
+    assert await rel.window_size(root.id) == 0
+    assert await parked(rel, root.id) == 5
+    async with rel.env.transaction() as conn:
+        assert await refill_window(conn, rel.tables) == 0
+    assert await parked(rel, root.id) == 5
+
+
 async def test_at_most_max_in_flight_at_any_time(rel: RelayEnv) -> None:
     batch_id = await add_windowed(rel, 10)
     finished: list[UUID] = []
