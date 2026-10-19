@@ -6,9 +6,9 @@
 ## Текущее состояние
 
 * **Ветка:** `docs/resource-management-plan` (план), код — по протоколу PLAN.md §0
-* **Текущая волна:** 2 — RM1.1, RM2.1
-* **Последний зелёный коммит:** 84a8689
-* **Готово:** 4 из 12
+* **Текущая волна:** 2 — RM1.1 готова, идёт RM2.1
+* **Последний зелёный коммит:** cc563cd
+* **Готово:** 5 из 12
 
 ## Задачи
 
@@ -16,9 +16,9 @@
 |---|---|---|---|---|
 | RM0.1 | relay: развести `NULL` и `0` в арифметике окна | — | done | 249e436 |
 | RM0.2 | ARCHITECTURE и COUNTERS под `defer` и окно 0 | — | done | 7daa67a, 12edbad |
-| RM1.1 | `set_max_in_flight` / `clear_max_in_flight`, ноль разрешён | RM0.1, RM0.2 | in_progress | |
+| RM1.1 | `set_max_in_flight` / `clear_max_in_flight`, ноль разрешён | RM0.1, RM0.2 | done | 0efe1db, cc563cd |
 | RM1.2 | Окно-aware распарковка (`resume` и relay) | RM1.1 | todo | |
-| RM2.1 | Миграция: `defer_reason`, `defers`, `first_deferred_at`, индекс | RM0.2 | todo | |
+| RM2.1 | Миграция: `defer_reason`, `defers`, `first_deferred_at`, индекс | RM0.2 | in_progress | |
 | RM2.2 | `item.defer()`: API и транзакция | RM2.1, RM1.1 | todo | |
 | RM2.3 | Потолки `max_defers` / `max_deferred_for` + sweeper | RM2.2 | todo | |
 | RM2.4 | `Progress.deferred`, `deferred_reasons`, событие | RM2.2 | todo | |
@@ -57,6 +57,25 @@
 - Отклонения от плана/доков: … (или «нет»)
 - Узнали / на что обратить внимание дальше: …
 -->
+
+### 2026-10-19 · RM1.1 · done · 0efe1db, cc563cd
+- Сделано: `max_in_flight = 0` разрешён в спеках корня и под-батча;
+  `Operations.set_max_in_flight` ставит абсолютное значение (``None`` снимает окно),
+  пишет `reason` в `th_batch.options`, не трогает паузу и пинает relay после commit;
+  `BatchHandle.set_max_in_flight` / `clear_max_in_flight` и метод фасада;
+  `refill_window` получил фильтр по батчам и трактует батч без окна как неограниченный.
+- Отклонения от плана/доков: `clear_max_in_flight` принимает ещё и `reason=`
+  (в ARCHITECTURE §11.2 указан без аргументов) — расширение, а не изменение семантики.
+  На уровне engine одна операция `set_max_in_flight(limit | None)`, два метода — только
+  в публичном API, чтобы «окна нет» нельзя было передать как число.
+- Узнали / на что обратить внимание дальше: `resume()` по-прежнему распарковывает всё
+  мимо окна — это ровно RM1.2; инвариант `count(th_window) <= max_in_flight` держится
+  только потому, что окно применяется при захвате (`_fit_window`).
+  `uv run poe test-all` на testcontainers пересоздаёт контейнер по ходу прогона и идёт
+  часами; на долгоживущей базе через `TALLYHO_TEST_DSN` и `-n 8` — 39 минут,
+  2327 passed, покрытие 97,59%. Два падения под `-n 8`
+  (`test_a_fq_12_...compose`, краш воркера на `test_finalizer`) по отдельности зелёные:
+  артефакты параллельного прогона.
 
 ### 2026-10-16 · RM5.1 · done · 642828c, 84a8689
 - Сделано: решение «подпул = отдельный батч» закреплено в ARCHITECTURE §16 и
