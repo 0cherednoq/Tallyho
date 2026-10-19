@@ -3024,7 +3024,7 @@ wheels = [
 
 [[package]]
 name = "tallyho"
-version = "0.0.1"
+version = "0.0.2a1"
 source = { editable = "." }
 dependencies = [
     { name = "sqlalchemy", extra = ["asyncio"] },

@@ -12,7 +12,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "tallyho"
-version = "0.0.1"
+version = "0.0.2a1"
 description = "Batch accounting, dynamic fan-out and stage pipelines on top of any task broker, backed by PostgreSQL."
 readme = "README.md"
 requires-python = ">=3.11"

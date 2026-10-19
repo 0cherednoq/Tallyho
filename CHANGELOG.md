@@ -50,6 +50,20 @@
   attributes=, created_after=, created_before=, limit=, cursor=)`.
 - Чтение задач батча `handle.items(states=, labels=)`.
 
+**Управление ограниченными ресурсами**
+
+- `BatchHandle.set_max_in_flight(limit, session=, reason=)` и `clear_max_in_flight()`: окно
+  параллелизма меняется на ходу; `0` — закрытое окно (новая работа ждёт, текущая доделывается),
+  независимо от паузы.
+- `item.defer(reason=, delay=, until=)`: отложить Item без траты попытки — возврат в очередь со
+  сроком, без ретрая и DLQ; потолки батча `max_defers` / `max_deferred_for` с итогом
+  `error("deferred_too_long")` и проходом sweeper для закрытого окна.
+- `deadline_mode="active"`: дедлайн не течёт, пока батч стоит без работы (пауза или окно `0`).
+- `th.demand(kinds, attributes=, limit=)` → `BatchDemand`: дешёвое чтение спроса активных батчей
+  (`pending`, `in_flight`, `deferred`, `max_in_flight`, `paused`) одним запросом.
+- Наблюдаемость отложений: `Progress.deferred`, `BatchView.deferred_reasons`, событие
+  `Observer.item_deferred`.
+
 **Интеграция с доменными таблицами**
 
 - Транзакционные хуки `@th.on_finalized(kind)`, `@th.on_progress(kind, every=)`,
