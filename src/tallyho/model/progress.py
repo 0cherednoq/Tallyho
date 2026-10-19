@@ -198,6 +198,7 @@ class NodeCounters:
     duplicates: int = 0
     skipped_by_limit: int = 0
     in_flight: int = 0
+    deferred: int = 0
     expected_total: int | None = None
     fed_by: tuple[UUID, ...] = field(default=())
 
@@ -405,6 +406,7 @@ class _Tree:
             found=node.total,
             queued=max(pending - node.in_flight, 0),
             in_flight=node.in_flight,
+            deferred=node.deferred,
             ok=node.ok,
             skip=node.skip,
             error=node.error,

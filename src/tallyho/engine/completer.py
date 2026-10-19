@@ -511,6 +511,10 @@ class _Applied:
     """Операция defer, применённая к Item: другие defer того же Item в пачке — ``False``."""
     deferred: set[UUID] = field(default_factory=set["UUID"])
     """Items, которые defer вернул в outbox (``item.defer``)."""
+    defer_events: list[tuple[UUID, UUID, str, datetime | None]] = field(
+        default_factory=list[tuple["UUID", "UUID", str, "datetime | None"]]
+    )
+    """``(batch_id, item_id, reason, until)`` отложенных Items — для Observer."""
     defer_handled: set[UUID] = field(default_factory=set["UUID"])
     """Items, обработанные defer: отложены или завершены по исчерпанному потолку."""
     requeued: set[UUID] = field(default_factory=set["UUID"])
@@ -1232,6 +1236,7 @@ class _Tx:
                 # Запись уже в outbox (дубль доставки до relay DELETE): defer не повторяем.
                 continue
             deferred.append(item_id)
+            self.applied.defer_events.append((row.batch_id, item_id, spec.reason, spec.until))
             # Item покинул брокера: окно max_in_flight считает dispatched - done.
             self.deltas[row.batch_id] += CounterDelta(dispatched=-1)
         if over_limit:
@@ -2415,33 +2420,36 @@ class Completer:
     def _notify(self, items: int, duration: float, applied: _Applied) -> None:
         # Исключение наблюдателя не должно ломать учёт: только лог.
         try:
-            self.observer.completer_flush(items=items, duration=duration)
-            for batch_id, kind in applied.created:
-                self.observer.batch_created(batch_id=batch_id, kind=kind)
-            for batch_id, item_id, attempt in applied.claimed:
-                self.observer.item_claimed(
-                    batch_id=batch_id,
-                    item_id=item_id,
-                    attempt=attempt,
-                )
-            for batch_id, item_id, attempt in applied.cancelled:
-                self.observer.item_finished(
-                    batch_id=batch_id,
-                    item_id=item_id,
-                    result=ResultClass.CANCELLED,
-                    label=CANCELLED_LABEL,
-                    attempt=attempt,
-                )
-            for item_id, (batch_id, value, attempt) in applied.finished.items():
-                self.observer.item_finished(
-                    batch_id=batch_id,
-                    item_id=item_id,
-                    result=value.result_class,
-                    label=value.effective_label,
-                    attempt=attempt,
-                )
+            self._emit(items, duration, applied)
         except Exception:  # ruff: ignore[blind-except]  # сбой наблюдателя не влияет на учёт
             _log.exception("Observer упал на событии Completer")
+
+    def _emit(self, items: int, duration: float, applied: _Applied) -> None:
+        self.observer.completer_flush(items=items, duration=duration)
+        for batch_id, kind in applied.created:
+            self.observer.batch_created(batch_id=batch_id, kind=kind)
+        for batch_id, item_id, attempt in applied.claimed:
+            self.observer.item_claimed(batch_id=batch_id, item_id=item_id, attempt=attempt)
+        for batch_id, item_id, attempt in applied.cancelled:
+            self.observer.item_finished(
+                batch_id=batch_id,
+                item_id=item_id,
+                result=ResultClass.CANCELLED,
+                label=CANCELLED_LABEL,
+                attempt=attempt,
+            )
+        for item_id, (batch_id, value, attempt) in applied.finished.items():
+            self.observer.item_finished(
+                batch_id=batch_id,
+                item_id=item_id,
+                result=value.result_class,
+                label=value.effective_label,
+                attempt=attempt,
+            )
+        for batch_id, item_id, reason, until in applied.defer_events:
+            self.observer.item_deferred(
+                batch_id=batch_id, item_id=item_id, reason=reason, until=until
+            )
 
     def _notify_buffer(self) -> None:
         try:

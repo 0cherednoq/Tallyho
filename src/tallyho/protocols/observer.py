@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Protocol, runtime_checkable
 from typing_extensions import override
 
 if TYPE_CHECKING:
+    from datetime import datetime
     from uuid import UUID
 
     from tallyho.model.states import BatchState, ResultClass
@@ -33,6 +34,19 @@ class Observer(Protocol):
 
     def item_claimed(self, *, batch_id: UUID, item_id: UUID, attempt: int) -> None:
         """An Item lease was acquired and its transaction committed."""
+        ...
+
+    def item_deferred(
+        self, *, batch_id: UUID, item_id: UUID, reason: str, until: datetime | None
+    ) -> None:
+        """Item отложен ``item.defer`` (после commit).
+
+        Args:
+            batch_id: батч Item.
+            item_id: отложенный Item.
+            reason: причина отложения (``defer_reason``).
+            until: абсолютный срок возврата, если он известен.
+        """
         ...
 
     def item_finished(
@@ -183,4 +197,10 @@ class NullObserver(Observer):
 
     @override
     def item_claimed(self, *, batch_id: UUID, item_id: UUID, attempt: int) -> None:
+        return None
+
+    @override
+    def item_deferred(
+        self, *, batch_id: UUID, item_id: UUID, reason: str, until: datetime | None
+    ) -> None:
         return None

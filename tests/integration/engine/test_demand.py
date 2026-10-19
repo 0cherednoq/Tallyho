@@ -194,3 +194,28 @@ async def test_demand_requires_kinds(env: Env) -> None:
         _ = await reader(env).demand("mail")  # строка вместо коллекции
     with pytest.raises(ConfigurationError, match="limit"):
         _ = await reader(env).demand(["mail"], limit=0)
+
+
+async def test_view_shows_deferred_gauge_and_reasons(env: Env) -> None:
+    root_id = await make_root(env, "mail", "v:1", items=5)
+    outbox = env.tables.outbox
+    item = env.tables.item
+    async with env.transaction() as conn:
+        ids = list(await conn.scalars(item.select().with_only_columns(item.c.id)))
+        _ = await conn.execute(
+            update(outbox).where(outbox.c.item_id.in_(ids[:2])).values(defer_reason="нет кредитов")
+        )
+        _ = await conn.execute(
+            update(outbox).where(outbox.c.item_id == ids[2]).values(defer_reason="нет слотов")
+        )
+    view = await reader(env).view(root_id)
+    assert view.progress.deferred == 3
+    assert view.deferred_reasons == {"нет кредитов": 2, "нет слотов": 1}
+
+
+async def test_view_adds_at_most_one_statement_for_deferred(env: Env) -> None:
+    # deferred и deferred_reasons читаются тем же запросом дерева, что и прогресс.
+    plain = await make_root(env, "mail", "v:2", items=1)
+    with selects_of(env) as statements:
+        _ = await reader(env).view(plain)
+    assert len(statements) == 1

@@ -6,10 +6,12 @@ from datetime import timedelta
 from typing import TYPE_CHECKING
 
 from sqlalchemy import delete, func, insert, select, text, update
+from typing_extensions import override
 
 from tallyho.engine.operations import Operations
 from tallyho.model.states import ItemState, OutboxKind
 from tallyho.protocols.clock import SystemClock
+from tallyho.protocols.observer import NullObserver
 from tests.integration.engine.completer_env import (
     NOW,
     RecordingRelay,
@@ -255,3 +257,23 @@ async def test_no_ceilings_defers_without_limit(env: Env) -> None:
     # Без потолков Item остаётся активным и просто откладывается снова.
     assert ItemState(row["state"]) is ItemState.ACTIVE
     assert row["defers"] == 1001
+
+
+async def test_defer_emits_observer_event(env: Env) -> None:
+    events: list[tuple[UUID, str, object]] = []
+
+    class _Observer(NullObserver):
+        @override
+        def item_deferred(
+            self, *, batch_id: UUID, item_id: UUID, reason: str, until: object
+        ) -> None:
+            del batch_id
+            events.append((item_id, reason, until))
+
+    seeded = await seed(env, 1)
+    ref = seeded.refs[0]
+    moment = NOW + timedelta(minutes=30)
+    async with open_completer(env, observer=_Observer()) as completer:
+        claim = await completer.claim(ref)
+        assert await completer.defer(ref, reason=REASON, until=moment, attempt=claim.attempt)
+    assert events == [(ref.id, REASON, moment)]

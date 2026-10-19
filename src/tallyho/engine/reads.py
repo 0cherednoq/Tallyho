@@ -146,6 +146,7 @@ class _Node:
     counters: NodeCounters
     labels: Mapping[str, int]
     metrics: Mapping[str, int]
+    deferred_reasons: Mapping[str, int]
     attributes: Mapping[str, AttributeValue]
     memo: Mapping[str, object] | None
 
@@ -221,6 +222,7 @@ class Reads:
                 progress=progress[node.id],
                 labels=node.labels,
                 metrics=node.metrics,
+                deferred_reasons=node.deferred_reasons,
                 children={
                     child.key or str(child.id): build(child) for child in children.get(node.id, ())
                 },
@@ -598,7 +600,9 @@ class Reads:
             return []
         return [_node(row) for row in rows]
 
-    def _forest_statement(self, batch_ids: list[UUID]) -> Select[tuple[object]]:
+    def _forest_statement(  # ruff: ignore[too-many-locals]  # один запрос дерева: коррелированные подзапросы счётчиков, in_flight, deferred, метрик
+        self, batch_ids: list[UUID]
+    ) -> Select[tuple[object]]:
         batch = self.tables.batch
         counter = self.tables.counter
         delta = self.tables.counter_delta
@@ -638,6 +642,22 @@ class Reads:
             .scalar_subquery()
         )
         in_flight = select(func.count()).where(lease.c.batch_id == batch.c.id).scalar_subquery()
+        outbox = self.tables.outbox
+        deferred = (
+            select(func.count())
+            .where(outbox.c.batch_id == batch.c.id, outbox.c.defer_reason.is_not(None))
+            .scalar_subquery()
+        )
+        reason_totals = (
+            select(outbox.c.defer_reason.label("reason"), func.count().label("total"))
+            .where(outbox.c.batch_id == batch.c.id, outbox.c.defer_reason.is_not(None))
+            .group_by(outbox.c.defer_reason)
+            .correlate(batch)
+            .subquery()
+        )
+        deferred_reasons = select(
+            func.jsonb_object_agg(reason_totals.c.reason, reason_totals.c.total)
+        ).scalar_subquery()
         statement = (
             select(
                 batch,
@@ -657,6 +677,8 @@ class Reads:
                     counter_sum(counter.c.skipped_by_limit) + delta_sum(delta.c.d_skipped_by_limit)
                 ).label("skipped_by_limit"),
                 in_flight.label("in_flight"),
+                deferred.label("deferred"),
+                deferred_reasons.label("deferred_reasons"),
                 values.label("values"),
                 feeds.label("fed_by"),
                 # Строка есть только у корня с атрибутами: остальные узлы берут их у него.
@@ -726,14 +748,32 @@ def _node(row: RowMapping) -> _Node:
             duplicates=cast("int", row["duplicates"]),
             skipped_by_limit=cast("int", row["skipped_by_limit"]),
             in_flight=cast("int", row["in_flight"]),
+            deferred=cast("int", row["deferred"]),
             expected_total=cast("int | None", row["expected_total"]),
             fed_by=fed_by,
         ),
         labels=labels,
         metrics=metrics,
+        deferred_reasons=_reason_counts(cast("object", row["deferred_reasons"])),
         attributes=attributes_from_json(cast("object", row["attributes"])),
         memo=memo_from_json(cast("object", row["memo"])),
     )
+
+
+def _reason_counts(value: object) -> Mapping[str, int]:
+    """Разбивка отложений по причинам из jsonb-агрегата.
+
+    Returns:
+        Число Items по каждой причине ``defer_reason``.
+    """
+    if not isinstance(value, dict):
+        return {}
+    raw = cast("dict[object, object]", value)
+    return {
+        str(reason): count
+        for reason, count in raw.items()
+        if isinstance(count, int) and not isinstance(count, bool)
+    }
 
 
 def _roots(nodes: list[_Node]) -> Mapping[UUID, _Node]:

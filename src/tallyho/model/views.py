@@ -68,6 +68,7 @@ class Progress:
     found: int = 0
     queued: int = 0
     in_flight: int = 0
+    deferred: int = 0
     ok: int = 0
     skip: int = 0
     error: int = 0
@@ -142,6 +143,7 @@ class BatchView:
     labels: Mapping[str, int]
     metrics: Mapping[str, int]
     children: Mapping[str, BatchView]
+    deferred_reasons: Mapping[str, int] = field(default_factory=dict[str, int])
     reason: CancelReason | None = None
     paused_at: datetime | None = None
     cancel_requested_at: datetime | None = None
@@ -158,6 +160,7 @@ class BatchView:
         """Заморозить словари (у ``memo`` — верхний уровень)."""
         object.__setattr__(self, "labels", _freeze(self.labels))
         object.__setattr__(self, "metrics", _freeze(self.metrics))
+        object.__setattr__(self, "deferred_reasons", _freeze(self.deferred_reasons))
         object.__setattr__(self, "children", _freeze(self.children))
         object.__setattr__(self, "attributes", _freeze(self.attributes))
         if self.memo is not None:
