@@ -110,7 +110,9 @@ th_counter_delta (id, batch_id, d_total, d_succeeded, d_failed, d_cancelled)  in
 Для `defer` новых колонок ни в `th_counter`, ни в `th_counter_delta` нет.
 «Отложено сейчас» — гейдж по строкам `th_outbox`, у которых
 `defer_reason IS NOT NULL`, как `in_flight` — гейдж по `th_lease`. Сам `defer`
-оставляет Item активным, не меняет `attempt` и не пишет дельту завершения.
+оставляет Item активным, не меняет `attempt` и не пишет дельту завершения:
+единственная его дельта — `dispatched -= 1`, как у любого возврата Item в outbox,
+потому что relay увеличит `dispatched` снова при следующей отправке.
 Поэтому групповой commit ниже и горячие строки счётчиков не получают ещё один
 вид обновления; кумулятивные `defers` и `first_deferred_at` хранятся в
 неиндексируемых колонках `th_item`, а не в счётчиках прогресса.

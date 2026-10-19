@@ -1527,7 +1527,7 @@ GROUP BY d.total, d.ok, ...;
 
 ### 9.4 Модель прогресса
 
-Прогресс батча — это `Progress` (§3.4), который собирается в Python из уже прочитанных строк счётчиков. `Progress.deferred` — гейдж числа Item, отложенных сейчас: `count(*)` по строкам `th_outbox` с `defer_reason IS NOT NULL`. Он считается как `in_flight` (гейдж по узкой side-таблице), а не через `th_counter` / `th_counter_delta`; поэтому `defer()` не пишет дельты счётчиков. `view()` / `watch()` получают `deferred` и разбивку по причинам одним `GROUP BY` по частичному индексу `th_outbox(batch_id) WHERE defer_reason IS NOT NULL`, рядом с запросом `in_flight` по `th_lease(batch_id)`.
+Прогресс батча — это `Progress` (§3.4), который собирается в Python из уже прочитанных строк счётчиков. `Progress.deferred` — гейдж числа Item, отложенных сейчас: `count(*)` по строкам `th_outbox` с `defer_reason IS NOT NULL`. Он считается как `in_flight` (гейдж по узкой side-таблице), а не через `th_counter` / `th_counter_delta`; поэтому `defer()` не вводит ни новых счётчиков, ни дельт итогов: он только корректирует `dispatched` на −1, как любой возврат Item в outbox, потому что relay увеличит его снова при следующей отправке. `view()` / `watch()` получают `deferred` и разбивку по причинам одним `GROUP BY` по частичному индексу `th_outbox(batch_id) WHERE defer_reason IS NOT NULL`, рядом с запросом `in_flight` по `th_lease(batch_id)`.
 
 **Ожидаемый итог (`expected`)** — по правилам, от точного к оценке:
 
@@ -2771,6 +2771,7 @@ xychart-beta
 | `completer_tick` / `completer_max_batch` | 20 мс / 500 | предельное ожидание первой операции пачки (от её прихода; операции, прождавшие тик за предыдущей транзакцией, уходят сразу, §9.2) / размер пачки |
 | `completer_backpressure` | 10 000 | как у River |
 | `lease_ttl` / `heartbeat_every` | 60 с / 20 с | |
+| `defer_default_delay` | 60 с | насколько `item.defer(reason=…)` откладывает Item, если не заданы ни `delay`, ни `until` |
 | `relay_grace` / `relay_claim_ttl` | 5 с / 30 с | возраст записи для страховочного scan / срок захвата записи |
 | `finalize_grace` | 30 с | |
 | `hook_timeout` | 10 с | `statement_timeout` + `asyncio.timeout` |
