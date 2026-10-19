@@ -195,6 +195,7 @@ class BatchBuilder:
         max_in_flight: int | None = None,
         max_defers: int | None = None,
         max_deferred_for: timedelta | None = None,
+        deadline_mode: str = "wall",
         expected_total: int | None = None,
         max_depth: int | None = None,
     ) -> BatchBuilder:
@@ -233,6 +234,7 @@ class BatchBuilder:
                 max_in_flight=max_in_flight,
                 max_defers=max_defers,
                 max_deferred_for=max_deferred_for,
+                deadline_mode=deadline_mode,
                 expected_total=expected_total,
                 on_feeder_failed=_feeder_policy(on_feeder_failed),
                 max_depth=max_depth,

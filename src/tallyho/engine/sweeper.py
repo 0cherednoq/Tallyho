@@ -319,6 +319,8 @@ class Sweeper:
     """Умолчания ``max_retries`` задач у адаптера; без него умолчание — 0."""
     settings: SweeperSettings = field(default_factory=SweeperSettings)
     observer: Observer = field(default_factory=NullObserver)
+    _last_shift: datetime | None = field(default=None, init=False)
+    """Время прошлого прохода active-дедлайнов: на него опирается величина сдвига."""
 
     async def sweep(self) -> SweepResult:
         """Выполнить по одному ограниченному проходу каждого вида.
@@ -329,6 +331,7 @@ class Sweeper:
         self._notify_oldest_lease(await self._run(self._oldest_lease_age))
         leases = await self.expire_leases()
         finalized = await self.finalize_stuck()
+        await self.shift_stalled_deadlines()
         deadlines = await self.enforce_deadlines()
         stages = await self.seal_orphan_stages()
         reconciled = await self.reconcile_drift()
@@ -370,6 +373,20 @@ class Sweeper:
         for batch_id in candidates:
             changed += int(await self.finalizer.try_finalize(batch_id))
         return changed
+
+    async def shift_stalled_deadlines(self) -> int:
+        """Сдвинуть дедлайн батчей ``deadline_mode="active"``, стоящих без работы.
+
+        Дедлайн в режиме ``active`` не течёт, пока батч на паузе или в закрытом
+        окне (``max_in_flight = 0``): sweeper на каждом проходе прибавляет к
+        ``deadline_at`` время, прошедшее с прошлого прохода (RM6.1). Сдвиг
+        монотонный, новых колонок не нужно. Режим ``wall`` (по умолчанию) не
+        трогается и ведёт себя как абсолютное время.
+
+        Returns:
+            Число сдвинутых батчей.
+        """
+        return await self._run(self._shift_stalled_in)
 
     async def enforce_deadlines(self) -> int:
         """Поставить просроченным батчам и их поддеревьям запрос отмены ``deadline``.
@@ -657,6 +674,28 @@ class Sweeper:
             if updated_at + delay <= now:
                 candidates.append(batch_id)
         return tuple(candidates)
+
+    async def _shift_stalled_in(self, conn: AsyncConnection) -> int:
+        batch = self.tables.batch
+        now = await self._now(conn)
+        previous, self._last_shift = self._last_shift, now
+        # Первый проход (или сменился лидер, часы прыгнули назад) только запоминает
+        # время: сдвигаем лишь на реально прошедшее с прошлого прохода.
+        if previous is None or previous >= now:
+            return 0
+        delta = now - previous
+        stalled = or_(batch.c.paused_at.is_not(None), batch.c.max_in_flight == literal(0))
+        result = await conn.execute(
+            update(batch)
+            .where(
+                batch.c.state.in_((int(BatchState.OPEN), int(BatchState.SEALED))),
+                batch.c.deadline_at.is_not(None),
+                batch.c.options.op("->>")("deadline_mode") == literal("active"),
+                stalled,
+            )
+            .values(deadline_at=batch.c.deadline_at + delta, updated_at=now)
+        )
+        return result.rowcount
 
     async def _deadline_candidates(self, conn: AsyncConnection) -> tuple[UUID, ...]:
         batch = self.tables.batch

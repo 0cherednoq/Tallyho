@@ -109,6 +109,13 @@ def test_root_spec_accepts_defer_ceilings() -> None:
     assert spec.max_deferred_for == timedelta(days=1)
 
 
+def test_root_spec_validates_deadline_mode() -> None:
+    assert RootSpec(kind="k").deadline_mode == "wall"
+    assert RootSpec(kind="k", deadline_mode="active").deadline_mode == "active"
+    with pytest.raises(ConfigurationError, match="deadline_mode"):
+        _ = RootSpec(kind="k", deadline_mode="paused")
+
+
 def test_sub_batch_spec_validation() -> None:
     with pytest.raises(ConfigurationError, match="key"):
         _ = SubBatchSpec(key="")

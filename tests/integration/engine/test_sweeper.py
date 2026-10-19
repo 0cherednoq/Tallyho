@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
@@ -565,3 +566,76 @@ async def test_sweeper_keeps_fresh_or_unbounded_deferred_items(env: Env) -> None
     assert await sweeper(env).expire_deferred() == 0
     rows = await item_rows(env, [fresh, unbounded])
     assert all(ItemState(state) is ItemState.ACTIVE for state, _l, _a, _o in rows)
+
+
+async def _deadline_batch(
+    env: Env, *, key: str, mode: str, deadline: datetime, window: int | None, paused: bool
+) -> UUID:
+    """Корень с дедлайном, режимом, окном и (при paused) паузой."""
+    async with env.transaction() as conn:
+        root = await env.producer.create_root(conn, RootSpec(kind="dl", key=key))
+        options = {"deadline_mode": mode} if mode != "wall" else {}
+        values: dict[str, object] = {"deadline_at": deadline, "options": options}
+        if window is not None:
+            values["max_in_flight"] = window
+        if paused:
+            values["paused_at"] = deadline
+        _ = await conn.execute(
+            update(env.tables.batch).where(env.tables.batch.c.id == root.id).values(values)
+        )
+    return root.id
+
+
+async def _deadline_at(env: Env, batch_id: UUID) -> datetime:
+    batch = env.tables.batch
+    async with env.connection() as conn:
+        value = await conn.scalar(select(batch.c.deadline_at).where(batch.c.id == batch_id))
+    assert value is not None
+    return value
+
+
+async def test_active_deadline_does_not_advance_on_first_pass_then_shifts(env: Env) -> None:
+
+    deadline = datetime.now(UTC) + timedelta(seconds=30)
+    stalled = await _deadline_batch(
+        env, key="stalled", mode="active", deadline=deadline, window=0, paused=False
+    )
+    sw = sweeper(env)
+    # Первый проход только запоминает время прохода — дедлайн не трогает.
+    assert await sw.shift_stalled_deadlines() == 0
+    assert await _deadline_at(env, stalled) == deadline
+    await asyncio.sleep(0.05)
+    # Второй проход сдвигает дедлайн на реально прошедшее время (> 0).
+    assert await sw.shift_stalled_deadlines() == 1
+    assert await _deadline_at(env, stalled) > deadline
+
+
+async def test_active_deadline_ignores_running_and_wall_batches(env: Env) -> None:
+
+    deadline = datetime.now(UTC) + timedelta(seconds=30)
+    running = await _deadline_batch(
+        env, key="running", mode="active", deadline=deadline, window=5, paused=False
+    )
+    wall = await _deadline_batch(
+        env, key="wall", mode="wall", deadline=deadline, window=0, paused=False
+    )
+    sw = sweeper(env)
+    assert await sw.shift_stalled_deadlines() == 0
+    await asyncio.sleep(0.05)
+    # Работающий (окно 5, не на паузе) и wall-батч дедлайн не сдвигают.
+    assert await sw.shift_stalled_deadlines() == 0
+    assert await _deadline_at(env, running) == deadline
+    assert await _deadline_at(env, wall) == deadline
+
+
+async def test_active_deadline_shifts_paused_batch(env: Env) -> None:
+
+    deadline = datetime.now(UTC) + timedelta(seconds=30)
+    paused = await _deadline_batch(
+        env, key="paused", mode="active", deadline=deadline, window=None, paused=True
+    )
+    sw = sweeper(env)
+    assert await sw.shift_stalled_deadlines() == 0
+    await asyncio.sleep(0.05)
+    assert await sw.shift_stalled_deadlines() == 1
+    assert await _deadline_at(env, paused) > deadline

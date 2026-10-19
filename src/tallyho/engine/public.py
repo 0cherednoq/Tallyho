@@ -54,6 +54,7 @@ class BatchDefinition:
     expected_total: int | None = None
     max_defers: int | None = None
     max_deferred_for: timedelta | None = None
+    deadline_mode: str = "wall"
     max_items: int | None = None
     retention: timedelta | None = None
     release_required: bool = False

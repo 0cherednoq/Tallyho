@@ -118,6 +118,8 @@ class CallbackName(StrEnum):
 
 _MAX_DEFERS: Final = 32767
 """Предел ``th_item.defers`` (smallint): потолок ``max_defers`` строго меньше."""
+_DEADLINE_MODES: Final = frozenset({"wall", "active"})
+"""Режимы дедлайна: ``wall`` — абсолютное время, ``active`` — не течёт в простое (RM6.1)."""
 _CALLBACK_BROKEN = "options.callbacks: повреждённая запись колбэка"
 _OPTIONS_NOT_JSON = "опции колбэка должны сериализоваться в JSON"
 _CALL_OPTIONS_NOT_JSON = "опции вызова (queue, опции брокера) должны сериализоваться в JSON"
@@ -211,6 +213,7 @@ class _BatchSpec:
     expected_total: int | None = None
     max_defers: int | None = None
     max_deferred_for: timedelta | None = None
+    deadline_mode: str = "wall"
 
     def _check(self) -> None:
         # Ноль разрешён: окно закрыто, новая работа паркуется (ARCHITECTURE §11.2).
@@ -223,6 +226,9 @@ class _BatchSpec:
             raise ConfigurationError(message)
         if self.max_deferred_for is not None and self.max_deferred_for <= timedelta(0):
             message = "max_deferred_for должен быть положительным timedelta"
+            raise ConfigurationError(message)
+        if self.deadline_mode not in _DEADLINE_MODES:
+            message = f"deadline_mode должен быть 'wall' или 'active', не {self.deadline_mode!r}"
             raise ConfigurationError(message)
 
 
@@ -951,6 +957,8 @@ class Producer:
         if spec.max_deferred_for is not None:
             # Секунды: jsonb числом, читается обратно в timedelta.
             options["max_deferred_for"] = spec.max_deferred_for.total_seconds()
+        if spec.deadline_mode != "wall":
+            options["deadline_mode"] = spec.deadline_mode
         if spec.callbacks:
             options["callbacks"] = {
                 CallbackName(name).value: self._callback(call).to_json()
