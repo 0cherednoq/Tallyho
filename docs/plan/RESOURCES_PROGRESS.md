@@ -6,7 +6,7 @@
 ## Текущее состояние
 
 * **Ветка:** `docs/resource-management-plan` (план), код — по протоколу PLAN.md §0
-* **Текущая волна:** 2 завершена; следующая — RM1.2, RM2.2, RM4.1
+* **Текущая волна:** 3 — RM1.2, RM2.2, RM4.1
 * **Последний зелёный коммит:** d8b6c0c
 * **Готово:** 6 из 12
 
@@ -17,7 +17,7 @@
 | RM0.1 | relay: развести `NULL` и `0` в арифметике окна | — | done | 249e436 |
 | RM0.2 | ARCHITECTURE и COUNTERS под `defer` и окно 0 | — | done | 7daa67a, 12edbad |
 | RM1.1 | `set_max_in_flight` / `clear_max_in_flight`, ноль разрешён | RM0.1, RM0.2 | done | 0efe1db, cc563cd |
-| RM1.2 | Окно-aware распарковка (`resume` и relay) | RM1.1 | todo | |
+| RM1.2 | Окно-aware распарковка (`resume` и relay) | RM1.1 | in_progress | |
 | RM2.1 | Миграция: `defer_reason`, `defers`, `first_deferred_at`, индекс | RM0.2 | done | fcc606d, d8b6c0c |
 | RM2.2 | `item.defer()`: API и транзакция | RM2.1, RM1.1 | todo | |
 | RM2.3 | Потолки `max_defers` / `max_deferred_for` + sweeper | RM2.2 | todo | |
