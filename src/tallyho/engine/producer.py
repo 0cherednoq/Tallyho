@@ -209,7 +209,8 @@ class _BatchSpec:
     expected_total: int | None = None
 
     def _check(self) -> None:
-        _check_optional("max_in_flight", self.max_in_flight, 1)
+        # Ноль разрешён: окно закрыто, новая работа паркуется (ARCHITECTURE §11.2).
+        _check_optional("max_in_flight", self.max_in_flight, 0)
         _check_optional("expected_total", self.expected_total, 0)
 
 

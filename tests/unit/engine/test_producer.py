@@ -67,7 +67,9 @@ def test_root_spec_requires_kind() -> None:
 
 def test_root_spec_rejects_bad_limits() -> None:
     with pytest.raises(ConfigurationError, match="max_in_flight"):
-        _ = RootSpec(kind="k", max_in_flight=0)
+        _ = RootSpec(kind="k", max_in_flight=-1)
+    with pytest.raises(ConfigurationError, match="max_in_flight"):
+        _ = RootSpec(kind="k", max_in_flight=True)
     with pytest.raises(ConfigurationError, match="expected_total"):
         _ = RootSpec(kind="k", expected_total=-1)
     with pytest.raises(ConfigurationError, match="max_items"):
@@ -81,6 +83,11 @@ def test_root_spec_accepts_limits() -> None:
     assert (spec.max_in_flight, spec.expected_total, spec.max_items) == (1, 0, 1)
 
 
+def test_root_spec_accepts_closed_window() -> None:
+    # Окно 0 — закрытое окно, а не «окна нет»: спек его принимает.
+    assert RootSpec(kind="k", max_in_flight=0).max_in_flight == 0
+
+
 def test_sub_batch_spec_validation() -> None:
     with pytest.raises(ConfigurationError, match="key"):
         _ = SubBatchSpec(key="")
@@ -89,7 +96,7 @@ def test_sub_batch_spec_validation() -> None:
     with pytest.raises(ConfigurationError, match="max_depth"):
         _ = SubBatchSpec(key="pages", max_depth=-1)
     with pytest.raises(ConfigurationError, match="max_in_flight"):
-        _ = SubBatchSpec(key="pages", max_in_flight=0)
+        _ = SubBatchSpec(key="pages", max_in_flight=-1)
 
 
 def test_sub_batch_spec_freezes_fed_by() -> None:
@@ -97,3 +104,4 @@ def test_sub_batch_spec_freezes_fed_by() -> None:
     spec = SubBatchSpec(key="cards", fed_by=[feeder])
     assert spec.fed_by == (feeder,)
     assert SubBatchSpec(key="pages", max_depth=0).max_depth == 0
+    assert SubBatchSpec(key="pages", max_in_flight=0).max_in_flight == 0
