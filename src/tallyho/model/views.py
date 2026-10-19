@@ -21,6 +21,7 @@ if TYPE_CHECKING:
     from tallyho.model.states import BatchState, CancelReason, ItemState
 
 __all__ = [
+    "BatchDemand",
     "BatchInfo",
     "BatchPage",
     "BatchSummary",
@@ -188,6 +189,35 @@ class BatchInfo:
     attributes: Mapping[str, AttributeValue]
     created_at: datetime
     finished_at: datetime | None = None
+
+    def __post_init__(self) -> None:
+        """Заморозить атрибуты."""
+        object.__setattr__(self, "attributes", _freeze(self.attributes))
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class BatchDemand:
+    """Спрос одного активного батча для ``th.demand(...)`` (ARCHITECTURE §11.2).
+
+    Дешёвое чтение для управляющего ресурсом контура: только счётчики спроса,
+    без labels, метрик, ETA и дерева — за ними ``th.handle(id).view()``.
+    ``pending`` — ещё не завершённые Items (``found - done``, с учётом
+    несвёрнутых дельт), ``in_flight`` — выполняются сейчас, ``deferred`` —
+    отложены (``item.defer``). ``attributes`` — неизменяемые атрибуты корня
+    дерева, одинаковые у любого его узла.
+    """
+
+    id: UUID
+    kind: str
+    key: str | None
+    attributes: Mapping[str, AttributeValue]
+    pending: int
+    in_flight: int
+    deferred: int
+    max_in_flight: int | None
+    paused: bool
+    truncated: bool = False
+    """Выдача ``demand`` упёрлась в ``limit``: часть батчей не попала в список."""
 
     def __post_init__(self) -> None:
         """Заморозить атрибуты."""

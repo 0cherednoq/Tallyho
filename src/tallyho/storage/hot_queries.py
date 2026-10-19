@@ -15,6 +15,7 @@ from sqlalchemy import any_, literal, select
 from tallyho.model.states import TERMINAL_THRESHOLD, BatchState, ItemState
 from tallyho.storage.batch_listing import DEFAULT_LIST_LIMIT, list_batches_statement
 from tallyho.storage.counters import stale_metric_slots_statement, user_metric_slot
+from tallyho.storage.demand import demand_statement
 from tallyho.storage.item_scan import DEFAULT_ITEMS_SCAN_WINDOW, item_window_statement
 from tallyho.storage.tables import PROGRESS_HOOK
 
@@ -214,6 +215,18 @@ def _list_by_kind(tables: Tables, probe: HotQueryProbe) -> Select[*tuple[object,
 def _list_by_attributes(tables: Tables, probe: HotQueryProbe) -> Select[*tuple[object, ...]]:
     return list_batches_statement(
         tables, attributes={"key": probe.key}, limit=DEFAULT_LIST_LIMIT + 1
+    )
+
+
+@HOT_QUERIES.register("demand.by_kind", max_plan_rows=_LISTED_ROOTS)
+def _demand_by_kind(tables: Tables, probe: HotQueryProbe) -> Select[*tuple[object, ...]]:
+    return demand_statement(tables, kinds=(probe.kind,), limit=_PAGE)
+
+
+@HOT_QUERIES.register("demand.by_attributes", max_plan_rows=_LISTED_ROOTS)
+def _demand_by_attributes(tables: Tables, probe: HotQueryProbe) -> Select[*tuple[object, ...]]:
+    return demand_statement(
+        tables, kinds=(probe.kind,), attributes={"tenant": "tenant-1"}, limit=_PAGE
     )
 
 

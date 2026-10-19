@@ -53,6 +53,7 @@ from tallyho.model.states import (
     ResultClass,
 )
 from tallyho.model.views import (
+    BatchDemand,
     BatchInfo,
     BatchPage,
     BatchSummary,
@@ -65,6 +66,7 @@ from tallyho.model.views import (
 __all__ = [
     "AttributeLimits",
     "AttributeValue",
+    "BatchDemand",
     "BatchInfo",
     "BatchPage",
     "BatchPurged",

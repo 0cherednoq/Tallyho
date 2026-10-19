@@ -17,6 +17,7 @@ from tallyho.model.errors import BatchPurged, ConfigurationError, NotFoundError
 from tallyho.model.progress import NodeCounters, ProgressSettings, compute_progress
 from tallyho.model.states import BatchState, CancelReason, ItemState
 from tallyho.model.views import (
+    BatchDemand,
     BatchInfo,
     BatchPage,
     BatchSummary,
@@ -30,6 +31,7 @@ from tallyho.storage.batch_listing import (
     MAX_LIST_LIMIT,
     list_batches_statement,
 )
+from tallyho.storage.demand import demand_statement
 from tallyho.storage.item_scan import (
     DEFAULT_ITEMS_SCAN_WINDOW,
     item_window_statement,
@@ -92,6 +94,7 @@ _WindowRow: TypeAlias = tuple[
 ]
 """Граница окна (``last_id``, ``scanned``) и колонки ``ITEM_VIEW_FIELDS``."""
 _ListRow: TypeAlias = tuple[UUID, str, str | None, int, datetime, datetime | None, object]
+_DemandRow: TypeAlias = tuple[UUID, str, str | None, int | None, bool, int, int, int, object]
 """Колонки ``BATCH_INFO_FIELDS`` и jsonb ``attributes``."""
 
 _NON_POSITIVE_LIMIT = "limit должен быть положительным целым числом"
@@ -105,6 +108,10 @@ _BAD_KINDS = "kinds должен быть коллекцией строк, а н
 _BAD_BATCH_STATES = "states должен быть коллекцией BatchState"
 _BAD_CURSOR = "cursor листинга не распознан: передавайте BatchPage.next_cursor без изменений"
 _BAD_LIST_LIMIT = f"limit листинга должен быть целым от 1 до {MAX_LIST_LIMIT}"
+DEFAULT_DEMAND_LIMIT: Final = 1000
+MAX_DEMAND_LIMIT: Final = 10_000
+_EMPTY_KINDS = "demand требует хотя бы один kind"
+_BAD_DEMAND_LIMIT = f"limit demand должен быть целым от 1 до {MAX_DEMAND_LIMIT}"
 _BAD_BOUND = "created_after и created_before должны быть datetime с часовым поясом"
 _CURSOR_VERSION = b"\x01"
 
@@ -477,6 +484,68 @@ class Reads:
         )
         more = len(rows) > limit
         return BatchPage(items=items, next_cursor=_encode_cursor(items[-1].id) if more else None)
+
+    async def demand(
+        self,
+        kinds: Collection[str],
+        *,
+        attributes: Mapping[str, AttributeValue] | None = None,
+        limit: int = DEFAULT_DEMAND_LIMIT,
+    ) -> tuple[BatchDemand, ...]:
+        """Read demand of active batches of the given kinds in one statement.
+
+        ``attributes`` must already be normalized. Unlike :meth:`view` this
+        reads only demand counters, independent of tree size; the number of SQL
+        statements does not depend on the batch count, but the cost is
+        O(active batches x counter slots).
+
+        Returns:
+            Demand rows by ascending id, at most ``limit``; each row's
+            ``truncated`` tells the limit was hit and more batches may exist.
+
+        Raises:
+            ConfigurationError: ``kinds`` is empty, a string, or the limit is malformed.
+        """
+        if not kinds:
+            raise ConfigurationError(_EMPTY_KINDS)
+        checked = _collection(kinds, str, _BAD_KINDS)
+        if isinstance(limit, bool) or not 1 <= limit <= MAX_DEMAND_LIMIT:
+            raise ConfigurationError(_BAD_DEMAND_LIMIT)
+        statement = demand_statement(
+            self.tables,
+            kinds=checked,
+            attributes=attributes,
+            # Лишняя строка говорит, упёрлись ли в limit.
+            limit=limit + 1,
+        )
+        async with self.engine.connect() as conn:
+            rows = cast("list[_DemandRow]", (await conn.execute(statement)).all())
+        truncated = len(rows) > limit
+        return tuple(
+            BatchDemand(
+                id=batch_id,
+                kind=kind,
+                key=key,
+                attributes=attributes_from_json(raw_attributes),
+                pending=max(pending, 0),
+                in_flight=in_flight,
+                deferred=deferred,
+                max_in_flight=max_in_flight,
+                paused=paused,
+                truncated=truncated,
+            )
+            for (
+                batch_id,
+                kind,
+                key,
+                max_in_flight,
+                paused,
+                pending,
+                in_flight,
+                deferred,
+                raw_attributes,
+            ) in rows[:limit]
+        )
 
     async def find(self, kind: str, key: str) -> UUID:
         """Find a root batch by its idempotency key.

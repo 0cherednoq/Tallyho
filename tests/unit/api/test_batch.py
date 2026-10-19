@@ -35,7 +35,7 @@ if TYPE_CHECKING:
 
     from tallyho.engine.public import MaintenanceRunner
     from tallyho.model.attributes import AttributeValue
-    from tallyho.model.views import BatchView, InFlightItem, ItemView
+    from tallyho.model.views import BatchDemand, BatchView, InFlightItem, ItemView
     from tallyho.protocols.broker import Message, WorkerFactory
 
 __all__: list[str] = []
@@ -229,6 +229,17 @@ class Facade(EngineFacade):
             )
         )
         return BatchPage(items=())
+
+    @override
+    async def demand(
+        self,
+        kinds: Collection[str],
+        *,
+        attributes: Mapping[str, AttributeValue] | None = None,
+        limit: int = 1000,
+    ) -> tuple[BatchDemand, ...]:
+        self.calls.append(("demand", (tuple(kinds), attributes, limit)))
+        return ()
 
     @override
     async def find(self, kind: str, key: str) -> UUID:

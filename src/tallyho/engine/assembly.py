@@ -66,7 +66,7 @@ if TYPE_CHECKING:
     from tallyho.model.attributes import AttributeValue
     from tallyho.model.calls import TaskCall
     from tallyho.model.states import BatchState, ItemState
-    from tallyho.model.views import BatchPage, BatchView, InFlightItem, ItemView
+    from tallyho.model.views import BatchDemand, BatchPage, BatchView, InFlightItem, ItemView
     from tallyho.protocols.broker import Dispatcher, WorkerFactory
     from tallyho.protocols.clock import Clock
     from tallyho.protocols.ids import IdFactory
@@ -555,6 +555,15 @@ class _Facade:
             limit=limit,
             cursor=cursor,
         )
+
+    async def demand(
+        self,
+        kinds: Collection[str],
+        *,
+        attributes: Mapping[str, AttributeValue] | None = None,
+        limit: int = 1000,
+    ) -> tuple[BatchDemand, ...]:
+        return await self._require(self._reads).demand(kinds, attributes=attributes, limit=limit)
 
     async def find(self, kind: str, key: str) -> UUID:
         return await self._require(self._reads).find(kind, key)

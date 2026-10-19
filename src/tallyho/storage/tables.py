@@ -573,6 +573,8 @@ def _batch(metadata: MetaData, prefix: str) -> Table[BatchColumns]:
     )
     # Листинг корней одного kind, keyset по id DESC.
     Index(f"{name}_kind_idx", c.kind, c.id, postgresql_where=c.parent_id.is_(None))
+    # th.demand(kinds=…): активные корни и под-батчи требуемых видов (ARCHITECTURE §5.2).
+    Index(f"{name}_kind_active_idx", c.kind, postgresql_where=c.state.in_(_OPEN_OR_SEALED))
     return batch
 
 

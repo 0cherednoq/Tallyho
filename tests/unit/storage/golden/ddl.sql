@@ -34,6 +34,8 @@ CREATE INDEX th_batch_active_updated_idx ON th_batch (updated_at) WHERE state < 
 
 CREATE INDEX th_batch_deadline_idx ON th_batch (deadline_at) WHERE deadline_at IS NOT NULL AND state IN (0, 1);
 
+CREATE INDEX th_batch_kind_active_idx ON th_batch (kind) WHERE state IN (0, 1);
+
 CREATE INDEX th_batch_kind_idx ON th_batch (kind, id) WHERE parent_id IS NULL;
 
 CREATE UNIQUE INDEX th_batch_kind_key_uq ON th_batch (kind, key) WHERE parent_id IS NULL AND key IS NOT NULL;

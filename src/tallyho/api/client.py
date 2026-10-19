@@ -24,7 +24,7 @@ from tallyho.protocols.ids import UuidV7Factory
 from tallyho.protocols.observer import NullObserver
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable, Collection, Iterable, Mapping
+    from collections.abc import Awaitable, Callable, Collection, Iterable, Mapping, Sequence
     from datetime import datetime
     from uuid import UUID
 
@@ -34,7 +34,7 @@ if TYPE_CHECKING:
     from tallyho.hooks.registry import FinalizedT, PolicyBreachT, ProgressT
     from tallyho.model.calls import TaskCall
     from tallyho.model.states import BatchState
-    from tallyho.model.views import BatchPage
+    from tallyho.model.views import BatchDemand, BatchPage
     from tallyho.protocols.broker import Dispatcher
     from tallyho.protocols.clock import Clock
     from tallyho.protocols.ids import IdFactory
@@ -471,6 +471,39 @@ class Tallyho:
             limit=limit,
             cursor=cursor,
         )
+
+    async def demand(
+        self,
+        kinds: Sequence[str],
+        *,
+        attributes: Mapping[str, object] | None = None,
+        limit: int = 1000,
+    ) -> list[BatchDemand]:
+        """Прочитать спрос активных (``open``/``sealed``) батчей требуемых видов.
+
+        Дешёвое чтение для контура, управляющего ресурсом: ``pending``,
+        ``in_flight``, ``deferred``, ``max_in_flight`` и ``paused`` каждого
+        батча одним составным запросом. Это не ``view()``: ни labels, ни
+        метрик, ни ETA, ни дерева. ``kinds`` обязателен; ``attributes``
+        фильтрует по неизменяемым атрибутам корня (работает и для под-батчей).
+
+        Число SQL-запросов не зависит от числа батчей, но стоимость —
+        O(активные батчи * слоты счётчиков). При упоре в ``limit`` часть
+        батчей не попадёт в выдачу: это видно по усечённому списку, а размер
+        списка не превышает ``limit``.
+
+        Пустой или строковый ``kinds`` и ``limit`` вне диапазона дают
+        ``ConfigurationError``.
+
+        Returns:
+            Список ``BatchDemand`` по возрастанию id, не длиннее ``limit``.
+        """
+        demands = await self._engine.demand(
+            kinds,
+            attributes=normalize_attributes(attributes, limits=self.settings.attribute_limits()),
+            limit=limit,
+        )
+        return list(demands)
 
     def call(
         self,

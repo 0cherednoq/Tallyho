@@ -21,7 +21,7 @@ if TYPE_CHECKING:
     from tallyho.model.calls import TaskCall
     from tallyho.model.policy import FailurePolicy
     from tallyho.model.states import BatchState, ItemState
-    from tallyho.model.views import BatchPage, BatchView, InFlightItem, ItemView
+    from tallyho.model.views import BatchDemand, BatchPage, BatchView, InFlightItem, ItemView
     from tallyho.protocols.broker import Dispatcher, WorkerFactory
     from tallyho.protocols.clock import Clock
     from tallyho.protocols.ids import IdFactory
@@ -201,6 +201,16 @@ class EngineFacade(Protocol):  # ruff: ignore[too-many-public-methods]  # фас
         cursor: str | None = None,
     ) -> BatchPage:
         """Страница листинга корневых батчей."""
+        ...
+
+    async def demand(
+        self,
+        kinds: Collection[str],
+        *,
+        attributes: Mapping[str, AttributeValue] | None = None,
+        limit: int = 1000,
+    ) -> tuple[BatchDemand, ...]:
+        """Прочитать спрос активных батчей требуемых видов (truncated — упор в limit)."""
         ...
 
     async def find(self, kind: str, key: str) -> UUID:
