@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import timedelta
 from uuid import UUID
 
 import pytest
@@ -86,6 +87,26 @@ def test_root_spec_accepts_limits() -> None:
 def test_root_spec_accepts_closed_window() -> None:
     # Окно 0 — закрытое окно, а не «окна нет»: спек его принимает.
     assert RootSpec(kind="k", max_in_flight=0).max_in_flight == 0
+
+
+def test_root_spec_rejects_bad_defer_ceilings() -> None:
+    with pytest.raises(ConfigurationError, match="max_defers"):
+        _ = RootSpec(kind="k", max_defers=0)
+    with pytest.raises(ConfigurationError, match="max_defers"):
+        _ = RootSpec(kind="k", max_defers=True)
+    with pytest.raises(ConfigurationError, match="max_defers"):
+        # Потолок должен быть строго меньше предела smallint th_item.defers.
+        _ = RootSpec(kind="k", max_defers=32767)
+    with pytest.raises(ConfigurationError, match="max_deferred_for"):
+        _ = RootSpec(kind="k", max_deferred_for=timedelta(0))
+    with pytest.raises(ConfigurationError, match="max_deferred_for"):
+        _ = RootSpec(kind="k", max_deferred_for=timedelta(seconds=-1))
+
+
+def test_root_spec_accepts_defer_ceilings() -> None:
+    spec = RootSpec(kind="k", max_defers=20, max_deferred_for=timedelta(days=1))
+    assert spec.max_defers == 20
+    assert spec.max_deferred_for == timedelta(days=1)
 
 
 def test_sub_batch_spec_validation() -> None:

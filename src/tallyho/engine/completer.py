@@ -471,6 +471,8 @@ class _BatchFlags:
     start_at: datetime | None
     max_items: int | None
     max_depth: int | None
+    max_defers: int | None = None
+    max_deferred_for: timedelta | None = None
 
 
 @dataclass(slots=True, kw_only=True)
@@ -509,6 +511,8 @@ class _Applied:
     """Операция defer, применённая к Item: другие defer того же Item в пачке — ``False``."""
     deferred: set[UUID] = field(default_factory=set["UUID"])
     """Items, которые defer вернул в outbox (``item.defer``)."""
+    defer_handled: set[UUID] = field(default_factory=set["UUID"])
+    """Items, обработанные defer: отложены или завершены по исчерпанному потолку."""
     requeued: set[UUID] = field(default_factory=set["UUID"])
     """Items, которые release вернул в outbox: дубль доставки уже закрыл джобу брокера."""
     finalize: set[UUID] = field(default_factory=set["UUID"])
@@ -565,6 +569,7 @@ class _Tx:
                 batch.c.start_at,
                 batch.c.max_items,
                 batch.c.max_depth,
+                batch.c.options,
             )
             .where(batch.c.id == any_(_uuids(ids)))
             .order_by(batch.c.id)
@@ -579,7 +584,9 @@ class _Tx:
             start_at,
             max_items,
             max_depth,
+            options,
         ) in result:
+            max_defers, max_deferred_for = _defer_ceilings(options)
             self.batches[batch_id] = _BatchFlags(
                 root_id=root_id,
                 state=BatchState(state),
@@ -588,6 +595,8 @@ class _Tx:
                 start_at=start_at,
                 max_items=max_items,
                 max_depth=max_depth,
+                max_defers=max_defers,
+                max_deferred_for=max_deferred_for,
             )
 
     async def lock_items(self, item_ids: Iterable[UUID]) -> None:
@@ -1174,11 +1183,17 @@ class _Tx:
             return
         item = self.tables.item
         outbox = self.tables.outbox
+        ceilings = await self._defer_state(sorted(specs))
         deferred: list[UUID] = []
+        over_limit: dict[UUID, tuple[ItemRef, FinishResult]] = {}
         for item_id in sorted(specs):
             spec = specs[item_id]
             row = self.items.get(item_id)
             if row is None or row.state.is_terminal:
+                continue
+            if self._defer_exhausted(row.batch_id, ceilings.get(item_id)):
+                # Потолок отложений исчерпан: вместо defer — терминальная ошибка (RM2.3).
+                over_limit[item_id] = (ItemRef(item_id, row.batch_id), _DEFERRED_TOO_LONG)
                 continue
             # Срок отложения — у самой записи; pause/resume её не трогают, поэтому
             # available_at не зависит от паузы батча (до срока relay её не отдаёт,
@@ -1219,6 +1234,10 @@ class _Tx:
             deferred.append(item_id)
             # Item покинул брокера: окно max_in_flight считает dispatched - done.
             self.deltas[row.batch_id] += CounterDelta(dispatched=-1)
+        if over_limit:
+            # Исчерпавшие потолок завершаются ошибкой: lease, окно и финализация — как у finish.
+            await self.finish(over_limit)
+            self.applied.defer_handled.update(over_limit)
         if not deferred:
             return
         _ = await self.conn.execute(
@@ -1234,6 +1253,36 @@ class _Tx:
         released = await self._release_window(deferred)
         self.applied.kick.update(released)
         self.applied.deferred.update(deferred)
+        self.applied.defer_handled.update(deferred)
+
+    async def _defer_state(
+        self, item_ids: list[UUID]
+    ) -> dict[UUID, tuple[int, datetime | None, datetime]]:
+        # Текущие defers, first_deferred_at и now для проверки потолков (RM2.3).
+        if not item_ids:
+            return {}
+        item = self.tables.item
+        rows = await self.conn.execute(
+            select(item.c.id, item.c.defers, item.c.first_deferred_at, self.now).where(
+                item.c.id == any_(_uuids(item_ids))
+            )
+        )
+        return {row[0]: (row[1], cast("datetime | None", row[2]), row[3]) for row in rows}
+
+    def _defer_exhausted(
+        self, batch_id: UUID, state: tuple[int, datetime | None, datetime] | None
+    ) -> bool:
+        flags = self.batches.get(batch_id)
+        if flags is None or state is None:
+            return False
+        defers, first_deferred_at, now = state
+        if flags.max_defers is not None and defers + 1 > flags.max_defers:
+            return True
+        return (
+            flags.max_deferred_for is not None
+            and first_deferred_at is not None
+            and now - first_deferred_at > flags.max_deferred_for
+        )
 
     async def expand(self, values: dict[UUID, tuple[ItemRef, FinishResult]]) -> None:
         """Записать spawn/expect только для Items, чей CAS finish был успешен."""
@@ -1472,6 +1521,39 @@ _REDELIVERY_EXHAUSTED: Final = FinishResult(
     },
 )
 """Итог Item, которому ``release`` после дубля доставки не вправе вернуть попытку (UC-04)."""
+
+DEFERRED_TOO_LONG_LABEL: Final = "deferred_too_long"
+"""Метка Item, который исчерпал потолок отложений ``max_defers``/``max_deferred_for``."""
+
+_DEFERRED_TOO_LONG: Final = FinishResult(
+    result_class=ResultClass.ERROR,
+    label=DEFERRED_TOO_LONG_LABEL,
+    error={
+        "type": "DeferredTooLong",
+        "message": "Item исчерпал потолок отложений (max_defers/max_deferred_for)",
+    },
+)
+"""Итог Item, у которого отложения уперлись в потолок (RM2.3)."""
+
+
+def _defer_ceilings(options: object) -> tuple[int | None, timedelta | None]:
+    """Прочитать потолки отложений из ``th_batch.options``.
+
+    Returns:
+        ``(max_defers, max_deferred_for)``; оба ``None``, если не заданы.
+    """
+    if not isinstance(options, dict):
+        return None, None
+    raw = cast("dict[object, object]", options)
+    defers = raw.get("max_defers")
+    seconds = raw.get("max_deferred_for")
+    max_defers = defers if isinstance(defers, int) and not isinstance(defers, bool) else None
+    window = (
+        timedelta(seconds=seconds)
+        if isinstance(seconds, (int, float)) and not isinstance(seconds, bool)
+        else None
+    )
+    return max_defers, window
 
 
 def _expansion_batches(finish_ops: Sequence[_Finish], batch_ids: list[UUID]) -> bool:
@@ -1779,7 +1861,7 @@ class Completer:
                 self._forget(item.id, attempt)
                 return False
         await tx.defer({item.id: _DeferSpec(reason=reason, until=until, delay=delay)})
-        if item.id not in tx.applied.deferred:
+        if item.id not in tx.applied.defer_handled:
             self._forget(item.id, attempt)
             return False
         inserted = await insert_delta(conn, self.tables, tx.deltas, created_at=tx.now)
@@ -2304,7 +2386,7 @@ class Completer:
                     done: Collection[UUID] = applied.released
                 elif isinstance(op, _Defer):
                     chosen = applied.deferrers.get(op.item.id)
-                    done = applied.deferred
+                    done = applied.defer_handled
                 else:
                     chosen = applied.finishers.get(op.item.id)
                     done = applied.finished

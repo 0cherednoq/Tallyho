@@ -195,3 +195,63 @@ async def test_cancel_after_defer_cancels_item(env: Env) -> None:
     assert ItemState(row["state"]) is ItemState.CANCELLED
     # Отложенная запись outbox убрана отменой.
     assert await _outbox(env, ref.id) is None
+
+
+async def _set_defers(env: Env, item_id: UUID, *, defers: int, first_at: object) -> None:
+    item = env.tables.item
+    async with env.transaction() as conn:
+        _ = await conn.execute(
+            update(item)
+            .where(item.c.id == item_id)
+            .values(defers=defers, first_deferred_at=first_at)
+        )
+
+
+async def test_max_defers_exhausted_fails_with_deferred_too_long(env: Env) -> None:
+    seeded = await seed(env, 1)
+    ref = seeded.refs[0]
+    await set_batch(env, seeded.batch_id, options={"max_defers": 1})
+    # Item уже откладывали один раз: следующий defer упрётся в потолок.
+    await _set_defers(env, ref.id, defers=1, first_at=NOW)
+    async with open_completer(env) as completer:
+        claim = await completer.claim(ref)
+        # defer возвращает True (операция применена), но итог — терминальная ошибка.
+        assert await completer.defer(
+            ref, reason=REASON, delay=timedelta(minutes=1), attempt=claim.attempt
+        )
+    row = await _item(env, ref.id)
+    assert ItemState(row["state"]) is ItemState.ERROR
+    assert row["label"] == "deferred_too_long"
+    assert await _outbox(env, ref.id) is None
+    assert await lease_row(env, ref.id) is None
+
+
+async def test_max_deferred_for_exhausted_fails(env: Env) -> None:
+    seeded = await seed(env, 1)
+    ref = seeded.refs[0]
+    await set_batch(env, seeded.batch_id, options={"max_deferred_for": 60.0})
+    # Впервые отложен давно: окно max_deferred_for уже прошло.
+    await _set_defers(env, ref.id, defers=3, first_at=NOW - timedelta(hours=1))
+    async with open_completer(env) as completer:
+        claim = await completer.claim(ref)
+        assert await completer.defer(
+            ref, reason=REASON, delay=timedelta(minutes=1), attempt=claim.attempt
+        )
+    row = await _item(env, ref.id)
+    assert ItemState(row["state"]) is ItemState.ERROR
+    assert row["label"] == "deferred_too_long"
+
+
+async def test_no_ceilings_defers_without_limit(env: Env) -> None:
+    seeded = await seed(env, 1)
+    ref = seeded.refs[0]
+    await _set_defers(env, ref.id, defers=1000, first_at=NOW - timedelta(days=365))
+    async with open_completer(env) as completer:
+        claim = await completer.claim(ref)
+        assert await completer.defer(
+            ref, reason=REASON, delay=timedelta(minutes=1), attempt=claim.attempt
+        )
+    row = await _item(env, ref.id)
+    # Без потолков Item остаётся активным и просто откладывается снова.
+    assert ItemState(row["state"]) is ItemState.ACTIVE
+    assert row["defers"] == 1001

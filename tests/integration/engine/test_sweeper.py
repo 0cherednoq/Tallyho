@@ -507,3 +507,61 @@ async def test_settings_and_empty_full_sweep(env: Env) -> None:
     result = await sweeper(env).sweep()
     assert result.leases == 0
     assert result.retained == 0
+
+
+async def _deferred_item(
+    env: Env, *, key: str, options: dict[str, object], first_at: datetime
+) -> tuple[UUID, UUID]:
+    """Корень с опциями и одним отложенным Item (outbox.defer_reason, first_deferred_at)."""
+    async with env.transaction() as conn:
+        root = await env.producer.create_root(conn, RootSpec(kind="pool", key=key))
+        _ = await env.producer.add_items(conn, root.id, [TaskCall(task_name="t", args=(0,))])
+        _ = await env.producer.seal(conn, root.id)
+        item = env.tables.item
+        item_id = await conn.scalar(
+            item.select().with_only_columns(item.c.id).where(item.c.batch_id == root.id)
+        )
+        assert item_id is not None
+        _ = await conn.execute(
+            update(env.tables.batch).where(env.tables.batch.c.id == root.id).values(options=options)
+        )
+        _ = await conn.execute(
+            update(item).where(item.c.id == item_id).values(defers=1, first_deferred_at=first_at)
+        )
+        _ = await conn.execute(
+            update(env.tables.outbox)
+            .where(env.tables.outbox.c.item_id == item_id)
+            .values(defer_reason="нет кредитов")
+        )
+    return root.id, item_id
+
+
+async def test_sweeper_closes_overdue_deferred_item(env: Env) -> None:
+    old = datetime.now(UTC) - timedelta(hours=1)
+    root_id, item_id = await _deferred_item(
+        env, key="overdue", options={"max_deferred_for": 60.0}, first_at=old
+    )
+    finalizer = _Finalizer()
+    assert await sweeper(env, finalizer).expire_deferred() == 1
+    rows = await item_rows(env, [item_id])
+    state, label, _attempt, outbox = rows[0]
+    assert ItemState(state) is ItemState.ERROR
+    assert label == "deferred_too_long"
+    # Отложенная запись outbox убрана, финализация запрошена.
+    assert outbox == 0
+    assert root_id in finalizer.tried
+
+
+async def test_sweeper_keeps_fresh_or_unbounded_deferred_items(env: Env) -> None:
+    fresh_root, fresh = await _deferred_item(
+        env, key="fresh", options={"max_deferred_for": 3600.0}, first_at=datetime.now(UTC)
+    )
+    _ = fresh_root
+    old = datetime.now(UTC) - timedelta(hours=1)
+    unbounded_root, unbounded = await _deferred_item(env, key="unbounded", options={}, first_at=old)
+    _ = unbounded_root
+    # Свежий (в пределах окна) и без потолка не трогаются.
+    # Свежий (в пределах окна) и без потолка не трогаются.
+    assert await sweeper(env).expire_deferred() == 0
+    rows = await item_rows(env, [fresh, unbounded])
+    assert all(ItemState(state) is ItemState.ACTIVE for state, _l, _a, _o in rows)

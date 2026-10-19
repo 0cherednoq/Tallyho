@@ -52,6 +52,8 @@ class BatchDefinition:
     failure_policy: FailurePolicy | None = None
     max_in_flight: int | None = None
     expected_total: int | None = None
+    max_defers: int | None = None
+    max_deferred_for: timedelta | None = None
     max_items: int | None = None
     retention: timedelta | None = None
     release_required: bool = False

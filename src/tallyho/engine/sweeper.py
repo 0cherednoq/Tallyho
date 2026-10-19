@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Protocol, TypeVar, cast
 
 from sqlalchemy import (
     DateTime,
+    Float,
     SmallInteger,
     Uuid,
     delete,
@@ -22,9 +23,11 @@ from sqlalchemy import (
     select,
     update,
 )
+from sqlalchemy import cast as sql_cast
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 
+from tallyho.engine.completer import DEFERRED_TOO_LONG_LABEL
 from tallyho.engine.operations import Operations
 from tallyho.engine.relay import release_window
 from tallyho.engine.retry_limits import effective_max_retries
@@ -191,6 +194,7 @@ class SweepResult:
     reconciled: int = 0
     deltas: int = 0
     expired: int = 0
+    deferred: int = 0
     retained: int = 0
 
 
@@ -330,6 +334,7 @@ class Sweeper:
         reconciled = await self.reconcile_drift()
         deltas = await self.fold_stale_deltas()
         expired = await self.expire_unclaimed()
+        deferred = await self.expire_deferred()
         retained = await self.retention()
         return SweepResult(
             leases=leases,
@@ -339,6 +344,7 @@ class Sweeper:
             reconciled=reconciled,
             deltas=deltas,
             expired=expired,
+            deferred=deferred,
             retained=retained,
         )
 
@@ -426,6 +432,21 @@ class Sweeper:
             Число завершённых Items.
         """
         changed, kick, finalize = await self._run(self._expire_unclaimed_in)
+        self._kick(kick)
+        await self._finalize(finalize)
+        return changed
+
+    async def expire_deferred(self) -> int:
+        """Завершить отложенные Items, просрочившие ``max_deferred_for``.
+
+        Третья проверка потолка (RM2.3): Item с окном 0 не попадёт в воркер,
+        поэтому проверка внутри задачи не выполнится — срок ловит sweeper по
+        ``th_outbox.defer_reason`` и ``th_item.first_deferred_at``.
+
+        Returns:
+            Число завершённых Items.
+        """
+        changed, kick, finalize = await self._run(self._expire_deferred_in)
         self._kick(kick)
         await self._finalize(finalize)
         return changed
@@ -794,6 +815,49 @@ class Sweeper:
         candidates = [self._finish_row(row) for row in rows]
         changed, kick = await self._finish_rows(
             conn, candidates, state=ItemState.ERROR, label="expired", now=now
+        )
+        finalize = tuple(sorted({row.batch_id for row in candidates}))
+        return changed, kick, finalize
+
+    async def _expire_deferred_in(
+        self, conn: AsyncConnection
+    ) -> tuple[int, tuple[UUID, ...], tuple[UUID, ...]]:
+        outbox = self.tables.outbox
+        item = self.tables.item
+        batch = self.tables.batch
+        now = await self._now(conn)
+        # max_deferred_for хранится в th_batch.options секундами: строим интервал в SQL.
+        max_seconds = sql_cast(batch.c.options.op("->>")("max_deferred_for"), Float())
+        cutoff = now - func.make_interval(0, 0, 0, 0, 0, 0, max_seconds)
+        overdue = item.c.first_deferred_at < cutoff
+        rows = list(
+            await conn.execute(
+                select(item.c.id, item.c.batch_id, item.c.weight)
+                .select_from(
+                    outbox.join(item, item.c.id == outbox.c.item_id).join(
+                        batch, batch.c.id == outbox.c.batch_id
+                    )
+                )
+                .where(
+                    outbox.c.defer_reason.is_not(None),
+                    item.c.state == _ACTIVE,
+                    item.c.first_deferred_at.is_not(None),
+                    # Потолок задан (у батча без max_deferred_for отложение бессрочно).
+                    max_seconds.is_not(None),
+                    overdue,
+                )
+                .order_by(item.c.first_deferred_at, item.c.id)
+                .limit(self.settings.batch_size)
+                .with_for_update(of=(item, outbox), skip_locked=True)
+            )
+        )
+        candidates = [self._finish_row(row) for row in rows]
+        item_ids = [row.item_id for row in candidates]
+        # Отложенная запись outbox больше не нужна: Item завершается ошибкой.
+        if item_ids:
+            _ = await conn.execute(delete(outbox).where(outbox.c.item_id.in_(item_ids)))
+        changed, kick = await self._finish_rows(
+            conn, candidates, state=ItemState.ERROR, label=DEFERRED_TOO_LONG_LABEL, now=now
         )
         finalize = tuple(sorted({row.batch_id for row in candidates}))
         return changed, kick, finalize

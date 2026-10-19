@@ -116,6 +116,8 @@ class CallbackName(StrEnum):
     ON_FINALIZED_TASK = "on_finalized_task"
 
 
+_MAX_DEFERS: Final = 32767
+"""Предел ``th_item.defers`` (smallint): потолок ``max_defers`` строго меньше."""
 _CALLBACK_BROKEN = "options.callbacks: повреждённая запись колбэка"
 _OPTIONS_NOT_JSON = "опции колбэка должны сериализоваться в JSON"
 _CALL_OPTIONS_NOT_JSON = "опции вызова (queue, опции брокера) должны сериализоваться в JSON"
@@ -207,11 +209,21 @@ class _BatchSpec:
     failure_policy: FailurePolicy | None = None
     max_in_flight: int | None = None
     expected_total: int | None = None
+    max_defers: int | None = None
+    max_deferred_for: timedelta | None = None
 
     def _check(self) -> None:
         # Ноль разрешён: окно закрыто, новая работа паркуется (ARCHITECTURE §11.2).
         _check_optional("max_in_flight", self.max_in_flight, 0)
         _check_optional("expected_total", self.expected_total, 0)
+        # smallint th_item.defers: потолок строго меньше предела колонки.
+        _check_optional("max_defers", self.max_defers, 1)
+        if self.max_defers is not None and self.max_defers >= _MAX_DEFERS:
+            message = f"max_defers должен быть меньше {_MAX_DEFERS}, получено {self.max_defers!r}"
+            raise ConfigurationError(message)
+        if self.max_deferred_for is not None and self.max_deferred_for <= timedelta(0):
+            message = "max_deferred_for должен быть положительным timedelta"
+            raise ConfigurationError(message)
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
@@ -934,6 +946,11 @@ class Producer:
         options: dict[str, object] = {}
         if spec.failure_policy is not None:
             options["failure_policy"] = spec.failure_policy.to_json()
+        if spec.max_defers is not None:
+            options["max_defers"] = spec.max_defers
+        if spec.max_deferred_for is not None:
+            # Секунды: jsonb числом, читается обратно в timedelta.
+            options["max_deferred_for"] = spec.max_deferred_for.total_seconds()
         if spec.callbacks:
             options["callbacks"] = {
                 CallbackName(name).value: self._callback(call).to_json()
