@@ -6,9 +6,9 @@
 ## Текущее состояние
 
 * **Ветка:** `docs/resource-management-plan` (план), код — по протоколу PLAN.md §0
-* **Текущая волна:** 3 — RM1.2, RM2.2, RM4.1
-* **Последний зелёный коммит:** a2fa89a
-* **Готово:** 7 из 12
+* **Текущая волна:** 3 завершена; следующая — RM2.3, RM2.4, RM6.1
+* **Последний зелёный коммит:** 0902b5a
+* **Готово:** 9 из 12
 
 ## Задачи
 
@@ -19,11 +19,11 @@
 | RM1.1 | `set_max_in_flight` / `clear_max_in_flight`, ноль разрешён | RM0.1, RM0.2 | done | 0efe1db, cc563cd |
 | RM1.2 | Окно-aware распарковка (`resume` и relay) | RM1.1 | done | a2fa89a |
 | RM2.1 | Миграция: `defer_reason`, `defers`, `first_deferred_at`, индекс | RM0.2 | done | fcc606d, d8b6c0c |
-| RM2.2 | `item.defer()`: API и транзакция | RM2.1, RM1.1 | in_progress | |
+| RM2.2 | `item.defer()`: API и транзакция | RM2.1, RM1.1 | done | a6a816e, 6829766 |
 | RM2.3 | Потолки `max_defers` / `max_deferred_for` + sweeper | RM2.2 | todo | |
 | RM2.4 | `Progress.deferred`, `deferred_reasons`, событие | RM2.2 | todo | |
 | RM3.1 | Ленивый импорт `hook_modules` + `install_hooks()` | — | done | 098564b, 2bf5f09 |
-| RM4.1 | `th.demand()` и `BatchDemand` | RM0.2, RM2.1 | todo | |
+| RM4.1 | `th.demand()` и `BatchDemand` | RM0.2, RM2.1 | done | 0902b5a |
 | RM5.1 | Решение «подпул = батч» вместо `requires=` (только документы) | — | done | 642828c, 84a8689 |
 | RM6.1 | `deadline_mode="active"` | RM1.1 | todo | |
 | RM7.1 | Приёмка A-RM: 0 сгоревших ретраев | RM1.2, RM2.3, RM2.4, RM4.1 | todo | |
@@ -57,6 +57,35 @@
 - Отклонения от плана/доков: … (или «нет»)
 - Узнали / на что обратить внимание дальше: …
 -->
+
+### 2026-10-19 · RM4.1 · done · 0902b5a
+- Сделано: `th.demand(kinds, attributes=, limit=)` → `list[BatchDemand]` одним составным
+  запросом (коррелированные подзапросы по th_counter/th_counter_delta/th_lease/th_outbox);
+  частичный индекс `th_batch (kind) WHERE state IN (open, sealed)`; флаг `truncated` на
+  строках; две записи в HOT_QUERIES под EXPLAIN-гард. 8 engine-тестов + 2 api-теста.
+- Отклонения от плана/доков: `truncated` сделан полем `BatchDemand` (одинаковым у всех
+  строк выдачи), как указано в ARCHITECTURE §11.2; возврат остаётся `list[BatchDemand]`.
+  Сверка с view(): pending = found - done, in_flight и deferred совпадают.
+- Узнали / на что обратить внимание дальше: под-батч попадает в demand только если его
+  собственный `kind` в наборе `kinds`; фильтр `attributes` смотрит на атрибуты корня
+  (join по root_id) и работает для под-батчей. Тест счётчика SQL-запросов: ровно 1 SELECT
+  на любой размер выборки.
+
+### 2026-10-19 · RM2.2 · done · a6a816e, 6829766
+- Сделано: `item.defer(reason=, delay=, until=)` — итог попытки наравне с ok/skip/error;
+  `Completer.defer` (путь A) и `defer_in` (путь B) одной транзакцией возвращают Item в
+  outbox со сроком и `defer_reason`, поднимают `defers`/`generation`, ставят
+  `first_deferred_at`, освобождают место окна и распарковывают ждущих; `attempt` не
+  растёт, брокеру — успех. `defer_default_delay` (60 с) в настройках. ARCHITECTURE §15 и
+  COUNTERS уточнены (defer: только `dispatched -= 1`). 6 completer-тестов, 5 runtime,
+  defer-часть unit-тестов context.
+- Отклонения от плана/доков: pause/resume теперь не трогают записи с
+  `defer_reason IS NOT NULL` — срок отложения задаёт сам defer, иначе resume сбросил бы
+  `until`. На откате транзакции complete_in сработает запасной путь A (как у finish):
+  Item всё равно отложится, домен откатится — атомарность домена проверяется probe-строкой.
+- Узнали / на что обратить внимание дальше: lease отложенного Item (он остаётся ACTIVE)
+  снимается после commit в `_settle_external` по (item_id, attempt), иначе `state != ACTIVE`
+  его бы не нашёл. `max_defers` ограничен smallint (<32767) — учесть в RM2.3.
 
 ### 2026-10-19 · RM1.2 · done · a2fa89a
 - Сделано: `resume` батча с окном выпускает только свободные места окна
