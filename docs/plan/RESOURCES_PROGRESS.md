@@ -6,7 +6,7 @@
 ## Текущее состояние
 
 * **Ветка:** `docs/resource-management-plan` (план), код — по протоколу PLAN.md §0
-* **Текущая волна:** 3 завершена; следующая — RM2.3, RM2.4, RM6.1
+* **Текущая волна:** 4 — RM2.3 (гейт идёт), RM2.4, RM6.1
 * **Последний зелёный коммит:** 0902b5a
 * **Готово:** 9 из 12
 
@@ -20,7 +20,7 @@
 | RM1.2 | Окно-aware распарковка (`resume` и relay) | RM1.1 | done | a2fa89a |
 | RM2.1 | Миграция: `defer_reason`, `defers`, `first_deferred_at`, индекс | RM0.2 | done | fcc606d, d8b6c0c |
 | RM2.2 | `item.defer()`: API и транзакция | RM2.1, RM1.1 | done | a6a816e, 6829766 |
-| RM2.3 | Потолки `max_defers` / `max_deferred_for` + sweeper | RM2.2 | todo | |
+| RM2.3 | Потолки `max_defers` / `max_deferred_for` + sweeper | RM2.2 | in_progress | 6a657b6 |
 | RM2.4 | `Progress.deferred`, `deferred_reasons`, событие | RM2.2 | todo | |
 | RM3.1 | Ленивый импорт `hook_modules` + `install_hooks()` | — | done | 098564b, 2bf5f09 |
 | RM4.1 | `th.demand()` и `BatchDemand` | RM0.2, RM2.1 | done | 0902b5a |
