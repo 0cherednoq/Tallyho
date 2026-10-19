@@ -6,9 +6,9 @@
 ## Текущее состояние
 
 * **Ветка:** `docs/resource-management-plan` (план), код — по протоколу PLAN.md §0
-* **Текущая волна:** 2 — RM1.1 готова, идёт RM2.1
-* **Последний зелёный коммит:** cc563cd
-* **Готово:** 5 из 12
+* **Текущая волна:** 2 завершена; следующая — RM1.2, RM2.2, RM4.1
+* **Последний зелёный коммит:** d8b6c0c
+* **Готово:** 6 из 12
 
 ## Задачи
 
@@ -18,7 +18,7 @@
 | RM0.2 | ARCHITECTURE и COUNTERS под `defer` и окно 0 | — | done | 7daa67a, 12edbad |
 | RM1.1 | `set_max_in_flight` / `clear_max_in_flight`, ноль разрешён | RM0.1, RM0.2 | done | 0efe1db, cc563cd |
 | RM1.2 | Окно-aware распарковка (`resume` и relay) | RM1.1 | todo | |
-| RM2.1 | Миграция: `defer_reason`, `defers`, `first_deferred_at`, индекс | RM0.2 | in_progress | |
+| RM2.1 | Миграция: `defer_reason`, `defers`, `first_deferred_at`, индекс | RM0.2 | done | fcc606d, d8b6c0c |
 | RM2.2 | `item.defer()`: API и транзакция | RM2.1, RM1.1 | todo | |
 | RM2.3 | Потолки `max_defers` / `max_deferred_for` + sweeper | RM2.2 | todo | |
 | RM2.4 | `Progress.deferred`, `deferred_reasons`, событие | RM2.2 | todo | |
@@ -57,6 +57,30 @@
 - Отклонения от плана/доков: … (или «нет»)
 - Узнали / на что обратить внимание дальше: …
 -->
+
+### 2026-10-19 · волна 2 · общие гейты
+- `uv run poe check` — зелёный, 1345 тестов.
+- `uv run poe test-all` на долгоживущей базе (`TALLYHO_TEST_DSN`, `-n 8`) — 2331 passed,
+  11 skipped, покрытие 98,17%, 38 минут. Четыре падения под `-n 8`
+  (`test_finalizer.py` ×3 — `QueuePool limit ... connection timed out` на общей базе,
+  `test_a_fq_12_...compose` — тайминговая проверка rate-limit) по отдельности зелёные:
+  24 + 22 passed. Это артефакты параллельного прогона, не регресс.
+- На testcontainers тот же набор идёт часами: контейнер пересоздаётся по ходу прогона.
+  Для гейтов удобнее поднять `postgres:16-alpine` один раз и дать `TALLYHO_TEST_DSN`.
+
+### 2026-10-19 · RM2.1 · done · fcc606d, d8b6c0c
+- Сделано: `th_outbox.defer_reason`, `th_item.defers`, `th_item.first_deferred_at` и
+  частичный индекс `th_outbox (batch_id) WHERE defer_reason IS NOT NULL` в схеме v1;
+  запрет индексов по изменяемым колонкам `th_item` расширен на новые
+  (`ITEM_MUTABLE_COLUMNS`); интеграционные тесты установки, частичности индекса,
+  неизменности `th_counter` / `th_counter_delta` и транзакционности DDL миграции.
+- Отклонения от плана/доков: опции батча `max_defers` / `max_deferred_for` в этой
+  задаче **не** заведены — их нет в ARCHITECTURE §11.2, а по AGENTS.md документ правится
+  до кода, и для умолчаний нужен открытый вопрос №1. Передано в RM2.3, которая эти
+  потолки и реализует; миграции они по-прежнему не требуют.
+  Колонки добавлены в v1, а не версией v2: релиза не было (D-080).
+- Узнали / на что обратить внимание дальше: `defers` — `smallint`, потолок
+  `max_defers` обязан быть меньше 32767, иначе колонка переполнится (учесть в RM2.3).
 
 ### 2026-10-19 · RM1.1 · done · 0efe1db, cc563cd
 - Сделано: `max_in_flight = 0` разрешён в спеках корня и под-батча;
