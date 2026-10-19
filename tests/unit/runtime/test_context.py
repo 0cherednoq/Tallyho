@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field, fields
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, cast
 from uuid import uuid4
 
@@ -289,3 +289,54 @@ async def test_wrap_passthrough_rejects_bad_markers_and_module_binding() -> None
     bind_runtime(runtime)
     module_wrapped = tracked(task)
     assert await module_wrapped(4) == 4
+
+
+def test_defer_records_reason_and_default_delay() -> None:
+    context, _ = _context()
+    context.defer(reason="нет кредитов")
+    assert context.deferred is True
+    assert context.defer_reason == "нет кредитов"
+    assert context.defer_until is None
+    assert context.defer_delay == context.defer_default_delay
+
+
+def test_defer_keeps_explicit_delay_and_until() -> None:
+    delayed, _ = _context()
+    delayed.defer(reason="ждём", delay=timedelta(minutes=5))
+    assert delayed.defer_delay == timedelta(minutes=5)
+    assert delayed.defer_until is None
+
+    scheduled, _ = _context()
+    moment = datetime(2030, 1, 1, tzinfo=UTC)
+    scheduled.defer(reason="до срока", until=moment)
+    assert scheduled.defer_until == moment
+    assert scheduled.defer_delay is None
+
+
+def test_defer_rejects_bad_arguments() -> None:
+    context, _ = _context()
+    with pytest.raises(ConfigurationError, match="reason"):
+        context.defer(reason="")
+    moment = datetime(2030, 1, 1, tzinfo=UTC)
+    with pytest.raises(ConfigurationError, match="delay или until"):
+        context.defer(reason="x", delay=timedelta(seconds=1), until=moment)
+    with pytest.raises(ConfigurationError, match="отрицательным"):
+        context.defer(reason="x", delay=timedelta(seconds=-1))
+    with pytest.raises(ConfigurationError, match="причины defer"):
+        context.defer(reason=f"{METRIC_PREFIX}скрытая")
+
+
+def test_defer_and_outcome_are_mutually_exclusive() -> None:
+    after_outcome, _ = _context()
+    after_outcome.ok("готово")
+    with pytest.raises(ConfigurationError, match="после ok/skip/error"):
+        after_outcome.defer(reason="поздно")
+
+    after_defer, _ = _context()
+    after_defer.defer(reason="ждём")
+    with pytest.raises(ConfigurationError, match="после defer"):
+        after_defer.ok("поздно")
+
+
+def test_defer_outside_task_is_noop() -> None:
+    item.defer(reason="ignored")

@@ -420,6 +420,7 @@ class _Facade:
             dispatcher=adapter,
             tree_cache=tree_cache,
             heartbeat_every=heartbeat,
+            defer_default_delay=self.settings.defer_default_delay,
         )
         adapter.install_runtime(
             # Событие DLQ брокера разбирается по правилу сверки (UC-15).

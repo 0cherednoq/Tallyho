@@ -88,6 +88,7 @@ def test_defaults_match_architecture_table() -> None:
         "completer_backpressure": 10_000,
         "lease_ttl": timedelta(seconds=60),
         "heartbeat_every": timedelta(seconds=20),
+        "defer_default_delay": timedelta(seconds=60),
         "relay_grace": timedelta(seconds=5),
         "relay_claim_ttl": timedelta(seconds=30),
         "finalize_grace": timedelta(seconds=30),

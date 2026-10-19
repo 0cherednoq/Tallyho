@@ -84,6 +84,7 @@ class Settings:
     completer_backpressure: int = 10_000
     lease_ttl: timedelta = timedelta(seconds=60)
     heartbeat_every: timedelta = timedelta(seconds=20)
+    defer_default_delay: timedelta = timedelta(seconds=60)
     relay_grace: timedelta = timedelta(seconds=5)
     relay_claim_ttl: timedelta = timedelta(seconds=30)
     finalize_grace: timedelta = timedelta(seconds=30)
@@ -148,6 +149,7 @@ class Settings:
             "completer_tick": self.completer_tick,
             "lease_ttl": self.lease_ttl,
             "heartbeat_every": self.heartbeat_every,
+            "defer_default_delay": self.defer_default_delay,
             "relay_claim_ttl": self.relay_claim_ttl,
             "hook_timeout": self.hook_timeout,
             "hook_backoff_initial": self.hook_backoff_initial,
@@ -201,6 +203,7 @@ class Settings:
             completer_backpressure=self.completer_backpressure,
             lease_ttl=self.lease_ttl,
             heartbeat_every=self.heartbeat_every,
+            defer_default_delay=self.defer_default_delay,
             relay_grace=self.relay_grace,
             relay_claim_ttl=self.relay_claim_ttl,
             finalize_grace=self.finalize_grace,

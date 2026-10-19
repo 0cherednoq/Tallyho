@@ -110,7 +110,7 @@ from tallyho.storage.tx import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Mapping, Sequence
+    from collections.abc import Collection, Iterable, Mapping, Sequence
     from datetime import datetime
     from uuid import UUID
 
@@ -431,7 +431,27 @@ class _Finish:
     """Попытка-владелец lease (UC-03); ``None`` — без проверки lease, только CAS."""
 
 
-_Op = _Claim | _Heartbeat | _Release | _Finish
+@dataclass(frozen=True, slots=True, kw_only=True)
+class _DeferSpec:
+    """Срок и причина отложения Item; общее для пути A и complete_in."""
+
+    reason: str
+    until: datetime | None = None
+    """Абсолютный срок возврата; задан ровно один из ``until`` и ``delay``."""
+    delay: timedelta | None = None
+    """Относительная задержка от ``now`` в SQL."""
+
+
+@dataclass(eq=False, slots=True)
+class _Defer:
+    item: ItemRef
+    spec: _DeferSpec
+    future: asyncio.Future[bool]
+    attempt: int | None = None
+    """Попытка-владелец lease (UC-03); ``None`` — без проверки lease."""
+
+
+_Op = _Claim | _Heartbeat | _Release | _Finish | _Defer
 
 
 def _pending(ops: Sequence[_Op]) -> list[_Op]:
@@ -485,6 +505,10 @@ class _Applied:
     """Операция release, применённая к Item: другие release того же Item в пачке — ``False``."""
     finishers: dict[UUID, _Finish] = field(default_factory=dict["UUID", _Finish])
     """Операция finish, переданная в CAS: другие finish того же Item в пачке — ``False``."""
+    deferrers: dict[UUID, _Defer] = field(default_factory=dict["UUID", _Defer])
+    """Операция defer, применённая к Item: другие defer того же Item в пачке — ``False``."""
+    deferred: set[UUID] = field(default_factory=set["UUID"])
+    """Items, которые defer вернул в outbox (``item.defer``)."""
     requeued: set[UUID] = field(default_factory=set["UUID"])
     """Items, которые release вернул в outbox: дубль доставки уже закрыл джобу брокера."""
     finalize: set[UUID] = field(default_factory=set["UUID"])
@@ -1137,6 +1161,80 @@ class _Tx:
         released = await self._release_window(successful)
         self.applied.kick.update(released)
 
+    async def defer(self, specs: dict[UUID, _DeferSpec]) -> None:
+        """Отложить Items: вернуть в outbox со сроком, не тратя попытку (UC-15).
+
+        Item остаётся ``ACTIVE`` с неизменным ``attempt``; запись outbox
+        получает ``defer_reason`` и ``available_at`` (срок), ``defers`` и
+        ``generation`` растут, ``first_deferred_at`` ставится один раз.
+        Освободившееся место окна отдаётся запаркованным записям батча.
+        Паузу defer уважает: у батча на паузе срок — ``infinity``.
+        """
+        if not specs:
+            return
+        item = self.tables.item
+        outbox = self.tables.outbox
+        deferred: list[UUID] = []
+        for item_id in sorted(specs):
+            spec = specs[item_id]
+            row = self.items.get(item_id)
+            if row is None or row.state.is_terminal:
+                continue
+            # Срок отложения — у самой записи; pause/resume её не трогают, поэтому
+            # available_at не зависит от паузы батча (до срока relay её не отдаёт,
+            # а на паузе паркует как любую готовую запись).
+            if spec.until is not None:
+                available_at: ColumnElement[datetime] = literal(spec.until)
+            else:
+                available_at = self.now + literal(spec.delay, Interval())
+            source = select(
+                item.c.id,
+                _small(OutboxKind.ITEM),
+                item.c.batch_id,
+                item.c.id,
+                item.c.task_name,
+                available_at,
+                literal(spec.reason, Text()),
+            ).where(item.c.id == item_id)
+            inserted = await self.conn.scalar(
+                insert(outbox)
+                .from_select(
+                    [
+                        "id",
+                        "kind",
+                        "batch_id",
+                        "item_id",
+                        "task_name",
+                        "available_at",
+                        "defer_reason",
+                    ],
+                    source,
+                )
+                .on_conflict_do_nothing(index_elements=[outbox.c.id])
+                .returning(outbox.c.id)
+            )
+            if inserted is None:
+                # Запись уже в outbox (дубль доставки до relay DELETE): defer не повторяем.
+                continue
+            deferred.append(item_id)
+            # Item покинул брокера: окно max_in_flight считает dispatched - done.
+            self.deltas[row.batch_id] += CounterDelta(dispatched=-1)
+        if not deferred:
+            return
+        _ = await self.conn.execute(
+            update(item)
+            .where(item.c.id == any_(_uuids(sorted(deferred))))
+            .values(
+                defers=item.c.defers + 1,
+                generation=item.c.generation + 1,
+                first_deferred_at=func.coalesce(item.c.first_deferred_at, self.now),
+            )
+        )
+        await self._delete_leases(deferred)
+        released = await self._release_window(deferred)
+        self.applied.kick.update(released)
+        self.applied.deferred.update(deferred)
+
     async def expand(self, values: dict[UUID, tuple[ItemRef, FinishResult]]) -> None:
         """Записать spawn/expect только для Items, чей CAS finish был успешен."""
         # Items, завершённые release по исчерпанным попыткам, ничего не порождают.
@@ -1406,7 +1504,7 @@ def _value_batches(value: FinishResult, batch_ids: list[UUID]) -> bool:
     return bool(value.sub_batches)
 
 
-_Owned = TypeVar("_Owned", _Release, _Finish)
+_Owned = TypeVar("_Owned", _Release, _Finish, _Defer)
 
 
 def _owners(tx: _Tx, ops: Sequence[_Owned]) -> dict[UUID, _Owned]:
@@ -1438,6 +1536,8 @@ class _UserCommit:
     delta_ids: frozenset[int]
     metric_slots: tuple[SlotKey, ...]
     """Слоты транзакции в ``th_metric`` по батчам."""
+    deferred: bool = False
+    """Item отложен (остаётся ACTIVE): lease удаляется по попытке, не по state."""
 
 
 def _small(value: int) -> ColumnElement[int]:
@@ -1602,6 +1702,94 @@ class Completer:
         future = self._new_future(bool)
         op = _Heartbeat(item, (progress_done, progress_total), future, attempt)
         return await self._submit(op, future)
+
+    async def defer(
+        self,
+        item: ItemRef,
+        *,
+        reason: str,
+        until: datetime | None = None,
+        delay: timedelta | None = None,
+        attempt: int | None = None,
+    ) -> bool:
+        """Отложить Item: вернуть в outbox со сроком, не тратя попытку (UC-15).
+
+        Успешный выход задачи, а не отказ: lease удаляется без ``attempt += 1``,
+        запись outbox получает ``defer_reason`` и срок (``until`` или
+        ``now + delay``), ``defers`` и ``generation`` растут. Item остаётся
+        ``ACTIVE``, поэтому батч не финализируется, пока он не завершится.
+
+        Args:
+            item: Item, захваченный этим процессом.
+            reason: Причина отложения (``defer_reason``).
+            until: Абсолютный срок; взаимоисключается с ``delay``.
+            delay: Задержка от ``now``; задать ровно один из ``until``/``delay``.
+            attempt: Номер попытки из claim; с ним Item откладывается, только
+                если lease взят этим процессом для этой попытки (UC-03).
+
+        Returns:
+            ``True``, если этот вызов отложил Item; ``False`` для повторного,
+            уже завершённого Item или попытки, потерявшей lease.
+        """
+        future = self._new_future(bool)
+        spec = _DeferSpec(reason=reason, until=until, delay=delay)
+        return await self._submit(_Defer(item, spec, future, attempt), future)
+
+    async def defer_in(
+        self,
+        target: AsyncSession | AsyncConnection,
+        item: ItemRef,
+        *,
+        reason: str,
+        until: datetime | None = None,
+        delay: timedelta | None = None,
+        attempt: int | None = None,
+    ) -> bool:
+        """Отложить Item внутри транзакции пользователя (путь B, UC-08/UC-15).
+
+        Домен пользователя и отложение коммитятся одной транзакцией: при её
+        откате не остаётся ни того, ни другого. lease удаляется после commit
+        в короткой транзакции Completer, как у :meth:`complete_in`, чтобы
+        heartbeat той же попытки не ловил 40001.
+
+        Args:
+            target: Открытая пользовательская сессия или соединение.
+            item: Откладываемый Item.
+            reason: Причина отложения.
+            until: Абсолютный срок; взаимоисключается с ``delay``.
+            delay: Задержка от ``now``; задан ровно один из ``until``/``delay``.
+            attempt: Номер попытки из claim; с ним откладывает только владелец.
+
+        Returns:
+            ``True``, если Item отложен; ``False``, если он уже терминальный,
+            запись уже в outbox или попытка потеряла lease.
+
+        Raises:
+            ClosedError: Completer закрыт; транзакция пользователя не тронута.
+        """
+        if self._closing:
+            raise ClosedError(_CLOSED)
+        conn = await resolve_connection(target)
+        tx = _Tx(self, conn, user_tx=True)
+        await tx.lock_batches([item.batch_id])
+        if attempt is not None:
+            await tx.lock_items([item.id])
+            await tx.lock_leases([item.id], lock=False)
+            if not tx.holds(item, attempt):
+                self._forget(item.id, attempt)
+                return False
+        await tx.defer({item.id: _DeferSpec(reason=reason, until=until, delay=delay)})
+        if item.id not in tx.applied.deferred:
+            self._forget(item.id, attempt)
+            return False
+        inserted = await insert_delta(conn, self.tables, tx.deltas, created_at=tx.now)
+        delta_ids = frozenset(delta_id for ids in inserted.values() for delta_id in ids)
+        tx.applied.progress.update(tx.deltas)
+        done = _UserCommit(
+            item_id=item.id, attempt=attempt, delta_ids=delta_ids, metric_slots=(), deferred=True
+        )
+        await after_commit(target, lambda: self._schedule_external(tx.applied, done))
+        return True
 
     async def release(self, item: ItemRef, *, attempt: int | None = None) -> bool:
         """Отпустить lease перед ретраем брокера: ``attempt += 1`` (UC-04, вердикт RETRY).
@@ -1924,15 +2112,32 @@ class Completer:
         """
         item = self.tables.item
         lease = self.tables.lease
-        # Строка Item — под блокировкой; Item, переоткрытый retry_failed после
-        # commit, не терминальный, и его новый lease остаётся.
-        finished = (
-            select(item.c.id)
-            .where(item.c.id == done.item_id, item.c.state != _ACTIVE)
-            .with_for_update()
-            .scalar_subquery()
-        )
-        _ = await conn.execute(delete(lease).where(lease.c.item_id == finished))
+        if done.deferred:
+            # Отложенный Item остаётся ACTIVE: lease этой попытки снимаем по
+            # (item_id, attempt). Reclaim после истечения берёт новый attempt,
+            # поэтому чужой lease не удаляем. Строку Item блокируем в том же
+            # порядке (§9.2), чтобы heartbeat и reclaim не шли параллельно.
+            locked = (
+                select(item.c.id)
+                .where(item.c.id == done.item_id)
+                .with_for_update()
+                .scalar_subquery()
+            )
+            _ = await conn.execute(
+                delete(lease).where(lease.c.item_id == locked, lease.c.attempt == done.attempt)
+                if done.attempt is not None
+                else delete(lease).where(lease.c.item_id == locked)
+            )
+        else:
+            # Строка Item — под блокировкой; Item, переоткрытый retry_failed после
+            # commit, не терминальный, и его новый lease остаётся.
+            finished = (
+                select(item.c.id)
+                .where(item.c.id == done.item_id, item.c.state != _ACTIVE)
+                .with_for_update()
+                .scalar_subquery()
+            )
+            _ = await conn.execute(delete(lease).where(lease.c.item_id == finished))
         folded = await fold_delta_ids(conn, self.tables, done.delta_ids)
         taken = await take_metric_slot(conn, self.tables, done.metric_slots)
         slot = self.settings.slot
@@ -2033,6 +2238,7 @@ class Completer:
         beats: list[_Heartbeat] = []
         release_ops: list[_Release] = []
         finish_ops: list[_Finish] = []
+        defer_ops: list[_Defer] = []
         for op in ops:
             if isinstance(op, _Claim):
                 if op.item.id in claims:
@@ -2042,16 +2248,21 @@ class Completer:
                 beats.append(op)
             elif isinstance(op, _Release):
                 release_ops.append(op)
+            elif isinstance(op, _Defer):
+                defer_ops.append(op)
             else:
                 finish_ops.append(op)
         # Все блокировки строк — в начале и по порядку: batch → item → lease.
         batch_ids = [ref.batch_id for ref in claims.values()]
-        # release может вернуть Item в outbox, а там важна пауза батча.
-        batch_ids.extend(op.item.batch_id for op in ops if isinstance(op, _Finish | _Release))
+        # release и defer возвращают Item в outbox, а там важна пауза батча.
+        batch_ids.extend(
+            op.item.batch_id for op in ops if isinstance(op, _Finish | _Release | _Defer)
+        )
         writes_structure = _expansion_batches(finish_ops, batch_ids)
         await tx.lock_batches(batch_ids, write=writes_structure)
         touched = [op.item.id for op in release_ops]
         touched.extend(op.item.id for op in finish_ops)
+        touched.extend(op.item.id for op in defer_ops)
         await tx.lock_items([*touched, *claims])
         await tx.lock_leases([*touched, *claims, *(op.item.id for op in beats)])
         # release раньше claim: ретрай брокера мог прийти в ту же пачку.
@@ -2068,6 +2279,9 @@ class Completer:
         finishes = {item_id: (op.item, op.value) for item_id, op in tx.applied.finishers.items()}
         await tx.finish(finishes)
         await tx.expand(finishes)
+        # defer — после finish: один и тот же Item не может и завершиться, и отложиться.
+        tx.applied.deferrers = _owners(tx, defer_ops)
+        await tx.defer({item_id: op.spec for item_id, op in tx.applied.deferrers.items()})
         await tx.write_counters()
         tx.applied.progress.update(tx.deltas)
         return tx.applied
@@ -2085,12 +2299,15 @@ class Completer:
                     # Lease не у этой попытки: она Item больше не держит.
                     self._forget(op.item.id, op.attempt)
             else:
-                chosen = (
-                    applied.releasers.get(op.item.id)
-                    if isinstance(op, _Release)
-                    else applied.finishers.get(op.item.id)
-                )
-                done = applied.released if isinstance(op, _Release) else applied.finished
+                if isinstance(op, _Release):
+                    chosen: _Release | _Finish | _Defer | None = applied.releasers.get(op.item.id)
+                    done: Collection[UUID] = applied.released
+                elif isinstance(op, _Defer):
+                    chosen = applied.deferrers.get(op.item.id)
+                    done = applied.deferred
+                else:
+                    chosen = applied.finishers.get(op.item.id)
+                    done = applied.finished
                 value = chosen is op and op.item.id in done
                 if chosen is op:
                     _ = self._held.pop(op.item.id, None)

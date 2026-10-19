@@ -284,6 +284,7 @@ class WorkerFactory(Protocol):
         dispatcher: Dispatcher,
         tree_cache: object,
         heartbeat_every: timedelta,
+        defer_default_delay: timedelta,
     ) -> WorkerRuntime:
         """Собрать runtime из непрозрачных engine-сервисов."""
         ...

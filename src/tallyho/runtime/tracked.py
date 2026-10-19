@@ -9,6 +9,7 @@ import inspect
 import logging
 from collections.abc import Mapping
 from contextvars import ContextVar
+from datetime import timedelta
 from typing import TYPE_CHECKING, ParamSpec, Protocol, TypeVar, cast, final
 from uuid import UUID
 
@@ -34,7 +35,6 @@ from tallyho.runtime.context import (
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
-    from datetime import timedelta
 
     from tallyho.engine.completer import Completer
     from tallyho.engine.spawn import TreeCache, TreeSnapshot
@@ -49,6 +49,7 @@ _log = logging.getLogger(__name__)
 
 _runtime: ContextVar[TaskRuntime | None] = ContextVar("tallyho_runtime", default=None)
 _installed: list[TaskRuntime] = []
+_DEFAULT_DEFER_DELAY = timedelta(seconds=60)
 _NOT_INSTALLED = "tallyho runtime не установлен"
 _BAD_MARKER = "служебный аргумент _th имеет неверный формат"
 _TREE_FAILED = "не удалось прочитать дерево батча после claim"
@@ -69,6 +70,7 @@ class TaskRuntime:
     dispatcher: Dispatcher
     tree_cache: TreeCache
     heartbeat_every: timedelta
+    defer_default_delay: timedelta
 
     def __init__(
         self,
@@ -78,6 +80,7 @@ class TaskRuntime:
         dispatcher: Dispatcher,
         tree_cache: TreeCache,
         heartbeat_every: timedelta,
+        defer_default_delay: timedelta = _DEFAULT_DEFER_DELAY,
     ) -> None:
         """Собрать runtime вокруг engine и адаптера брокера.
 
@@ -92,6 +95,7 @@ class TaskRuntime:
         self.dispatcher = dispatcher
         self.tree_cache = tree_cache
         self.heartbeat_every = heartbeat_every
+        self.defer_default_delay = defer_default_delay
 
     def wrap(self, fn: Callable[P, Awaitable[R]]) -> Callable[P, Awaitable[R | None]]:
         """Обернуть только ``async def`` и сохранить метаданные.
@@ -162,6 +166,7 @@ class TaskRuntime:
             tree=tree,
             make_call=self._make_call,
             completer=self.completer,
+            defer_default_delay=self.defer_default_delay,
         )
         heartbeat = asyncio.create_task(
             self._heartbeat(context), name=f"tallyho-heartbeat-{ref.id}"
@@ -232,9 +237,19 @@ class TaskRuntime:
             raise
         if not (context.completed_in_user_tx or context.lease_lost):
             # Потерянный lease здесь ничего не меняет: брокеру — успех, итог не записан.
-            _ = await self.completer.finish(
-                context.ref, context.finish_result(), attempt=context.attempt
-            )
+            if context.deferred:
+                # defer — успешный выход: попытка не тратится, ретрая и DLQ нет.
+                _ = await self.completer.defer(
+                    context.ref,
+                    reason=context.defer_reason,
+                    until=context.defer_until,
+                    delay=context.defer_delay,
+                    attempt=context.attempt,
+                )
+            else:
+                _ = await self.completer.finish(
+                    context.ref, context.finish_result(), attempt=context.attempt
+                )
         return result
 
     async def _settle_failure(self, exc: BaseException, context: ItemContext) -> bool:
@@ -300,6 +315,7 @@ def build_runtime(
     dispatcher: Dispatcher,
     tree_cache: object,
     heartbeat_every: timedelta,
+    defer_default_delay: timedelta,
 ) -> TaskRuntime:
     """Собрать и активировать runtime из непрозрачных engine-зависимостей.
 
@@ -312,6 +328,7 @@ def build_runtime(
         dispatcher=dispatcher,
         tree_cache=cast("TreeCache", tree_cache),
         heartbeat_every=heartbeat_every,
+        defer_default_delay=defer_default_delay,
     )
     bind_runtime(runtime)
     return runtime

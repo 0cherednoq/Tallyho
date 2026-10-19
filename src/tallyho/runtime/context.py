@@ -5,6 +5,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
+from datetime import timedelta
 from typing import TYPE_CHECKING, ParamSpec, Protocol, Self, TypeVar, cast, overload
 
 from tallyho.engine.completer import ExpectRequest, FinishResult, SpawnRequest, SubBatchRequest
@@ -17,7 +18,7 @@ from tallyho.storage.tx import after_commit, after_commit_pending, resolve_conne
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Generator, Iterable, Mapping
-    from datetime import datetime, timedelta
+    from datetime import datetime
     from uuid import UUID
 
     from sqlalchemy.engine import Connection
@@ -46,11 +47,17 @@ T = TypeVar("T")
 U = TypeVar("U")
 V = TypeVar("V")
 
+_DEFAULT_DEFER_DELAY = timedelta(seconds=60)
 _NO_CONTEXT = "операция th.item доступна только внутри отслеживаемой задачи"
 _OTHER_TRANSACTION = (
     "complete_in уже вызван в другой, ещё не завершённой транзакции: "
     "Item завершается в одной транзакции"
 )
+_DEFER_EMPTY_REASON = "defer требует непустой reason"
+_DEFER_DELAY_AND_UNTIL = "defer принимает delay или until, но не оба сразу"
+_DEFER_NEGATIVE_DELAY = "delay у defer не может быть отрицательным"
+_DEFER_AFTER_OUTCOME = "defer нельзя вызывать после ok/skip/error той же попытки"
+_OUTCOME_AFTER_DEFER = "ok/skip/error нельзя вызывать после defer той же попытки"
 
 
 class CallFactory(Protocol):
@@ -164,6 +171,7 @@ class ItemContext:
     completer: Completer
     progress_done: int | None = None
     progress_total: int | None = None
+    defer_default_delay: timedelta = field(default=_DEFAULT_DEFER_DELAY)
     completed_in_user_tx: bool = False
     lease_lost: bool = False
     """``complete_in`` обнаружил, что попытка больше не владеет Item (UC-08)."""
@@ -179,6 +187,12 @@ class ItemContext:
     _result: object = None
     _error: object = None
     _mark: bool | None = None
+    _outcome_set: bool = False
+    """Явно вызван ok/skip/error: defer после этого — ошибка порядка."""
+    _deferred: bool = False
+    _defer_reason: str = ""
+    _defer_until: datetime | None = None
+    _defer_delay: timedelta | None = None
 
     @property
     def id(self) -> UUID:
@@ -351,6 +365,65 @@ class ItemContext:
         """Установить ошибочный итог без выбрасывания исключения."""
         self._set_result(ResultClass.ERROR, label, error=detail, mark=mark)
 
+    def defer(
+        self,
+        *,
+        reason: str,
+        delay: timedelta | None = None,
+        until: datetime | None = None,
+    ) -> None:
+        """Отложить Item вместо завершения попытки (UC-15).
+
+        Итог попытки, как ``ok``/``skip``/``error``: взаимоисключается с ними
+        по порядку. Запись фактически выполняется на успешной ветке обёртки
+        задачи или в ``complete_in``. Попытка не тратится, ``attempt`` не
+        растёт; Item возвращается в очередь со сроком и причиной.
+
+        Args:
+            reason: Непустая причина (валидируется как метка: первый символ
+                не может быть U+001F, есть предел длины).
+            delay: Задержка от «сейчас»; взаимоисключается с ``until``. Без
+                обоих — ``defer_default_delay`` из настроек.
+            until: Абсолютный срок возврата.
+
+        Raises:
+            ConfigurationError: пустой ``reason``; ``delay`` и ``until`` вместе;
+                отрицательный ``delay``; вызов после ``ok``/``skip``/``error``.
+        """
+        if not reason:
+            raise ConfigurationError(_DEFER_EMPTY_REASON)
+        check_counter_name(reason, what="причины defer")
+        if delay is not None and until is not None:
+            raise ConfigurationError(_DEFER_DELAY_AND_UNTIL)
+        if delay is not None and delay < timedelta(0):
+            raise ConfigurationError(_DEFER_NEGATIVE_DELAY)
+        if self._outcome_set:
+            raise ConfigurationError(_DEFER_AFTER_OUTCOME)
+        self._deferred = True
+        self._defer_reason = reason
+        self._defer_until = until
+        self._defer_delay = None if until is not None else (delay or self.defer_default_delay)
+
+    @property
+    def deferred(self) -> bool:
+        """Попытка завершается отложением, а не итогом ``ok``/``skip``/``error``."""
+        return self._deferred
+
+    @property
+    def defer_reason(self) -> str:
+        """Причина отложения, заданная ``defer``."""
+        return self._defer_reason
+
+    @property
+    def defer_until(self) -> datetime | None:
+        """Абсолютный срок возврата или ``None``."""
+        return self._defer_until
+
+    @property
+    def defer_delay(self) -> timedelta | None:
+        """Задержка возврата или ``None``, если задан ``until``."""
+        return self._defer_delay
+
     async def complete_in(self, session: AsyncSession | AsyncConnection) -> None:
         """Атомарно завершить Item в транзакции пользователя (ARCHITECTURE UC-08).
 
@@ -382,9 +455,19 @@ class ItemContext:
             if pending.connection is not connection:
                 raise ConfigurationError(_OTHER_TRANSACTION)
             return
-        changed = await self.completer.complete_in(
-            session, self.ref, self.finish_result(), attempt=self.attempt
-        )
+        if self._deferred:
+            changed = await self.completer.defer_in(
+                session,
+                self.ref,
+                reason=self._defer_reason,
+                until=self._defer_until,
+                delay=self._defer_delay,
+                attempt=self.attempt,
+            )
+        else:
+            changed = await self.completer.complete_in(
+                session, self.ref, self.finish_result(), attempt=self.attempt
+            )
         if not changed:
             self.lease_lost = True
             raise LeaseLostError(self.id)
@@ -430,8 +513,11 @@ class ItemContext:
         error: object = None,
         mark: bool | None = None,
     ) -> None:
+        if self._deferred:
+            raise ConfigurationError(_OUTCOME_AFTER_DEFER)
         if label is not None:
             check_counter_name(label, what="метки")
+        self._outcome_set = True
         self._result_class = result_class
         self._label = label
         self._result = result
@@ -630,6 +716,17 @@ class ItemFacade:
         """Делегировать ошибочный итог; вне задачи — no-op."""
         if (context := self.current()) is not None:
             context.error(label, detail=detail, mark=mark)
+
+    def defer(
+        self,
+        *,
+        reason: str,
+        delay: timedelta | None = None,
+        until: datetime | None = None,
+    ) -> None:
+        """Делегировать отложение; вне задачи — no-op."""
+        if (context := self.current()) is not None:
+            context.defer(reason=reason, delay=delay, until=until)
 
     async def complete_in(self, session: AsyncSession | AsyncConnection) -> None:
         """Делегировать ``complete_in``; вне задачи — no-op.

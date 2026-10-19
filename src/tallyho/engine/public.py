@@ -105,6 +105,7 @@ class EngineSettings:
     completer_backpressure: int
     lease_ttl: timedelta
     heartbeat_every: timedelta
+    defer_default_delay: timedelta
     relay_grace: timedelta
     relay_claim_ttl: timedelta
     finalize_grace: timedelta

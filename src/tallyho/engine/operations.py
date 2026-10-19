@@ -177,7 +177,12 @@ class Operations:
         )
         _ = await conn.execute(
             update(self.tables.outbox)
-            .where(self.tables.outbox.c.batch_id.in_(ids), self.tables.outbox.c.kind == _ITEM)
+            .where(
+                self.tables.outbox.c.batch_id.in_(ids),
+                self.tables.outbox.c.kind == _ITEM,
+                # Отложенные записи живут по своему сроку (defer): их не паркуем.
+                self.tables.outbox.c.defer_reason.is_(None),
+            )
             .values(available_at=_INFINITY)
         )
 
@@ -208,7 +213,11 @@ class Operations:
             _ = await conn.execute(
                 update(outbox)
                 .where(
-                    outbox.c.batch_id == batch.c.id, batch.c.id.in_(free), outbox.c.kind == _ITEM
+                    outbox.c.batch_id == batch.c.id,
+                    batch.c.id.in_(free),
+                    outbox.c.kind == _ITEM,
+                    # Только запаркованные (пауза/окно): у отложенных записей свой срок.
+                    outbox.c.available_at == _INFINITY,
                 )
                 .values(available_at=available)
             )
