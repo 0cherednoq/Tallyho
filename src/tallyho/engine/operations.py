@@ -24,7 +24,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.dialects.postgresql import JSONB
 
-from tallyho.engine.relay import refill_window
+from tallyho.engine.relay import refill_window, window_room
 from tallyho.model.errors import (
     BatchPurged,
     ConfigurationError,
@@ -91,6 +91,14 @@ class _ItemRow:
     options: object | None
     weight: int
     label: str | None
+
+
+@dataclass(frozen=True, slots=True, kw_only=True)
+class _Window:
+    """Окно батча и его ``start_at``: распарковка знает и предел, и срок."""
+
+    limit: int
+    start_at: datetime | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -174,7 +182,14 @@ class Operations:
         )
 
     async def resume(self, target: AsyncSession | AsyncConnection, batch_id: UUID) -> None:
-        """Снять паузу и вернуть припаркованные Items в очередь."""
+        """Снять паузу и вернуть припаркованные Items в очередь.
+
+        Пауза и переполненное окно паркуют записи одинаково
+        (``available_at = ∞``), поэтому батч с окном распарковывается не
+        целиком: выпускается столько записей, сколько свободно в окне, а
+        остальные остаются запаркованными до освобождения мест (ARCHITECTURE
+        §6.2). Инвариант ``count(th_window) <= max_in_flight`` держится.
+        """
         conn = await resolve_connection(target)
         ids = await self._lock_subtree(conn, batch_id)
         await self._ensure_retained(conn, batch_id)
@@ -187,12 +202,52 @@ class Operations:
             .values(paused_at=None, updated_at=now)
         )
         available = func.greatest(func.coalesce(batch.c.start_at, now), now)
-        _ = await conn.execute(
-            update(outbox)
-            .where(outbox.c.batch_id == batch.c.id, batch.c.id.in_(ids), outbox.c.kind == _ITEM)
-            .values(available_at=available)
-        )
+        windows = await self._windows(conn, ids)
+        free = [value for value in ids if value not in windows]
+        if free:
+            _ = await conn.execute(
+                update(outbox)
+                .where(
+                    outbox.c.batch_id == batch.c.id, batch.c.id.in_(free), outbox.c.kind == _ITEM
+                )
+                .values(available_at=available)
+            )
+        for windowed, schedule in windows.items():
+            await self._resume_windowed(conn, windowed, schedule=schedule, now=now)
         await self._after(target, relay=ids)
+
+    async def _windows(self, conn: AsyncConnection, ids: Sequence[UUID]) -> dict[UUID, _Window]:
+        # Батчи поддерева с окном: остальные распарковываются одним UPDATE.
+        batch = self.tables.batch
+        rows = await conn.execute(
+            select(batch.c.id, batch.c.max_in_flight, batch.c.start_at)
+            .where(batch.c.id.in_(ids), batch.c.max_in_flight.is_not(None))
+            .order_by(batch.c.id)
+        )
+        return {row[0]: _Window(limit=row[1], start_at=row[2]) for row in rows}
+
+    async def _resume_windowed(
+        self, conn: AsyncConnection, batch_id: UUID, *, schedule: _Window, now: datetime
+    ) -> None:
+        # Запись батча с окном выпускается только на свободное место окна.
+        room = await window_room(conn, self.tables, batch_id, limit=schedule.limit)
+        if not room:
+            return
+        outbox = self.tables.outbox
+        chosen = (
+            select(outbox.c.id)
+            .where(
+                outbox.c.batch_id == batch_id,
+                outbox.c.available_at == _INFINITY,
+                outbox.c.kind == _ITEM,
+            )
+            .limit(room)
+            .with_for_update(skip_locked=True)
+        )
+        available = max(schedule.start_at or now, now)
+        _ = await conn.execute(
+            update(outbox).where(outbox.c.id.in_(chosen)).values(available_at=literal(available))
+        )
 
     async def set_max_in_flight(
         self,

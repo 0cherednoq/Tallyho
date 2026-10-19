@@ -96,7 +96,14 @@ if TYPE_CHECKING:
     from tallyho.storage.tables import Tables
     from tallyho.storage.tx import TxSettings
 
-__all__ = ["Relay", "RelaySettings", "refill_window", "release_window", "window_lock_key"]
+__all__ = [
+    "Relay",
+    "RelaySettings",
+    "refill_window",
+    "release_window",
+    "window_lock_key",
+    "window_room",
+]
 
 _log = logging.getLogger(__name__)
 
@@ -862,24 +869,44 @@ async def refill_window(
             # Окна нет: парковка окном невозможна, запаркованное уезжает целиком.
             room[batch_id] = None
             continue
-        in_window = await _bounded_count(
-            conn,
-            tables.window.c.batch_id == batch_id,
-            column=tables.window.c.item_id,
-            limit=limit,
-        )
-        ready = await _bounded_count(
-            conn,
-            (outbox.c.batch_id == batch_id)
-            & (outbox.c.kind == _small(OutboxKind.ITEM))
-            & (outbox.c.available_at < _infinity()),
-            column=outbox.c.id,
-            limit=limit,
-        )
-        busy = in_window + ready
-        if busy < limit:
-            room[batch_id] = limit - busy
+        free = await window_room(conn, tables, batch_id, limit=limit)
+        if free:
+            room[batch_id] = free
     return await _unpark(conn, tables, room)
+
+
+async def window_room(conn: AsyncConnection, tables: Tables, batch_id: UUID, *, limit: int) -> int:
+    """Сколько записей батча ещё можно выпустить в окно ``limit``.
+
+    Свободно = окно - строки ``th_window`` (отправлено и не завершено) -
+    готовые к отправке записи outbox батча. Готовые считаются, потому что
+    relay захватит их без спроса, и место для них должно быть уже занято.
+
+    Args:
+        conn: Соединение в открытой транзакции.
+        tables: Таблицы установки.
+        batch_id: Батч с окном.
+        limit: Текущее окно батча, ``>= 0``.
+
+    Returns:
+        Свободные места, от нуля до ``limit``.
+    """
+    outbox = tables.outbox
+    in_window = await _bounded_count(
+        conn,
+        tables.window.c.batch_id == batch_id,
+        column=tables.window.c.item_id,
+        limit=limit,
+    )
+    ready = await _bounded_count(
+        conn,
+        (outbox.c.batch_id == batch_id)
+        & (outbox.c.kind == _small(OutboxKind.ITEM))
+        & (outbox.c.available_at < _infinity()),
+        column=outbox.c.id,
+        limit=limit,
+    )
+    return max(0, limit - in_window - ready)
 
 
 async def _bounded_count(
