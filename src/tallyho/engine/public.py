@@ -138,7 +138,7 @@ class MaintenanceRunner(Protocol):
         ...
 
 
-class EngineFacade(Protocol):
+class EngineFacade(Protocol):  # ruff: ignore[too-many-public-methods]  # фасад зеркалит публичный API батча (ARCHITECTURE §11.2)
     """Операции T6.1, реализованные внутри engine-слоя."""
 
     def install(self, adapter: Dispatcher | None, worker_factory: WorkerFactory) -> None:
@@ -224,6 +224,17 @@ class EngineFacade(Protocol):
 
     async def cancel(self, target: AsyncSession | AsyncConnection | None, batch_id: UUID) -> None:
         """Запросить отмену."""
+        ...
+
+    async def set_max_in_flight(
+        self,
+        target: AsyncSession | AsyncConnection | None,
+        batch_id: UUID,
+        limit: int | None,
+        *,
+        reason: str | None = None,
+    ) -> None:
+        """Задать (``limit >= 0``) или снять (``None``) окно батча."""
         ...
 
     async def reschedule(

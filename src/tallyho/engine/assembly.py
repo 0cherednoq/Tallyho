@@ -164,7 +164,7 @@ class _Writer:
         await after_commit(self.target, lambda: self.finalize(batch_id))
 
 
-@dataclass(eq=False, kw_only=True)
+@dataclass(eq=False, kw_only=True)  # ruff: ignore[too-many-public-methods]  # фасад зеркалит публичный API батча (ARCHITECTURE §11.2)
 class _Facade:
     installation: Installation
     clock: Clock
@@ -587,6 +587,21 @@ class _Facade:
             return
         async with begin_transaction(self.installation.engine) as conn:
             _ = await operations.cancel(conn, batch_id)
+
+    async def set_max_in_flight(
+        self,
+        target: AsyncSession | AsyncConnection | None,
+        batch_id: UUID,
+        limit: int | None,
+        *,
+        reason: str | None = None,
+    ) -> None:
+        operations = self._live(self._operations)
+        if target is not None:
+            await operations.set_max_in_flight(target, batch_id, limit, reason=reason)
+            return
+        async with begin_transaction(self.installation.engine) as conn:
+            await operations.set_max_in_flight(conn, batch_id, limit, reason=reason)
 
     async def reschedule(
         self,

@@ -22,8 +22,15 @@ from sqlalchemy import (
     select,
     update,
 )
+from sqlalchemy.dialects.postgresql import JSONB
 
-from tallyho.model.errors import BatchPurged, DownstreamFinalized, InvalidStateError
+from tallyho.engine.relay import refill_window
+from tallyho.model.errors import (
+    BatchPurged,
+    ConfigurationError,
+    DownstreamFinalized,
+    InvalidStateError,
+)
 from tallyho.model.states import TERMINAL_THRESHOLD, BatchState, CancelReason, ItemState, OutboxKind
 from tallyho.storage.counters import CounterDelta, insert_delta, upsert_metrics
 from tallyho.storage.now import sql_now
@@ -50,6 +57,8 @@ _ITEM = literal_column(str(int(OutboxKind.ITEM)), SmallInteger())
 _INFINITY = literal_column("'infinity'::timestamptz", DateTime(timezone=True))
 _CHUNK = 1000
 _NOT_TERMINAL = "операция допустима только для терминального батча"
+_NEGATIVE_WINDOW = "max_in_flight должен быть целым >= 0"
+_WINDOW_REASON = "max_in_flight_reason"
 _NO_DATABASE_TIME = "БД не вернула текущее время"
 
 
@@ -184,6 +193,60 @@ class Operations:
             .values(available_at=available)
         )
         await self._after(target, relay=ids)
+
+    async def set_max_in_flight(
+        self,
+        target: AsyncSession | AsyncConnection,
+        batch_id: UUID,
+        limit: int | None,
+        *,
+        reason: str | None = None,
+    ) -> None:
+        """Задать или снять окно ``max_in_flight`` этого экземпляра батча.
+
+        Значение абсолютное и идемпотентное: ``limit >= 0`` ставит окно
+        (``0`` — закрытое: новая работа паркуется, выполняющаяся доделывается),
+        ``None`` снимает его. Паузу операция не трогает, а расширение окна
+        возвращает запаркованные записи в объёме появившегося места — только
+        если батч не на паузе (ARCHITECTURE §11.2). Терминальный батч не
+        меняется.
+
+        Args:
+            target: Сессия или соединение вызывающего.
+            batch_id: Батч; потомки своё окно сохраняют.
+            limit: Новое окно или ``None``, чтобы его снять.
+            reason: Причина изменения — в ``th_batch.options`` для наблюдаемости.
+
+        Raises:
+            ConfigurationError: отрицательный или нецелый ``limit``.
+        """
+        if limit is not None and (isinstance(limit, bool) or limit < 0):
+            message = f"{_NEGATIVE_WINDOW}, получено {limit!r}"
+            raise ConfigurationError(message)
+        conn = await resolve_connection(target)
+        _ = await self._lock_rows(conn, [batch_id], batch_id=batch_id)
+        await self._ensure_retained(conn, batch_id)
+        now = await self._now(conn)
+        batch = self.tables.batch
+        options = cast(
+            "ColumnElement[object]", batch.c.options.op("-", return_type=JSONB())(_WINDOW_REASON)
+        )
+        if reason is not None:
+            options = cast(
+                "ColumnElement[object]",
+                options.op("||", return_type=JSONB())(
+                    func.jsonb_build_object(literal(_WINDOW_REASON), literal(reason))
+                ),
+            )
+        _ = await conn.execute(
+            update(batch)
+            .where(batch.c.id == batch_id, batch.c.state < TERMINAL_THRESHOLD)
+            .values(max_in_flight=limit, options=options, updated_at=now)
+        )
+        # Окно расширилось (в том числе снято) — вернуть запаркованное в его объёме.
+        if limit != 0:
+            _ = await refill_window(conn, self.tables, batch_ids=[batch_id])
+        await self._after(target, relay=[batch_id])
 
     async def reschedule(
         self, target: AsyncSession | AsyncConnection, batch_id: UUID, start_at: datetime

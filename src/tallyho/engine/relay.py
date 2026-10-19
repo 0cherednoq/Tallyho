@@ -77,7 +77,14 @@ from tallyho.storage.now import sql_now
 from tallyho.storage.tx import RetryPolicy, run_transaction
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
+    from collections.abc import (
+        Awaitable,
+        Callable,
+        Collection,
+        Iterable,
+        Mapping,
+        Sequence,
+    )
     from datetime import datetime
 
     from sqlalchemy import ColumnElement
@@ -806,18 +813,22 @@ async def release_window(
     return sorted(freed)
 
 
-async def refill_window(conn: AsyncConnection, tables: Tables) -> int:
+async def refill_window(
+    conn: AsyncConnection, tables: Tables, *, batch_ids: Collection[UUID] | None = None
+) -> int:
     """Вернуть в очередь запаркованные записи батчей, у которых в окне есть место.
 
     Страховка scan: места могли освободиться без :func:`release_window`
-    (resume, sweeper, ручная правка). Рассматриваются активные батчи с
-    ``max_in_flight`` не на паузе, у которых есть запаркованные записи.
+    (resume, sweeper, расширение окна, ручная правка). Рассматриваются
+    активные батчи не на паузе, у которых есть запаркованные записи.
     Свободно = окно - строки ``th_window`` - готовые (не запаркованные)
-    записи батча.
+    записи батча; у батча без окна (``max_in_flight IS NULL``) ограничения
+    нет, и распарковываются все его записи.
 
     Args:
         conn: Соединение в открытой транзакции.
         tables: Таблицы установки.
+        batch_ids: Рассматривать только эти батчи; ``None`` — все активные.
 
     Returns:
         Сколько записей возвращено в очередь.
@@ -829,19 +840,28 @@ async def refill_window(conn: AsyncConnection, tables: Tables) -> int:
         .where(outbox.c.batch_id == batch.c.id, outbox.c.available_at == _infinity())
         .exists()
     )
-    candidates = await conn.execute(
+    stmt = (
         select(batch.c.id, batch.c.max_in_flight)
         .where(
             batch.c.state < _small(TERMINAL_THRESHOLD),
-            batch.c.max_in_flight.is_not(None),
             batch.c.paused_at.is_(None),
             parked,
         )
         .order_by(batch.c.id)
     )
-    room: Counter[UUID] = Counter()
+    if batch_ids is not None:
+        if not batch_ids:
+            return 0
+        stmt = stmt.where(batch.c.id == any_(_uuids(sorted(batch_ids))))
+    candidates = await conn.execute(stmt)
+    room: dict[UUID, int | None] = {}
     for batch_id, max_in_flight in candidates:
-        limit = max_in_flight
+        # Колонка nullable, в типах SQLAlchemy этого не видно.
+        limit = cast("int | None", max_in_flight)
+        if limit is None:
+            # Окна нет: парковка окном невозможна, запаркованное уезжает целиком.
+            room[batch_id] = None
+            continue
         in_window = await _bounded_count(
             conn,
             tables.window.c.batch_id == batch_id,
@@ -870,8 +890,9 @@ async def _bounded_count(
     return int(await conn.scalar(select(func.count()).select_from(sample)) or 0)
 
 
-async def _unpark(conn: AsyncConnection, tables: Tables, room: Mapping[UUID, int]) -> int:
-    # Не больше room[batch] запаркованных записей Items батча, не стоящего на паузе.
+async def _unpark(conn: AsyncConnection, tables: Tables, room: Mapping[UUID, int | None]) -> int:
+    # Не больше room[batch] запаркованных записей Items батча, не стоящего на
+    # паузе; None — без ограничения (у батча нет окна).
     if not room:
         return 0
     batch = tables.batch

@@ -258,6 +258,17 @@ class Facade(EngineFacade):
         self.calls.append(("cancel", (target, batch_id)))
 
     @override
+    async def set_max_in_flight(
+        self,
+        target: AsyncSession | AsyncConnection | None,
+        batch_id: UUID,
+        limit: int | None,
+        *,
+        reason: str | None = None,
+    ) -> None:
+        self.calls.append(("set_max_in_flight", (target, batch_id, limit, reason)))
+
+    @override
     async def reschedule(
         self,
         target: AsyncSession | AsyncConnection | None,
@@ -431,7 +442,11 @@ async def test_handle_delegates_reads_wait_and_mutations() -> None:
     assert await handle.reschedule(at) == 3
     await handle.pause()
     await handle.resume()
+    await handle.set_max_in_flight(0, reason="нет кредитов")
+    await handle.clear_max_in_flight()
     await handle.cancel()
+    assert ("set_max_in_flight", (None, ROOT_ID, 0, "нет кредитов")) in facade.calls
+    assert ("set_max_in_flight", (None, ROOT_ID, None, None)) in facade.calls
     assert await handle.retry_failed(labels=["bad"]) == 4
     await handle.retry_finalize()
     await handle.release()
@@ -444,6 +459,7 @@ async def test_handle_delegates_reads_wait_and_mutations() -> None:
         "reschedule",
         "pause",
         "resume",
+        "set_max_in_flight",
         "cancel",
         "retry_failed",
         "retry_finalize",

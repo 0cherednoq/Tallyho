@@ -422,6 +422,47 @@ class BatchHandle:
         """Снять паузу с поддерева."""
         await self._engine.resume(session, self.id)
 
+    async def set_max_in_flight(
+        self,
+        limit: int,
+        *,
+        session: AsyncSession | AsyncConnection | None = None,
+        reason: str | None = None,
+    ) -> None:
+        """Задать окно параллелизма этого батча.
+
+        Значение абсолютное и идемпотентное. ``limit=0`` закрывает окно:
+        новая работа паркуется, уже выполняющаяся доделывается. Паузу окно не
+        трогает, а его расширение выпускает запаркованное в объёме появившегося
+        места. С ``session=`` изменение входит в транзакцию вызывающего, а
+        relay получает пинок после commit; ``reason`` сохраняется в опциях
+        батча для наблюдаемости.
+
+        Args:
+            limit: Новое окно, целое ``>= 0``; отрицательное или нецелое
+                значение даёт ``ConfigurationError``.
+            session: Сессия или соединение вызывающего.
+            reason: Причина изменения.
+        """
+        await self._engine.set_max_in_flight(session, self.id, limit, reason=reason)
+
+    async def clear_max_in_flight(
+        self,
+        *,
+        session: AsyncSession | AsyncConnection | None = None,
+        reason: str | None = None,
+    ) -> None:
+        """Снять окно параллелизма: отправка этого батча больше не ограничена.
+
+        Отдельный метод, чтобы «окна нет» нельзя было спутать с «окно ноль».
+        Запаркованные окном записи возвращаются в очередь.
+
+        Args:
+            session: Сессия или соединение вызывающего.
+            reason: Причина изменения.
+        """
+        await self._engine.set_max_in_flight(session, self.id, None, reason=reason)
+
     async def cancel(self, *, session: AsyncSession | AsyncConnection | None = None) -> None:
         """Запросить отмену поддерева."""
         await self._engine.cancel(session, self.id)

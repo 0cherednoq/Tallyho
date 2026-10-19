@@ -190,6 +190,20 @@ async def test_refill_counts_ready_records_and_skips_paused(rel: RelayEnv) -> No
         assert await refill_window(conn, rel.tables) == 0
 
 
+async def test_refill_takes_only_requested_batches(rel: RelayEnv) -> None:
+    first = await add_windowed(rel, 4, max_in_flight=1)
+    second = await add_windowed(rel, 4, max_in_flight=1)
+    _ = await rel.relay.scan_once()
+    window = rel.tables.window
+    async with rel.env.transaction() as conn:
+        _ = await conn.execute(delete(window))
+        # Пустой список батчей — ничего не рассматриваем.
+        assert await refill_window(conn, rel.tables, batch_ids=[]) == 0
+        assert await refill_window(conn, rel.tables, batch_ids=[first]) == 1
+    assert await parked(rel, first) == 2
+    assert await parked(rel, second) == 3
+
+
 async def test_reclaim_after_failure_keeps_window_place(rel: RelayEnv) -> None:
     # Relay захватил записи и упал до DELETE: после claim_ttl те же записи уходят, не паркуются.
     batch_id = await add_windowed(rel, 5)
