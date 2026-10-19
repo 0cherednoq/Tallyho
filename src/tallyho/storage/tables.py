@@ -321,6 +321,10 @@ class ItemColumns(TypedColumns):
     weight = _int(default=1)
     result = _jsonb(nullable=True)
     error = _jsonb(nullable=True)
+    defers = _small(default=0)
+    """Сколько раз Item откладывали (``item.defer``): по нему работает ``max_defers``."""
+    first_deferred_at = _utc(nullable=True)
+    """Когда Item отложили впервые: по нему работает ``max_deferred_for``."""
     created_at = _utc()
     finished_at = _utc(nullable=True)
     generation = _int(default=0)
@@ -340,6 +344,8 @@ class OutboxColumns(TypedColumns):
     options = _jsonb(nullable=True)
     """Опции постановки колбэка; опции Item хранятся в ``th_item.options`` (D-033)."""
     available_at = _utc()
+    defer_reason = _text(nullable=True)
+    """Причина отложения: отличает ``deferred`` от парковки по ``start_at``, паузе и окну."""
     attempts = _small(default=0)
 
 
@@ -607,6 +613,12 @@ def _outbox(metadata: MetaData, prefix: str) -> Table[OutboxColumns]:
     # (batch_id, available_at): pause/cancel по батчу и окно max_in_flight —
     # запаркованные (infinity) и готовые к отправке записи одного батча.
     Index(f"{name}_batch_idx", outbox.c.batch_id, outbox.c.available_at)
+    # Гейдж и причины deferred, th.demand(), sweeper потолка отложений (ARCHITECTURE §5.2).
+    Index(
+        f"{name}_deferred_idx",
+        outbox.c.batch_id,
+        postgresql_where=outbox.c.defer_reason.is_not(None),
+    )
     return outbox
 
 

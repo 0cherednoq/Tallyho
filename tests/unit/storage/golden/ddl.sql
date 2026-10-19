@@ -127,6 +127,8 @@ CREATE TABLE th_item (
 	weight INTEGER DEFAULT 1 NOT NULL,
 	result JSONB,
 	error JSONB,
+	defers SMALLINT DEFAULT 0 NOT NULL,
+	first_deferred_at TIMESTAMP WITH TIME ZONE,
 	created_at TIMESTAMP WITH TIME ZONE NOT NULL,
 	finished_at TIMESTAMP WITH TIME ZONE,
 	generation INTEGER DEFAULT 0 NOT NULL,
@@ -186,6 +188,7 @@ CREATE TABLE th_outbox (
 	payload BYTEA,
 	options JSONB,
 	available_at TIMESTAMP WITH TIME ZONE NOT NULL,
+	defer_reason TEXT,
 	attempts SMALLINT DEFAULT 0 NOT NULL,
 	PRIMARY KEY (id)
 )
@@ -194,6 +197,8 @@ CREATE TABLE th_outbox (
 CREATE INDEX th_outbox_available_idx ON th_outbox (available_at);
 
 CREATE INDEX th_outbox_batch_idx ON th_outbox (batch_id, available_at);
+
+CREATE INDEX th_outbox_deferred_idx ON th_outbox (batch_id) WHERE defer_reason IS NOT NULL;
 
 CREATE TABLE th_window (
 	item_id UUID NOT NULL,

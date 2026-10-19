@@ -47,7 +47,17 @@ TABLE_SUFFIXES = (
 )
 
 # Колонки th_item, которые меняет finish: индекс по ним ломает HOT update.
-ITEM_MUTABLE_COLUMNS = frozenset({"state", "label", "result", "error", "finished_at"})
+ITEM_MUTABLE_COLUMNS = frozenset(
+    {
+        "state",
+        "label",
+        "result",
+        "error",
+        "finished_at",
+        "defers",
+        "first_deferred_at",
+    }
+)
 
 AGGRESSIVE_AUTOVACUUM = {"autovacuum_vacuum_scale_factor": 0, "autovacuum_vacuum_threshold": 1000}
 HOT_TABLE = {"fillfactor": 50, **AGGRESSIVE_AUTOVACUUM}
