@@ -57,6 +57,15 @@ CREATE TABLE th_batch_attr (
 
 CREATE INDEX th_batch_attr_attributes_idx ON th_batch_attr USING gin (attributes jsonb_path_ops);
 
+CREATE TABLE th_checkpoint (
+	item_id UUID NOT NULL,
+	batch_id UUID NOT NULL,
+	position BIGINT NOT NULL,
+	updated_at TIMESTAMP WITH TIME ZONE NOT NULL,
+	PRIMARY KEY (item_id)
+)
+ WITH (fillfactor = 50, autovacuum_vacuum_scale_factor = 0, autovacuum_vacuum_threshold = 1000);
+
 CREATE TABLE th_counter (
 	batch_id UUID NOT NULL,
 	slot SMALLINT NOT NULL,

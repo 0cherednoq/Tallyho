@@ -939,6 +939,7 @@ class Sweeper:
             self.tables.window,
             self.tables.outbox,
             self.tables.item_mark,
+            self.tables.checkpoint,
         ):
             _ = await conn.execute(delete(side).where(side.c.item_id.in_(item_ids)))
         _ = await conn.execute(delete(item).where(item.c.id.in_(item_ids)))

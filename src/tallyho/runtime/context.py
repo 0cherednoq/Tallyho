@@ -12,6 +12,7 @@ from tallyho.engine.completer import ExpectRequest, FinishResult, SpawnRequest, 
 from tallyho.engine.producer import CallbackName, SubBatchSpec
 from tallyho.model.calls import TaskCall
 from tallyho.model.errors import ConfigurationError, LeaseLostError
+from tallyho.model.outcomes import Defer, Error, Ok, Skip
 from tallyho.model.states import OnFeederFailed, ResultClass
 from tallyho.storage.metric_names import check_counter_name
 from tallyho.storage.tx import after_commit, after_commit_pending, resolve_connection
@@ -26,6 +27,7 @@ if TYPE_CHECKING:
 
     from tallyho.engine.completer import Completer, ItemRef
     from tallyho.engine.spawn import TreeSnapshot
+    from tallyho.model.outcomes import Outcome
     from tallyho.model.policy import FailurePolicy
 
 __all__ = [
@@ -35,6 +37,7 @@ __all__ = [
     "ItemContext",
     "ItemFacade",
     "RuntimeSubBatch",
+    "WorkItem",
     "activate_callback",
     "activate_item",
     "callback",
@@ -53,11 +56,16 @@ _OTHER_TRANSACTION = (
     "complete_in уже вызван в другой, ещё не завершённой транзакции: "
     "Item завершается в одной транзакции"
 )
-_DEFER_EMPTY_REASON = "defer требует непустой reason"
-_DEFER_DELAY_AND_UNTIL = "defer принимает delay или until, но не оба сразу"
-_DEFER_NEGATIVE_DELAY = "delay у defer не может быть отрицательным"
+_NO_CONTEXT_REQUIRE = (
+    "item.require() доступен только внутри отслеживаемой задачи: вне неё единицы работы нет"
+)
+_CHECKPOINT_NEGATIVE = "checkpoint_in требует неотрицательное целое position"
 _DEFER_AFTER_OUTCOME = "defer нельзя вызывать после ok/skip/error той же попытки"
 _OUTCOME_AFTER_DEFER = "ok/skip/error нельзя вызывать после defer той же попытки"
+_TWO_OUTCOME_SOURCES = (
+    "итог попытки задан дважды: вызовом item.ok/skip/error/defer и возвращённым "
+    "значением Outcome. Источник итога должен быть один"
+)
 
 
 class CallFactory(Protocol):
@@ -86,7 +94,7 @@ class CallbackContext:
 class RuntimeSubBatch:
     """Буфер динамического под-батча, добавляемый атомарно с finish Item."""
 
-    context: ItemContext
+    context: WorkItem
     spec: SubBatchSpec
     calls: list[TaskCall] = field(default_factory=list[TaskCall])
     sealed: bool = False
@@ -144,7 +152,7 @@ class RuntimeSubBatch:
         self.spec = replace(self.spec, expected_total=total)
 
     def seal(self) -> None:
-        """Закрыть builder и перенести его снимок в ItemContext."""
+        """Закрыть builder и перенести его снимок в WorkItem."""
         if not self.sealed:
             self.sealed = True
             self.context.sub_batches.append(SubBatchRequest(spec=self.spec, calls=self.calls))
@@ -159,13 +167,23 @@ class _Completion:
     committed: Callable[[], None]
 
 
-@dataclass(slots=True, kw_only=True)
-class ItemContext:
-    """Буферы одной попытки пользовательской задачи."""
+@dataclass(slots=True, kw_only=True)  # ruff: ignore[too-many-public-methods]  # публичный контракт задан ARCHITECTURE §11.2
+class WorkItem:
+    """Единица работы: буферы и операции одной попытки задачи (ARCHITECTURE §11.2).
+
+    Публичный тип, который отдают ``item.current()`` и ``item.require()``. Фасад
+    ``item`` делегирует ему; слоистому приложению удобнее получить его явно —
+    зависимостью конструктора или из контейнера — чем обращаться к фасаду из
+    глубины стека.
+    """
 
     ref: ItemRef
     attempt: int
     depth: int
+    defers: int = 0
+    """Сколько раз Item уже откладывали; значение из claim."""
+    checkpoint_position: int | None = None
+    """Закладка прогресса из claim; обновляется после commit ``checkpoint_in``."""
     tree: TreeSnapshot
     make_call: CallFactory
     completer: Completer
@@ -329,6 +347,51 @@ class ItemContext:
         """Монотонно повысить expected целевого батча."""
         self.expects.append(ExpectRequest(route=self.tree.route(self.batch_id, into), total=total))
 
+    def checkpoint(self) -> int | None:
+        """Вернуть закладку прогресса этой единицы работы (UC-19).
+
+        Значение прочитано вместе с claim, поэтому обращения к БД здесь нет.
+        После успешного ``checkpoint_in`` и commit его транзакции возвращается
+        новое значение.
+
+        Returns:
+            Сколько элементов или шагов уже сделано, или ``None``, если
+            закладки нет.
+        """
+        return self.checkpoint_position
+
+    async def checkpoint_in(self, session: AsyncSession | AsyncConnection, position: int) -> None:
+        """Записать закладку в транзакции вызывающего (UC-19).
+
+        Закладка коммитится тем же коммитом, что результат элемента: для
+        работы, которая пишет только в эту базу, повтор не переделывает
+        сделанное. Запись монотонна, ``th_item`` не обновляется, а
+        ``th_lease.progress_done`` двигается вместе с закладкой.
+
+        Args:
+            session: Открытая сессия или соединение вызывающего.
+            position: Сколько элементов или шагов сделано, целое ``>= 0``.
+
+        Raises:
+            ConfigurationError: ``position`` не является неотрицательным целым.
+            LeaseLostError: Item уже завершён или его lease перехвачен; ничего
+                не записано, и исключение должно откатить транзакцию.
+        """
+        if isinstance(position, bool) or position < 0:
+            raise ConfigurationError(_CHECKPOINT_NEGATIVE)
+        changed = await self.completer.checkpoint_in(
+            session, self.ref, position=position, attempt=self.attempt
+        )
+        if not changed:
+            self.lease_lost = True
+            raise LeaseLostError(self.id)
+
+        def committed() -> None:
+            self.checkpoint_position = max(self.checkpoint_position or 0, position)
+
+        # Снимок двигается только после commit: откат оставляет его прежним.
+        await after_commit(session, committed)
+
     def progress(self, done: int, total: int | None = None) -> None:
         """Обновить диагностический прогресс lease.
 
@@ -396,19 +459,41 @@ class ItemContext:
             ConfigurationError: пустой ``reason``; ``delay`` и ``until`` вместе;
                 отрицательный ``delay``; вызов после ``ok``/``skip``/``error``.
         """
-        if not reason:
-            raise ConfigurationError(_DEFER_EMPTY_REASON)
-        check_counter_name(reason, what="причины defer")
-        if delay is not None and until is not None:
-            raise ConfigurationError(_DEFER_DELAY_AND_UNTIL)
-        if delay is not None and delay < timedelta(0):
-            raise ConfigurationError(_DEFER_NEGATIVE_DELAY)
+        # Правила reason/delay/until — общие с публичным Defer (model/outcomes.py).
+        outcome = Defer(reason=reason, delay=delay, until=until)
+        check_counter_name(outcome.reason, what="причины defer")
         if self._outcome_set:
             raise ConfigurationError(_DEFER_AFTER_OUTCOME)
         self._deferred = True
-        self._defer_reason = reason
-        self._defer_until = until
-        self._defer_delay = None if until is not None else (delay or self.defer_default_delay)
+        self._defer_reason = outcome.reason
+        self._defer_until = outcome.until
+        self._defer_delay = (
+            None if outcome.until is not None else (outcome.delay or self.defer_default_delay)
+        )
+
+    def adopt(self, outcome: Outcome) -> None:
+        """Принять итог-значение задачи (UC-18).
+
+        Переводит ``Ok``/``Skip``/``Error``/``Defer`` в тот же внутренний итог,
+        что императивные вызовы, поэтому путей записи в БД не добавляется.
+
+        Args:
+            outcome: Итог, который задача вернула или передала в ``complete_in``.
+
+        Raises:
+            ConfigurationError: итог этой попытки уже задан императивно или
+                уже записан: двух источников итога быть не может.
+        """
+        if self._outcome_set or self._deferred or self.completed_in_user_tx:
+            raise ConfigurationError(_TWO_OUTCOME_SOURCES)
+        if isinstance(outcome, Ok):
+            self.ok(outcome.label, result=outcome.result, mark=outcome.mark)
+        elif isinstance(outcome, Skip):
+            self.skip(outcome.label, mark=outcome.mark)
+        elif isinstance(outcome, Error):
+            self.error(outcome.label, detail=outcome.detail, mark=outcome.mark)
+        else:
+            self.defer(reason=outcome.reason, delay=outcome.delay, until=outcome.until)
 
     @property
     def deferred(self) -> bool:
@@ -430,7 +515,9 @@ class ItemContext:
         """Задержка возврата или ``None``, если задан ``until``."""
         return self._defer_delay
 
-    async def complete_in(self, session: AsyncSession | AsyncConnection) -> None:
+    async def complete_in(
+        self, session: AsyncSession | AsyncConnection, outcome: Outcome | None = None
+    ) -> None:
         """Атомарно завершить Item в транзакции пользователя (ARCHITECTURE UC-08).
 
         Записывает итог и буферы, накопленные к этому моменту, если попытка
@@ -440,14 +527,19 @@ class ItemContext:
 
         Args:
             session: Открытая сессия или соединение пользователя.
+            outcome: Итог значением (``Ok``/``Skip``/``Error``/``Defer``), если
+                его задают здесь, а не вызовом ``item.ok``/``skip``/``error``/
+                ``defer``. Два источника итога — ошибка (UC-18).
 
         Raises:
             LeaseLostError: Item уже завершён без этой попытки или его lease
                 перехвачен. Ничего не записано; исключение должно выйти из
                 транзакции пользователя, чтобы та откатилась.
             ConfigurationError: Item уже завершается в другой, ещё открытой
-                транзакции этой же попытки.
+                транзакции этой же попытки, либо итог задан дважды.
         """
+        if outcome is not None:
+            self.adopt(outcome)
         pending = self.completion
         # Сначала опрос: для AsyncConnection он доставляет колбэк уже
         # подтверждённого COMMIT, и флаг ниже становится верным (Fix-16).
@@ -531,13 +623,17 @@ class ItemContext:
         self._mark = mark
 
 
-_item_context: ContextVar[ItemContext | None] = ContextVar("tallyho_item", default=None)
+ItemContext = WorkItem
+"""Прежнее имя :class:`WorkItem`; алиас сохраняется на один минорный выпуск."""
+
+
+_item_context: ContextVar[WorkItem | None] = ContextVar("tallyho_item", default=None)
 _callback_context: ContextVar[CallbackContext | None] = ContextVar("tallyho_callback", default=None)
 
 
 @contextmanager
-def activate_item(context: ItemContext) -> Generator[None, None, None]:
-    """Установить ItemContext на время пользовательской функции."""
+def activate_item(context: WorkItem) -> Generator[None, None, None]:
+    """Установить WorkItem на время пользовательской функции."""
     token = _item_context.set(context)
     try:
         yield
@@ -559,13 +655,33 @@ class ItemFacade:
     """Модуль-подобный фасад операций текущего Item."""
 
     @staticmethod
-    def current() -> ItemContext | None:
-        """Вернуть текущий контекст или ``None`` вне tracked-задачи.
+    def current() -> WorkItem | None:
+        """Вернуть текущую единицу работы или ``None`` вне tracked-задачи.
 
         Returns:
-            Активный ItemContext.
+            Активный WorkItem.
         """
         return _item_context.get()
+
+    @staticmethod
+    def require() -> WorkItem:
+        """Вернуть текущую единицу работы или отказать вне задачи.
+
+        Строгий вариант :meth:`current` для кода, который без единицы
+        работы не имеет смысла: адаптер закладки, запись итога в
+        транзакции приложения. Вне задачи остальные методы фасада —
+        no-op, и ошибка нашлась бы только по отсутствию записи.
+
+        Returns:
+            Активный WorkItem.
+
+        Raises:
+            ConfigurationError: вызов сделан вне tracked-задачи.
+        """
+        context = _item_context.get()
+        if context is None:
+            raise ConfigurationError(_NO_CONTEXT_REQUIRE)
+        return context
 
     def id(self) -> UUID | None:
         """Вернуть идентификатор Item или ``None`` вне задачи.
@@ -700,6 +816,23 @@ class ItemFacade:
         if (context := self.current()) is not None:
             context.expect(total, into=into)
 
+    def checkpoint(self) -> int | None:
+        """Вернуть закладку текущей единицы работы или ``None`` вне задачи.
+
+        Returns:
+            Значение закладки.
+        """
+        context = self.current()
+        return context.checkpoint() if context is not None else None
+
+    async def checkpoint_in(self, session: AsyncSession | AsyncConnection, position: int) -> None:
+        """Делегировать запись закладки; вне задачи — no-op.
+
+        Исключения — как у :meth:`WorkItem.checkpoint_in`.
+        """
+        if (context := self.current()) is not None:
+            await context.checkpoint_in(session, position)
+
     def progress(self, done: int, total: int | None = None) -> None:
         """Делегировать прогресс; вне задачи — no-op."""
         if (context := self.current()) is not None:
@@ -740,14 +873,17 @@ class ItemFacade:
         if (context := self.current()) is not None:
             context.defer(reason=reason, delay=delay, until=until)
 
-    async def complete_in(self, session: AsyncSession | AsyncConnection) -> None:
+    async def complete_in(
+        self, session: AsyncSession | AsyncConnection, outcome: Outcome | None = None
+    ) -> None:
         """Делегировать ``complete_in``; вне задачи — no-op.
 
-        Исключения — как у :meth:`ItemContext.complete_in`: ``LeaseLostError``,
-        если попытка больше не владеет Item.
+        Исключения — как у :meth:`WorkItem.complete_in`: ``LeaseLostError``,
+        если попытка больше не владеет Item, и ``ConfigurationError``, если
+        итог задан и императивно, и значением.
         """
         if (context := self.current()) is not None:
-            await context.complete_in(session)
+            await context.complete_in(session, outcome)
 
     def cancelled(self) -> bool:
         """Вернуть ``False`` вне задачи или флаг кооперативной отмены.

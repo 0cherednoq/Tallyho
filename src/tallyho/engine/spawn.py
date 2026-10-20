@@ -103,7 +103,7 @@ class TreeSnapshot:
 
 @final
 class TreeCache:
-    """Процессный кэш снимков деревьев для ItemContext."""
+    """Процессный кэш снимков деревьев для WorkItem."""
 
     def __init__(self) -> None:
         """Создать пустой процессный кэш."""

@@ -251,6 +251,15 @@ class EngineFacade(Protocol):  # ruff: ignore[too-many-public-methods]  # фас
         """Задать (``limit >= 0``) или снять (``None``) окно батча."""
         ...
 
+    async def release_deferred(
+        self,
+        target: AsyncSession | AsyncConnection | None,
+        batch_id: UUID,
+        reasons: Collection[str] | None,
+    ) -> int:
+        """Разбудить отложенные записи батча; ``None`` — все причины."""
+        ...
+
     async def reschedule(
         self,
         target: AsyncSession | AsyncConnection | None,
@@ -293,6 +302,7 @@ class _AssemblyModule(Protocol):
         serializer: Serializer | None,
         hooks: HookRegistry,
         settings: EngineSettings,
+        middleware: Sequence[object],
     ) -> EngineFacade: ...
 
 
@@ -307,6 +317,7 @@ def create_engine_facade(  # ruff: ignore[too-many-arguments]  # dependency boun
     serializer: Serializer | None,
     hooks: HookRegistry,
     settings: EngineSettings,
+    middleware: Sequence[object] = (),
 ) -> EngineFacade:
     """Создать конкретную композицию, не раскрывая storage API-слою.
 
@@ -325,6 +336,7 @@ def create_engine_facade(  # ruff: ignore[too-many-arguments]  # dependency boun
         serializer=serializer,
         hooks=hooks,
         settings=settings,
+        middleware=middleware,
     )
 
 

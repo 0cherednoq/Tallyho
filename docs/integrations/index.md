@@ -8,6 +8,7 @@ tallyho подключается к инструментам, которые у 
 | [flexiq](flexiq.md) | брокер задач: адаптер, опции постановки, ретраи и DLQ, остановка воркера | `tallyho[flexiq]` |
 | [Alembic](alembic.md) | миграции tallyho внутри ваших ревизий | `tallyho[alembic]` |
 | [pytest](pytest.md) | фикстура с готовой установкой для тестов | `tallyho[testing]` |
+| [Dishka](dishka.md) | единица работы как зависимость: scope контейнера на попытку | `tallyho[dishka]` |
 | [Prometheus](prometheus.md) | метрики через свой наблюдатель | не нужно |
 | [OpenTelemetry](opentelemetry.md) | спаны и метрики из готового наблюдателя | `tallyho[otel]` |
 | [pgbouncer](pgbouncer.md) | работа через transaction pooling | не нужно |
@@ -21,6 +22,7 @@ tallyho подключается к инструментам, которые у 
 flexiq
 alembic
 pytest
+dishka
 prometheus
 opentelemetry
 pgbouncer

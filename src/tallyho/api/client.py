@@ -239,9 +239,16 @@ class Tallyho:
         id_factory: IdFactory | None = None,
         observer: Observer | None = None,
         serializer: Serializer | None = None,
+        middleware: Sequence[object] = (),
         **settings: object,
     ) -> None:
-        """Настроить клиент без обращения к БД."""
+        """Настроить клиент без обращения к БД.
+
+        ``middleware`` — последовательность ``ItemMiddleware`` (ARCHITECTURE
+        §11.2): обёртки вокруг вызова каждой tracked-задачи, первая в списке —
+        внешняя. Тип объявлен как ``object``, потому что ``api`` не импортирует
+        ``runtime`` (§3.3); проверяет элементы сам runtime.
+        """
         self.engine = engine
         self.schema = schema
         self.prefix = prefix
@@ -264,6 +271,7 @@ class Tallyho:
             serializer=serializer,
             hooks=self.hooks,
             settings=self.settings.engine_settings(),
+            middleware=tuple(middleware),
         )
 
     def install_hooks(self) -> None:

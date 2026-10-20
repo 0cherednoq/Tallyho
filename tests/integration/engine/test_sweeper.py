@@ -472,6 +472,15 @@ async def test_retention_requires_release_and_purges_tree(env: Env) -> None:
         _ = await env.producer.add_items(
             conn, child.id, [TaskCall(task_name="task", args=(1,), kwargs={})]
         )
+        item_id = await conn.scalar(
+            select(env.tables.item.c.id).where(env.tables.item.c.batch_id == child.id)
+        )
+        # Закладка прогресса — такая же side-таблица Item: её удаляет то же дерево (RM8.4).
+        _ = await conn.execute(
+            insert(env.tables.checkpoint).values(
+                item_id=item_id, batch_id=child.id, position=7, updated_at=func.now()
+            )
+        )
         _ = await conn.execute(
             update(env.tables.batch)
             .where(env.tables.batch.c.id.in_([root.id, child.id]))
@@ -494,6 +503,7 @@ async def test_retention_requires_release_and_purges_tree(env: Env) -> None:
     assert await subject.retention() == 1
     assert await env.count(env.tables.batch) == 0
     assert await env.count(env.tables.item) == 0
+    assert await env.count(env.tables.checkpoint) == 0
     with pytest.raises(BatchPurged):
         _ = await Reads(schema_engine(env), env.tables, SystemClock()).view(root.id)
 

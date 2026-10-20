@@ -166,7 +166,7 @@ flowchart TB
 flowchart TB
     api["tallyho.api<br/>Tallyho, BatchBuilder, BatchHandle, call"]
     hooks["tallyho.hooks<br/>registry, on_finalized, on_progress, on_policy_breach"]
-    item["tallyho.runtime<br/>tracked, item, callback, ItemContext"]
+    item["tallyho.runtime<br/>tracked, item, callback, WorkItem"]
     eng["tallyho.engine<br/>Completer, Relay, Sweeper,<br/>Finalizer, Snapshotter, Counters"]
     st["tallyho.storage<br/>tables, queries, migrations"]
     model["tallyho.model<br/>states, summaries, views, errors"]
@@ -236,7 +236,7 @@ classDiagram
         +release(session) None
         +items(states, labels) AsyncIterator~ItemView~
     }
-    class ItemContext {
+    class WorkItem {
         +UUID id
         +UUID batch_id
         +int attempt
@@ -250,7 +250,7 @@ classDiagram
         +ok(label, result) None
         +skip(label) None
         +error(label, detail) None
-        +complete_in(session) None
+        +complete_in(session, outcome) None
         +cancelled() bool
     }
     class BatchSummary {
@@ -331,7 +331,7 @@ classDiagram
     Tallyho --> Relay
     Tallyho --> Sweeper
     Tallyho --> Snapshotter
-    ItemContext --> Completer
+    WorkItem --> Completer
     Completer ..> Finalizer : после commit
     Sweeper ..> Finalizer
     Finalizer ..> BatchSummary : передаёт в on_finalized
@@ -341,7 +341,7 @@ classDiagram
     Relay ..> DeadLetterReconciler : после каждого scan
     DeadLetterReconciler --> Runtime : reconcile_dead
     DeadLetterReconciler ..> Finalizer
-    Runtime ..> ItemContext : создаёт на время задачи
+    Runtime ..> WorkItem : создаёт на время задачи
 ```
 
 ---
@@ -358,6 +358,7 @@ classDiagram
 | `asyncpg` или `psycopg[binary]` | ≥ 0.29 / ≥ 3.1 | один из | драйвер |
 | `typing-extensions` | ≥ 4.10 | да | `ParamSpec`/`TypeVar` defaults на 3.11 |
 | `flexiq` | `>=2.0,<3` | extra `flexiq` | адаптер |
+| `dishka` | `>=1.4,<2` | extra `dishka` | интеграция `WorkItem` с контейнером: REQUEST-scope на попытку (§11.2) |
 | `alembic` | ≥ 1.13 | нет | встраивание миграций в проект пользователя |
 
 UUIDv7 генерируем сами (≈30 строк). В Python 3.14+ используем `uuid.uuid7()`.
@@ -369,6 +370,7 @@ UUIDv7 генерируем сами (≈30 строк). В Python 3.14+ исп�
 | `Dispatcher`, `Runtime`, `PayloadCodec` | адаптер брокера | отправка; обёртка исполнения, вердикт ретрая, сверка с DLQ: `reconcile_dead(cursor)` отдаёт порцию мёртвых джоб — Item и поколение отправки из служебного маркера — и новый непрозрачный курсор (UC-15, §11.3); кодек payload Items (без своего кодека — `SerializerCodec` поверх `Serializer`) |
 | `RetryLimits` | адаптер брокера (необязательно) | умолчание `max_retries` задачи по её имени — для sweeper, когда у вызова нет своей опции (UC-15) |
 | `RelayPolicy` | тестовый брокер | `relay_autostart = False`: relay не запускает фоновый цикл по `kick`, его проходы вызывает сам адаптер (`InlineBroker.step/drain`); так тест остаётся детерминированным |
+| `ItemMiddleware` | пользователь, интеграции | обёртка вокруг вызова tracked-задачи: `Tallyho(..., middleware=[...])`. Видит `WorkItem`, пропускает возвращаемое значение и исключение без изменений, итог не записывает (§11.2) |
 | Tx-хуки `on_finalized / on_progress / on_policy_breach` | пользователь | перенос итога и прогресса в доменные таблицы (§7) |
 | `Serializer` | пользователь (есть json/msgspec) | аргументы задач, `result` Item |
 | `Observer` | пользователь | метрики, OpenTelemetry, логи — вне транзакций, fire-and-forget |
@@ -395,6 +397,7 @@ erDiagram
     TH_ITEM ||--o| TH_LEASE : "пока выполняется"
     TH_ITEM ||--o| TH_ITEM_MARK : "только помеченные"
     TH_ITEM ||--o| TH_WINDOW : "отправлен, окно max_in_flight"
+    TH_ITEM ||--o| TH_CHECKPOINT : "только с закладкой прогресса"
     TH_BATCH ||--o| TH_BATCH_ATTR : "только корень с атрибутами"
 
     TH_BATCH {
@@ -520,6 +523,12 @@ erDiagram
         uuid item_id PK
         uuid batch_id
     }
+    TH_CHECKPOINT {
+        uuid item_id PK
+        uuid batch_id
+        bigint position "сделано элементов или шагов"
+        timestamptz updated_at
+    }
     TH_BATCH_ATTR {
         uuid batch_id PK "id корня"
         jsonb attributes "str/int/bool, неизменяемы"
@@ -541,6 +550,46 @@ erDiagram
 * повторный `th.batch(kind, key)` возвращает существующий батч, его атрибуты и `memo` не меняются (первый выигрывает, как для остальных параметров);
 * тенант — обычный атрибут. Фильтровать по нему в листинге обязано приложение: tallyho не знает, кто вызывает;
 * атрибуты и `memo` не попадают в логи и телеметрию.
+
+**Закладка единицы работы (`th_checkpoint`).** Item — одна единица работы (один вызов
+задачи), но его payload может описывать составную работу: 50 доменов на одну аренду
+аккаунта, несколько шагов регистрации. **Элемент** — часть payload, о которой знает только
+приложение. Закладка хранит `position` — сколько элементов или шагов этого Item уже
+обработано, чтобы новая попытка после `defer`, ретрая брокера, падения воркера или потери
+lease продолжила с того места, где остановилась предыдущая:
+
+* значение — целое `>= 0`. Payload Item'а неизменяем (на нём держатся ключ дедупликации и
+  сверка с DLQ), поэтому «докуда дошли» всегда выражается числом, а не сужением payload.
+  Курсоры внешних API выражаются через `item.spawn` — следующая страница это следующий
+  Item, а не закладка;
+* записывается только `WorkItem.checkpoint_in(session, position)` — в транзакции
+  вызывающего, тем же коммитом, что и результат элемента. Откат транзакции или savepoint
+  откатывает и закладку. Записи вне транзакции пользователя нет намеренно: иначе закладка
+  и данные приложения могли бы разойтись. Для работы, которая пишет только в эту же базу,
+  это даёт точно-однократный эффект на элемент: результат и закладка либо оба есть, либо
+  обоих нет. Для внешних неидемпотентных действий (HTTP, письмо) гарантии нет — там нужен
+  ключ идемпотентности на стороне ресурса;
+* читается `WorkItem.checkpoint()` — снимок, прочитанный `LEFT JOIN`-ом в том же запросе
+  claim, без второго обращения к БД (§8 UC-19);
+* `position` монотонна: запись меньшего значения строку не меняет. Владение попыткой
+  проверяется тем же fencing'ом, что у `complete_in`, — чужая попытка получает
+  `LeaseLostError`;
+* строка живёт, пока работа не закончена: её сохраняют `defer`, ретрай брокера, потеря
+  lease, `aclose` и `retry_failed`. Она удаляется в транзакции итога `ok`, `skip` и
+  `cancelled`, а при `error` остаётся до retention дерева, чтобы повтор не переделывал
+  сделанное (D-085);
+* `checkpoint_in` заодно обновляет `th_lease.progress_done`, поэтому `handle.in_flight()`
+  показывает «30 из N» без отдельного `item.progress`.
+
+Хранение — отдельная узкая таблица, а не колонка `th_item`: закладка пишется десятки раз
+за один Item, а `th_item` живёт с `fillfactor=85` ровно под одно HOT-обновление (finish) и
+хранит `payload` 1–2 КБ. Обновление `th_item` на каждый элемент копировало бы всю строку и
+быстро исчерпало бы запас страницы. Это тот же довод, по которому из `th_batch` вынесена
+`th_batch_attr`, а из `th_item` — `th_lease` и `th_window` (§5.2). `position` — `bigint`, а
+не `jsonb`: целое даёт однозначный контракт API и автоматический прогресс, не требует
+валидации размера и не уходит в TOAST. Произвольный курсор, если появится потребитель,
+добавляется nullable-колонкой `state jsonb` — `ADD COLUMN … NULL` в PostgreSQL не
+перезаписывает таблицу.
 
 ### 5.2 Индексы и запросы горячего пути
 
@@ -567,6 +616,7 @@ erDiagram
 | th_outbox | `(batch_id, available_at)` | pause/resume/cancel/reschedule; окно `max_in_flight`: запаркованные (`∞`) и готовые записи батча | размер = неотправленное |
 | th_outbox | `(batch_id) WHERE defer_reason IS NOT NULL` | гейдж и причины `deferred`, `th.demand()`, sweeper потолка отложений | размер = отложенные сейчас |
 | th_window | PK `(item_id)`, `(batch_id)` | окно `max_in_flight`: сколько Items батча отправлено и не завершено | размер ≤ сумма окон активных батчей |
+| th_checkpoint | PK `(item_id)` | закладка: чтение `LEFT JOIN` в claim, монотонный upsert из `checkpoint_in` | размер = Items с закладкой |
 | th_lease | PK, `(lease_until)` | claim, истёкшие lease | размер = in-flight |
 | th_lease | `(batch_id)` | `handle.in_flight()`, `in_flight` в прогрессе | размер = in-flight |
 | th_feed | PK `(feeder_id, fed_id)` | при финализации источника: какие этапы он наполняет | O(log n) |
@@ -577,7 +627,7 @@ erDiagram
 | th_metric | PK `(batch_id, name, slot)` | разбивка по labels и суммы `item.incr` (имя метрики — с префиксом U+001F, §11.2) | O(names × slots) |
 | th_item_mark | PK `(batch_id, label, item_id)` | `handle.items(labels=…)`: «все hard_bounce батча» для экспорта | O(log n + k) |
 
-Хранение: `th_item` `fillfactor=85` (место для HOT). `th_counter`/`th_metric` `fillfactor=50` + агрессивный per-table autovacuum. Состояния — `smallint`. FK на горячих таблицах не объявляем: целостность держит библиотека, retention удаляет деревом чанками.
+Хранение: `th_item` `fillfactor=85` (место для HOT). `th_counter`/`th_metric`/`th_checkpoint` `fillfactor=50` + агрессивный per-table autovacuum: все три обновляются многократно в одну строку. Вторичных индексов у `th_checkpoint` нет — её читают и пишут только по PK, а retention удаляет её по дереву, как остальные side-таблицы. Состояния — `smallint`. FK на горячих таблицах не объявляем: целостность держит библиотека, retention удаляет деревом чанками.
 
 ---
 
@@ -817,7 +867,7 @@ async def save_progress(session: AsyncSession, s: BatchSummary) -> None: ...
 
 `release()` вызывается у корня и относится к **последней финализации** дерева. `retry_failed()` на любом узле переоткрывает корень и сбрасывает его `released_at`: после новой финализации итоги Items другие, и домен должен забрать их заново и снова вызвать `release()`. Без этого retention удалил бы дерево по старому разрешению, не дожидаясь повторного экспорта. Инвариант: дерево с `release_required=True` не удаляется, пока после последней финализации корня не вызван `release()`.
 
-Удаление идёт чанками по 1 000 Items (`DELETE ... WHERE ctid IN (SELECT ... LIMIT)`), по деревьям, от листьев к корню. `handle.view()` удалённого батча бросает `BatchPurged`. Итог к этому моменту уже в домене.
+Удаление идёт чанками по 1 000 Items (`DELETE ... WHERE ctid IN (SELECT ... LIMIT)`), по деревьям, от листьев к корню. Side-таблицы Items удаляются теми же чанками: `th_lease`, `th_window`, `th_item_mark`, `th_checkpoint`. `handle.view()` удалённого батча бросает `BatchPurged`. Итог к этому моменту уже в домене.
 
 **Истёкшее дерево уже удалено для операций.** Sweeper выбирает корень (`FOR UPDATE SKIP LOCKED`) и удаляет дерево следующими транзакциями, не перепроверяя условие. Поэтому, как только у корня истёк `retention` (и вызван `release()`, если он обязателен), операции `BatchHandle`, меняющие батч (`retry_failed`, `cancel`, `pause`, `resume`, `reschedule`, `retry_finalize`, `release`), на любом узле дерева бросают `BatchPurged`, даже если sweeper до дерева ещё не дошёл. Условие проверяется после блокировки строк батча по времени БД на момент запроса (`statement_timestamp()`, а не начала транзакции пользователя); время только растёт, а изменить истёкшее дерево операции не дают, так что оно остаётся кандидатом до удаления. Иначе `retry_failed` мог бы переоткрыть дерево посреди удаления, вернуть успех, а дерево всё равно исчезло бы. Чтение (`view`, `items`, `in_flight`) показывает истёкшее дерево, пока его строки не удалены. `retry_failed` после `release()` возможен только до истечения `retention`.
 
@@ -901,6 +951,9 @@ flowchart LR
     time --> UC15["UC-15 Sweeper: восстановление, сверка с DLQ"]
     ops --> UC16["UC-16 Повтор упавших"]
     work --> UC17["UC-17 Конвейер этапов: into, авто-seal, каскад"]
+    work --> UC18["UC-18 Итог значением и судьба исключений"]
+    work --> UC19["UC-19 Закладка составной единицы работы"]
+    ops --> UC20["UC-20 Разбудить отложенное"]
 ```
 
 ### UC-01 Создать батч в транзакции пользователя
@@ -990,7 +1043,7 @@ sequenceDiagram
         MW-->>B: успех, задача не вызывалась
     else захвачен
         C-->>MW: ok
-        MW->>MW: ContextVar = ItemContext, старт heartbeat
+        MW->>MW: ContextVar = WorkItem, старт heartbeat
         MW->>T: await task(*args)
         T->>MW: item.spawn / incr / ok(label) → в буфер
         T-->>MW: return
@@ -1056,7 +1109,7 @@ sequenceDiagram
 sequenceDiagram
     autonumber
     participant T as Задача expand_page
-    participant Ctx as ItemContext
+    participant Ctx as WorkItem
     participant C as Completer
     participant DB as PostgreSQL
     participant R as Relay
@@ -1442,6 +1495,150 @@ sequenceDiagram
     end
 ```
 
+### UC-18 Итог попытки значением и судьба исключений
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant MW as tracked
+    participant T as Функция задачи
+    participant C as Completer
+
+    MW->>T: await task(*args)
+    alt задача вернула Outcome
+        T-->>MW: return Defer(reason="no_accounts", delay=10s)
+        MW->>MW: императивный итог не задан, перевод в единый внутренний итог
+        MW->>C: defer(item, attempt, reason, delay)
+    else задача вернула что угодно другое
+        T-->>MW: return {"checked": 50} или None
+        MW->>C: finish(item, attempt, ok)
+    else задача вернула Outcome, а item.ok уже вызван
+        T-->>MW: return Ok("chunk")
+        MW-->>MW: ConfigurationError до записи итога
+    else задача бросила исключение, объявленное в defer_on / error_on / skip_on
+        T-->>MW: raise NoCheckerAccount
+        MW->>MW: правило по ближайшему классу MRO, перевод в Defer / Error / Skip
+        MW->>C: тот же путь, что у возвращённого Outcome
+    else задача бросила прочее исключение
+        T-->>MW: raise ProviderUnavailable
+        MW->>C: release или error("exhausted") по вердикту брокера (UC-04)
+    end
+```
+
+**Итог — данные на выходе задачи.** `Ok(label=None, *, result=None, mark=None)`,
+`Skip(label=None, *, mark=None)`, `Error(label=None, *, detail=None, mark=None)` и
+`Defer(reason, delay=None, until=None)` — замороженные
+dataclass'ы модели, объединённые закрытым типом `Outcome`. Возврат `Outcome` эквивалентен
+соответствующему вызову `item.ok/skip/error/defer`: `Error` записывает ошибочный итог без
+исключения и ретраев, `Defer` возвращает Item в очередь, не тратя попытку. Возврат `None`
+или любого не-`Outcome` значения сохраняет прежнюю семантику «успех с меткой `ok`», и само
+значение возвращается обёрткой брокеру без изменений. Итог виден в сигнатуре задачи и
+проверяется в тесте сравнением: `assert await task(...) == Defer(reason="quota")`.
+
+**Два источника итога — всегда ошибка.** Если задача и вызвала `item.ok/skip/error/defer`,
+и вернула `Outcome`, обёртка бросает `ConfigurationError` до записи возвращённого итога:
+правило «последний вызов выигрывает» здесь означало бы молчаливую потерю одного из двух
+итогов. Дальше попытка завершается как любое исключение задачи — по вердикту брокера
+(UC-04), потому что это ошибка в коде, а не исход работы. Тот же запрет
+действует в `complete_in(session, outcome)`: передать итог аргументом, уже задав его
+императивно, нельзя. `complete_in(session)` без аргумента работает как раньше.
+
+**Судьба исключения объявляется при регистрации задачи**, а не в её теле: «что это
+исключение значит для учёта работы» — знание об одном типе исключения, а не об одном
+вызове.
+
+```python
+@fq.task(
+    queue="checks",
+    retry_on=[ProviderUnavailable],                     # вердикт брокера, как раньше
+    defer_on={NoCheckerAccount: lambda e: Defer(reason=e.reason, delay=e.retry_after)},
+    error_on={InvalidDomainName: "invalid_domain"},      # Error(label=...), без ретраев
+    skip_on={DomainAlreadyChecked: "duplicate"},
+)
+async def check_domain_chunk(run_id: str, domains: list[str]) -> Ok: ...
+```
+
+* значение правила — готовый `Outcome` или функция `exc -> Outcome`; для `error_on` и
+  `skip_on` допустима метка строкой;
+* правило выбирается по ближайшему классу в MRO исключения, поэтому выигрывает самый
+  конкретный. Неоднозначная конфигурация — один класс в двух `*_on` или одновременно в
+  `*_on` и `retry_on` — `ConfigurationError` **при регистрации**: у каждого исключения одна
+  судьба, и узнать об этом надо до первого вызова;
+* переводится только исключение пользовательской задачи. `CancelledError`,
+  `LeaseLostError` и внутренние ошибки путей владения не переводятся никогда (UC-03);
+* опции принадлежат tallyho: адаптер забирает их себе и во flexiq не передаёт, как уже
+  делает с `weight`. Пользовательские `retry_on` / `dont_retry_on` не меняются;
+* если сама функция перевода упала, это обычное исключение задачи (вердикт брокера), с
+  записью в лог вместе с типом исходного исключения.
+
+### UC-19 Закладка составной единицы работы
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant MW as tracked
+    participant T as Функция задачи
+    participant DB as PostgreSQL
+
+    MW->>DB: claim: th_item + th_lease + LEFT JOIN th_checkpoint, один запрос
+    DB-->>MW: attempt, defers, position = 30
+    MW->>T: await task(*args)
+    T->>T: work = item.require(), start = work.checkpoint() or 0, это 30
+    loop элементы 31..50
+        T->>DB: BEGIN в сессии приложения
+        T->>DB: INSERT результата элемента
+        T->>DB: checkpoint_in(session, i + 1): upsert th_checkpoint и th_lease.progress_done
+        T->>DB: COMMIT, результат и закладка одним коммитом
+    end
+    T-->>MW: return Ok("chunk")
+    MW->>DB: finish: итог Item и DELETE th_checkpoint в той же транзакции
+```
+
+Закладка не трогает `th_item`: за жизнь Item с закладкой на каждый из 50 элементов строка
+`th_item` обновляется один раз (finish, HOT), а `th_checkpoint` — 50 раз в своей узкой
+таблице с `fillfactor=50` (§5.1). Запись меньшего `position` строку не меняет: порядок
+попыток после перехвата lease не гарантирован, а монотонность делает повтор безвредным.
+Чужая попытка получает `LeaseLostError`, и закладка остаётся прежней — тот же fencing, что
+у `complete_in` (UC-08). Откат транзакции приложения откатывает и закладку, и видимый
+прогресс. Для очень больших пачек закладку пишут раз в N элементов: цена повтора — не
+больше N элементов.
+
+Чего закладка не даёт: если внешнее действие уже выполнено, а транзакция с закладкой не
+закоммитилась, повтор выполнит его снова. Для таких действий нужен ключ идемпотентности на
+стороне ресурса — закладка отвечает только за работу, которая пишет в ту же базу.
+
+### UC-20 Разбудить отложенное
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant G as Контур ёмкости
+    participant H as BatchHandle
+    participant DB as PostgreSQL
+    participant R as Relay
+
+    G->>DB: ресурс появился, домен пополнил кредиты
+    G->>H: release_deferred(reasons=["no_accounts"], session=session)
+    H->>DB: UPDATE th_outbox: available_at = now(), defer_reason = NULL для этих причин
+    H-->>G: число разбуженных записей
+    G->>DB: COMMIT домена и пробуждения одной транзакцией
+    DB->>R: kick после commit
+    R->>DB: выпуск в пределах свободного места окна и не на паузе
+```
+
+Отложенные Items уходят в брокер по своему сроку, и это намеренно: `pause` и `resume` их не
+трогают (UC-15). Но контур, который управляет ёмкостью, открывает окно в тот же такт, когда
+ресурс появился, — и без пробуждения окно простаивало бы до истечения `delay`.
+`BatchHandle.release_deferred(reasons=None, *, session=None)` делает отложенные записи
+батча доступными сейчас, очищая только `defer_reason`; без `reasons` — все. `defers` и
+`first_deferred_at` не сбрасываются, поэтому потолки `max_defers` и `max_deferred_for`
+продолжают действовать и пробуждение нельзя использовать как обход потолка. Пауза,
+`start_at`, дедлайн и окно соблюдаются: фактический выпуск остаётся обязанностью
+window-aware relay, поэтому при окне 3 и 10 разбуженных уйдут 3, остальные ждут места.
+Возвращается число реально изменённых строк; повторный и конкурентный вызов идемпотентен.
+При `session=` изменение входит в транзакцию вызывающего, а `kick` relay выполняется после
+commit — откат не меняет ни одной строки.
+
 ---
 
 ## 9. Счётчики и групповой коммит
@@ -1501,7 +1698,7 @@ Completer: следующая групповая транзакция её не 
 транзакции (снимок не старше commit вызывающего, поэтому последний завершивший Item всегда доходит
 до полной проверки под блокировкой).
 
-Порядок блокировок: `[доменные строки пользователя] → th_batch → th_item (по id) → th_counter (по batch_id, slot) → th_metric`. Нарушение — баг. Тот же порядок у Finalizer (§8.1 п.3) и операций над поддеревом. Ловится стресс-тестом: любой `40P01` на соединениях сценария, включая повторённый автоматически, — падение.
+Порядок блокировок: `[доменные строки пользователя] → th_batch → th_item (по id) → th_lease → th_checkpoint → th_counter (по batch_id, slot) → th_metric`. `checkpoint_in` берёт только `th_item` (проверка владения), `th_lease` и `th_checkpoint` — её префикс порядка совпадает с `complete_in`, поэтому закладка посреди работы не может сцепиться в дедлок с завершением. Нарушение — баг. Тот же порядок у Finalizer (§8.1 п.3) и операций над поддеревом. Ловится стресс-тестом: любой `40P01` на соединениях сценария, включая повторённый автоматически, — падение.
 
 Свёртка дельт пути B — после-коммитная транзакция Completer и проход sweeper по устаревшим дельтам (UC-08, UC-15) — берёт `th_counter_delta` → отрицательные слоты `th_metric` → `th_counter` → `th_metric` своего слота. Sweeper берёт первые два шага через `SKIP LOCKED` и никого не ждёт, пока не дошёл до строк своего слота.
 
@@ -1674,8 +1871,13 @@ await th.migrate()  # или ревизия Alembic: upgrade(..., version=1)
 | Батч | `th.batch(kind, key=, seal=, start_at=, on_succeeded=, on_completed_with_errors=, on_failed=, on_cancelled=, on_finalized_task=, failure_policy=, max_in_flight=, expected_total=, max_defers=, max_deferred_for=, deadline_mode=, max_items=, deadline=, retention=, release_required=, attributes=, memo=, session=)` → `BatchBuilder`: `add`, `map`, `add_calls`, `sub_batch`, `expect`, `seal` |
 | Под-батч / этап | `builder.sub_batch(key, fed_by=[...], on_feeder_failed="seal" или "cancel", max_in_flight=, max_defers=, max_deferred_for=, deadline_mode=, max_depth=, expected_total=, failure_policy=, on_...=)` — те же параметры, что у батча, плюс `kind=`, кроме `retention`/`release_required`/`max_items`/`attributes`/`memo` (задаются только у корня) и `seal`/`session` (действуют на весь builder корня) |
 | Поиск | `th.handle(batch_id)`, `th.find(kind, key)`, `handle.child(key)`, `th.list_batches(kinds=, states=, attributes=, created_after=, created_before=, limit=, cursor=)` → `BatchPage`; `th.demand(kinds, attributes=, limit=)` → `list[BatchDemand]` |
-| Handle | `view`, `watch`, `wait`, `in_flight(limit=)`, `reschedule`, `pause`, `resume`, `set_max_in_flight(limit, session=, reason=)`, `clear_max_in_flight()`, `cancel`, `retry_failed(labels=)`, `retry_finalize`, `release`, `items(states=, labels=)` |
-| Задача | `from tallyho import item`: `item.id()`, `spawn(fn, *args, **kwargs)`, `spawn(fn, *args, into=, key=)`, `spawn_call(call, into=)`, `sub_batch(key, kind=, start_at=, deadline=, failure_policy=, max_in_flight=, max_defers=, max_deferred_for=, expected_total=, max_depth=, on_...=)`, `expect(n, into=)`, `progress(done, total)`, `incr`, `defer(reason=, delay=, until=)`, `ok(label=, result=)`, `skip(label)`, `error(label, detail=)`, `complete_in(session)`, `cancelled()`, `current()` |
+| Handle | `view`, `watch`, `wait`, `in_flight(limit=)`, `reschedule`, `pause`, `resume`, `set_max_in_flight(limit, session=, reason=)`, `clear_max_in_flight()`, `cancel`, `retry_failed(labels=)`, `retry_finalize`, `release`, `items(states=, labels=)`, `release_deferred(reasons=, session=)` |
+| Задача | `from tallyho import item`: `item.id()`, `spawn(fn, *args, **kwargs)`, `spawn(fn, *args, into=, key=)`, `spawn_call(call, into=)`, `sub_batch(key, kind=, start_at=, deadline=, failure_policy=, max_in_flight=, max_defers=, max_deferred_for=, expected_total=, max_depth=, on_...=)`, `expect(n, into=)`, `progress(done, total)`, `incr`, `defer(reason=, delay=, until=)`, `ok(label=, result=)`, `skip(label)`, `error(label, detail=)`, `checkpoint()`, `checkpoint_in(session, position)`, `complete_in(session, outcome=)`, `cancelled()`, `current()`, `require()` |
+| Единица работы | `WorkItem` — тип, который отдают `item.current()` и `item.require()`: `id`, `batch_id`, `attempt`, `defers` и те же операции, что у фасада |
+| Итог задачи | `from tallyho import Defer, Error, Ok, Outcome, Skip`; возврат из задачи или аргумент `complete_in` (UC-18) |
+| Судьба исключений | опции регистрации задачи: `defer_on={Exc: Defer(...) | fn}`, `error_on={Exc: "label" | fn}`, `skip_on={Exc: "label" | fn}` (UC-18) |
+| Обёртка задачи | `Tallyho(..., middleware=[...])` — последовательность `ItemMiddleware` |
+| DI | extra `tallyho[dishka]`: `from tallyho.integrations.dishka import DishkaItemScope, TallyhoProvider, inject, FromDishka` |
 | Колбэк | `from tallyho import callback`: `callback.current()` → `CallbackContext(callback_id, batch_id)`; `None` вне колбэк-задачи |
 | Вызовы | `th.call(fn, *args, **kwargs).opts(key=, weight=, queue=)` — типизировано через `ParamSpec` |
 | Tx-хуки | `@th.on_finalized(kind)`, `@th.on_progress(kind, every=)`, `@th.on_policy_breach(kind)` |
@@ -1699,7 +1901,13 @@ await th.migrate()  # или ревизия Alembic: upgrade(..., version=1)
 
 `deadline_mode` батча — `"wall"` (по умолчанию, абсолютное время) или `"active"`. При `"active"` дедлайн не течёт, пока батч стоит без работы — на паузе или в закрытом окне (`max_in_flight = 0`): sweeper на каждом проходе прибавляет к `deadline_at` время, прошедшее с прошлого прохода. Сдвиг монотонный, отдельного аккумулятора и новых колонок не нужно; режим хранится в `th_batch.options`. Это закрывает случай, когда батч проваливался по времени, простояв в нехватке ресурса, хотя работа не выполнялась.
 
-`item.complete_in(session)` бросает `LeaseLostError`, если попытка больше не владеет Item (UC-08). Вне отслеживаемой задачи это no-op, как и остальные методы `item`, кроме `sub_batch`: он возвращает builder и вне задачи бросает `ConfigurationError`.
+`item.complete_in(session)` бросает `LeaseLostError`, если попытка больше не владеет Item (UC-08). Вне отслеживаемой задачи это no-op, как и остальные методы `item`, кроме `sub_batch` и `require`: `sub_batch` возвращает builder, `require` — сам `WorkItem`, и вне задачи оба бросают `ConfigurationError`.
+
+**`WorkItem` — публичная единица работы.** Это тот же объект, который раньше назывался `ItemContext`: буферы и операции одной попытки. Фасад `item` делегирует ему и остаётся без изменений, но слоистому приложению нужен не фасад, а зависимость: `item.require() -> WorkItem` отдаёт его явно и вне задачи бросает `ConfigurationError` вместо тихого no-op, а `item.current() -> WorkItem | None` остаётся мягким вариантом. `WorkItem` открывает `id`, `batch_id`, `attempt`, `defers` (сколько раз Item уже откладывали), `checkpoint()`, `checkpoint_in(session, position)`, `progress`, `incr`, `spawn`/`spawn_call`/`expect`/`sub_batch`, `ok`/`skip`/`error`/`defer`, `complete_in(session, outcome=None)` и `cancelled()`. `ItemContext` остаётся алиасом `WorkItem` на один минорный выпуск.
+
+**Middleware вокруг задачи.** `ItemMiddleware` — протокол `async def __call__(work: WorkItem, call_next: Callable[[], Awaitable[object]]) -> object`. Цепочка задаётся один раз в `Tallyho(..., middleware=[...])`, первый элемент списка — внешний. Она вызывается после claim и активации контекста, но вокруг вызова задачи, поэтому возвращаемое значение и исключение проходят через неё и затем получают обычную семантику UC-18. Middleware не записывает итог и не владеет ретраями: для итога есть `Outcome`, для судьбы исключения — `*_on`. Колбэк-задачи и неотслеживаемые вызовы не оборачиваются; пустой список сохраняет текущий горячий путь без накладных расходов.
+
+**Контейнер зависимостей.** Extra `tallyho[dishka]` даёт `DishkaItemScope(container)` — middleware, которая открывает REQUEST-scope на каждую попытку и кладёт в его контекст текущий `WorkItem`, — и `TallyhoProvider`, который отдаёт этот `WorkItem` зависимостям. Инфраструктурные адаптеры (закладка, итог в транзакции) получают его конструктором, а вне задачи он в контейнере отсутствует, и разрешение падает с понятной ошибкой. Реэкспортированные `inject` и `FromDishka` убирают DI-параметры из видимой сигнатуры, поэтому `th.call(task, ...)` типизируется без них: `inject` возвращает `InjectedTask[R]` — протокол с `*args: object`, у которого проверяется тип результата, а не список аргументов. «Сигнатура минус несколько параметров» в системе типов не выражается, и требовать внедряемый аргумент в вызове было бы хуже. Подстановки `WorkItem` по типу аргумента задачи нет (D-086).
 
 Метки итога — свободные строки. По умолчанию `ok()` без label → `"ok"`, исчерпанные попытки → `error("exhausted")`, lease истёк на последней попытке → `error("lease_expired")`, отмена → `cancelled`. `error()` по умолчанию помечается в `th_item_mark`, `ok()`/`skip()` — нет (переопределяется `mark=`).
 

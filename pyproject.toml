@@ -47,6 +47,7 @@ flexiq = ["flexiq>=2.0,<3"]
 alembic = ["alembic>=1.13"]
 testing = ["pytest-asyncio>=1.4"]
 otel = ["opentelemetry-api>=1.25"]
+dishka = ["dishka>=1.4,<2"]
 
 [project.scripts]
 tallyho = "tallyho.cli:main"
@@ -376,7 +377,7 @@ name = "Layers (docs/ARCHITECTURE.md section 3.3): upper may import lower, never
 type = "layers"
 containers = ["tallyho"]
 layers = [
-  "cli | adapters | testing | observability",
+  "cli | adapters | integrations | testing | observability",
   "api | runtime",
   "engine",
   "hooks | storage",

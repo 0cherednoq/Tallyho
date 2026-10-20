@@ -33,11 +33,12 @@ from tallyho.model.errors import (
 )
 from tallyho.model.states import TERMINAL_THRESHOLD, BatchState, CancelReason, ItemState, OutboxKind
 from tallyho.storage.counters import CounterDelta, insert_delta, upsert_metrics
+from tallyho.storage.metric_names import check_counter_name
 from tallyho.storage.now import sql_now
 from tallyho.storage.tx import after_commit, deliver_committed, resolve_connection
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Sequence
+    from collections.abc import Collection, Iterable, Sequence
     from datetime import datetime
     from uuid import UUID
 
@@ -60,6 +61,7 @@ _NOT_TERMINAL = "операция допустима только для тер�
 _NEGATIVE_WINDOW = "max_in_flight должен быть целым >= 0"
 _WINDOW_REASON = "max_in_flight_reason"
 _NO_DATABASE_TIME = "БД не вернула текущее время"
+_DEFER_EMPTY_REASON = "причина defer не может быть пустой"
 
 
 class _Relay(Protocol):
@@ -311,6 +313,71 @@ class Operations:
         if limit != 0:
             _ = await refill_window(conn, self.tables, batch_ids=[batch_id])
         await self._after(target, relay=[batch_id])
+
+    async def release_deferred(
+        self,
+        target: AsyncSession | AsyncConnection,
+        batch_id: UUID,
+        reasons: Collection[str] | None = None,
+    ) -> int:
+        """Сделать отложенные записи батча доступными сейчас (ARCHITECTURE UC-20).
+
+        Отложенные Items уходят в брокер по своему сроку, и пауза их не
+        трогает. Эта операция нужна контуру, который управляет ёмкостью:
+        ресурс появился, и ждать истечения ``delay`` незачем. Очищается только
+        ``defer_reason``, а ``defers``, ``first_deferred_at``, ``attempt`` и
+        поколение остаются — потолки ``max_defers`` и ``max_deferred_for``
+        продолжают действовать. Отложенный старт соблюдается: срок не раньше
+        ``start_at`` батча, а пауза и окно остаются обязанностью relay,
+        поэтому выпуск идёт в пределах свободного места окна.
+
+        Args:
+            target: Сессия или соединение вызывающего.
+            batch_id: Батч; потомки своё отложенное сохраняют.
+            reasons: Причины, которые нужно разбудить; ``None`` — все. Пустая
+                коллекция не меняет ничего.
+
+        Returns:
+            Число реально изменённых записей outbox.
+
+        Raises:
+            ConfigurationError: причина пуста или начинается с зарезервированного
+                U+001F — такой ``defer_reason`` записать было нельзя.
+        """
+        chosen = None if reasons is None else sorted(set(reasons))
+        if chosen is not None:
+            for reason in chosen:
+                if not reason:
+                    raise ConfigurationError(_DEFER_EMPTY_REASON)
+                check_counter_name(reason, what="причины defer")
+        conn = await resolve_connection(target)
+        _ = await self._lock_rows(conn, [batch_id], batch_id=batch_id)
+        await self._ensure_retained(conn, batch_id)
+        if chosen is not None and not chosen:
+            return 0
+        now = await self._now(conn)
+        batch = self.tables.batch
+        outbox = self.tables.outbox
+        # Отложенный старт не обходим: срок не раньше start_at батча.
+        available = (
+            select(func.greatest(func.coalesce(batch.c.start_at, literal(now)), literal(now)))
+            .where(batch.c.id == batch_id)
+            .scalar_subquery()
+        )
+        where = [
+            outbox.c.batch_id == batch_id,
+            outbox.c.kind == _ITEM,
+            outbox.c.defer_reason.is_not(None),
+        ]
+        if chosen is not None:
+            where.append(outbox.c.defer_reason.in_(chosen))
+        result = await conn.execute(
+            update(outbox).where(*where).values(available_at=available, defer_reason=None)
+        )
+        changed = result.rowcount
+        if changed:
+            await self._after(target, relay=[batch_id])
+        return changed
 
     async def reschedule(
         self, target: AsyncSession | AsyncConnection, batch_id: UUID, start_at: datetime

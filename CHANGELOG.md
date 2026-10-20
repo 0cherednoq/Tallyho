@@ -19,10 +19,28 @@
   `seal`.
 - Потоковое добавление: `th.batch(..., seal=False)` коммитит порцию, не закрывая батч; следующий
   вход с тем же ключом дописывает в него, закрывает вход без `seal=False` или `seal()`.
+- Итог задачи **возвращаемым значением**: `Ok(label, result=, mark=)`, `Skip(label, mark=)`,
+  `Error(label, detail=, mark=)` и `Defer(reason, delay=, until=)` — замороженные значения, которые
+  сравниваются в тестах напрямую. Возврат `None` или любого другого значения по-прежнему означает
+  `ok`. Два источника итога (вызов и возврат) — `ConfigurationError` до записи.
 - Итог задачи через `item.ok / skip / error` с метками (labels), пользовательские метрики
   `item.incr`, собственный прогресс задачи `item.progress`, кооперативная отмена
-  `item.cancelled()`, завершение в транзакции пользователя `item.complete_in(session)`; попытка,
-  потерявшая аренду, получает `LeaseLostError`, и её доменные записи откатываются.
+  `item.cancelled()`, завершение в транзакции пользователя
+  `item.complete_in(session, outcome=None)`; попытка, потерявшая аренду, получает
+  `LeaseLostError`, и её доменные записи откатываются.
+- Судьба исключения объявляется при регистрации задачи: `defer_on`, `error_on`, `skip_on`
+  (константа, метка или функция `exc -> итог`). Правило выбирается по ближайшему классу в MRO;
+  один класс в двух опциях или одновременно в `*_on` и `retry_on` — `ConfigurationError` при
+  регистрации. `CancelledError` и потеря аренды не переводятся никогда.
+- Публичный тип единицы работы `WorkItem` (прежнее имя `ItemContext` остаётся алиасом на один
+  минорный выпуск) и строгий `item.require()`, который вне задачи бросает `ConfigurationError`.
+- Закладка составной единицы работы: `WorkItem.checkpoint()` читается вместе с захватом задачи,
+  `await WorkItem.checkpoint_in(session, position)` пишет её в транзакции приложения — тем же
+  коммитом, что результат элемента. Запись монотонна, `th_item` не обновляется,
+  `th_lease.progress_done` двигается вместе с закладкой. Закладка переживает `defer`, ретрай,
+  падение воркера и `retry_failed`, удаляется итогом `ok`/`skip`/`cancelled`.
+- Обёртки вокруг задачи: `Tallyho(..., middleware=[...])` с протоколом `ItemMiddleware`
+  (`work`, `call_next`); итог обёртка не записывает и ретраями не управляет.
 - Вызовы `th.call(fn, …).opts(key=, weight=, queue=, …)`: дедупликация по ключу, веса для
   прогресса, опции брокера.
 - Колбэк-задачи `on_succeeded`, `on_completed_with_errors`, `on_failed`, `on_cancelled`,
@@ -61,8 +79,22 @@
 - `deadline_mode="active"`: дедлайн не течёт, пока батч стоит без работы (пауза или окно `0`).
 - `th.demand(kinds, attributes=, limit=)` → `BatchDemand`: дешёвое чтение спроса активных батчей
   (`pending`, `in_flight`, `deferred`, `max_in_flight`, `paused`) одним запросом.
+- `BatchHandle.release_deferred(reasons=None, session=)`: разбудить отложенные задачи батча, когда
+  ресурс появился раньше их срока. Очищается только причина отложения — `defers` и
+  `first_deferred_at` остаются, поэтому потолки продолжают действовать; пауза, отложенный старт и
+  окно соблюдаются, выпуск идёт в пределах свободного места окна.
 - Наблюдаемость отложений: `Progress.deferred`, `BatchView.deferred_reasons`, событие
   `Observer.item_deferred`.
+
+**Внедрение зависимостей**
+
+- Extra `tallyho[dishka]` и пакет `tallyho.integrations.dishka`: `DishkaItemScope` открывает
+  REQUEST-scope контейнера на каждую попытку, `TallyhoProvider` отдаёт текущий `WorkItem`
+  зависимостям, `inject` и `FromDishka` убирают DI-параметры из видимой сигнатуры задачи. Вне
+  задачи `WorkItem` в контейнере отсутствует, и разрешение падает с понятной ошибкой. Обычный
+  `import tallyho` dishka не требует.
+- Новая таблица `th_checkpoint` (`item_id` PK, `batch_id`, `position`, `updated_at`) входит в
+  базовую схему v1; `SCHEMA_VERSION` не менялся.
 
 **Интеграция с доменными таблицами**
 

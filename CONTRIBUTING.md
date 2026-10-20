@@ -73,7 +73,7 @@ src/tallyho/
   storage/     таблицы, запросы, миграции (SQLAlchemy Core)
   hooks/       реестр tx-хуков
   engine/      Completer, Relay, Sweeper, Finalizer, Snapshotter
-  runtime/     tracked, ItemContext
+  runtime/     tracked, WorkItem
   api/         Tallyho, BatchBuilder, BatchHandle
   adapters/    адаптеры брокеров (flexiq)
   testing/     InlineBroker, FakeClock — для тестов пользователей

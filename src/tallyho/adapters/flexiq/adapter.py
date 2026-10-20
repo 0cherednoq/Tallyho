@@ -12,7 +12,7 @@ import time
 from collections import OrderedDict, defaultdict
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import timedelta
 from importlib.metadata import version
 from typing import TYPE_CHECKING, ParamSpec, Protocol, TypeVar, cast, final, runtime_checkable
@@ -43,6 +43,7 @@ from tallyho.protocols.broker import (
     WorkerServices,
 )
 from tallyho.protocols.serialization import PayloadCodec
+from tallyho.runtime.exceptions import build_exception_policy
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Sequence
@@ -51,6 +52,7 @@ if TYPE_CHECKING:
 
     from tallyho.protocols.broker import Message, WorkerRuntime
     from tallyho.protocols.serialization import CallArgs
+    from tallyho.runtime.exceptions import ExceptionPolicy
 
 __all__ = ["FlexiqAdapter"]
 
@@ -80,6 +82,8 @@ _FLEXIQ_MAJOR = 2
 _PAIR_SIZE = 2
 _BATCH_OPTION = "batch"
 _WEIGHT_OPTION = "weight"
+_TALLYHO_OPTIONS = frozenset({"defer_on", "error_on", "skip_on"})
+"""Опции судьбы исключений принадлежат tallyho: во flexiq они не передаются."""
 _WEIGHT_HINT = "вес — опция вызова tallyho: th.call(...).opts(weight=...)"
 _ENCODE_PAYLOAD = "_encode_payload"
 _DECODE_PAYLOAD = "_deserialize_payload"
@@ -209,6 +213,8 @@ class _TaskConfig:
     idempotent: bool
     retry_on: tuple[type[BaseException], ...]
     dont_retry_on: tuple[type[BaseException], ...]
+    exception_policy: ExceptionPolicy = field(default_factory=build_exception_policy)
+    """Судьба исключений задачи: опции tallyho, во flexiq они не уходят."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -383,10 +389,12 @@ class FlexiqAdapter(
                 raise ConfigurationError(_SYNC_TASK)
             runtime = self._require_runtime()
             config = _with_infrastructure_retries(self._task_config(options))
-            broker_options = dict(options)
+            broker_options = {
+                name: value for name, value in options.items() if name not in _TALLYHO_OPTIONS
+            }
             if config.retry_on:
                 broker_options["retry_on"] = list(config.retry_on)
-            tracked = runtime.wrap(fn)
+            tracked = runtime.wrap(fn, policy=config.exception_policy)
             dynamic = cast("_AsyncTask", tracked)
 
             async def invoke(*args: object, **kwargs: object) -> object:
@@ -855,6 +863,12 @@ class FlexiqAdapter(
             idempotent=_boolean(options.get("idempotent", False), "idempotent"),
             retry_on=_exception_types(options.get("retry_on"), "retry_on"),
             dont_retry_on=_exception_types(options.get("dont_retry_on"), "dont_retry_on"),
+            exception_policy=build_exception_policy(
+                defer_on=options.get("defer_on"),
+                error_on=options.get("error_on"),
+                skip_on=options.get("skip_on"),
+                retry_on=_exception_types(options.get("retry_on"), "retry_on"),
+            ),
         )
 
 

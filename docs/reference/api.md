@@ -7,7 +7,7 @@
 | Раздел | Что внутри |
 |---|---|
 | [Клиент и батчи](api/client.md) | `Tallyho`, `Settings`, `BatchBuilder`, `BatchHandle`, `Call` |
-| [Внутри задачи](api/runtime.md) | фасады `item` и `callback`, декоратор `tracked` |
+| [Внутри задачи](api/runtime.md) | итоги `Ok`/`Skip`/`Error`/`Defer`, `WorkItem`, судьба исключений, `ItemMiddleware`, фасады `item` и `callback`, декоратор `tracked` |
 | [Модель](api/model.md) | состояния, снимки и сводки, политики ошибок, исключения |
 | [Тестирование](api/testing.md) | `InlineBroker`, `FakeClock`, `TallyhoTestEnv`, pytest-фикстура |
 | [Интеграции и расширение](api/extensions.md) | адаптер flexiq, наблюдатели, Alembic, протоколы для своих реализаций |

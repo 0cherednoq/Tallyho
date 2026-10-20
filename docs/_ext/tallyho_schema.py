@@ -41,6 +41,7 @@ _ORDER: Final = (
     "item_mark",
     "feed",
     "window",
+    "checkpoint",
     "expiry",
     "batch_attr",
     "meta",
@@ -78,6 +79,10 @@ _TABLES: Final[dict[str, str]] = {
     ),
     "feed": "Связи конвейера: какой под-батч какой этап наполняет (`fed_by`).",
     "window": "Отправленные и ещё не завершённые задачи батчей с `max_in_flight`.",
+    "checkpoint": (
+        "Закладки составных задач: сколько элементов или шагов задача уже сделала. Строка есть "
+        "только у задач, которые её пишут, и удаляется вместе с итогом `ok`, `skip` или отменой."
+    ),
     "expiry": "Сроки задач, поставленных с опцией брокера `expires`.",
     "batch_attr": (
         "Атрибуты и `memo` корневого батча. Строка есть только у корня, которому они заданы."
@@ -131,6 +136,8 @@ _COLUMNS: Final[dict[str, dict[str, str]]] = {
         "weight": "вес задачи в `ratio`",
         "result": "значение из `item.ok(result=...)`",
         "error": "значение из `item.error(detail=...)` или описание сбоя",
+        "defers": "сколько раз задачу откладывали (`item.defer`, `Defer`)",
+        "first_deferred_at": "когда задачу отложили впервые; по нему работает `max_deferred_for`",
         "created_at": "когда задача добавлена",
         "finished_at": "когда записан итог",
         "generation": "сколько раз задача возвращалась в очередь отправки",
@@ -146,6 +153,7 @@ _COLUMNS: Final[dict[str, dict[str, str]]] = {
         "available_at": (
             "не раньше какого момента отправлять; так устроены отложенный старт и пауза"
         ),
+        "defer_reason": "причина отложения: отличает отложенную запись от запаркованной",
         "attempts": "сколько раз запись пытались отправить",
     },
     "lease": {
@@ -210,6 +218,12 @@ _COLUMNS: Final[dict[str, dict[str, str]]] = {
         "item_id": "отправленная задача",
         "batch_id": "батч с `max_in_flight`",
     },
+    "checkpoint": {
+        "item_id": "задача, чей прогресс",
+        "batch_id": "её батч; по нему закладки удаляются вместе с деревом",
+        "position": "сколько элементов или шагов сделано; значение только растёт",
+        "updated_at": "когда закладка двигалась последний раз",
+    },
     "expiry": {
         "item_id": "задача",
         "expires_at": (
@@ -230,6 +244,7 @@ _COLUMNS: Final[dict[str, dict[str, str]]] = {
 _INDEXES: Final[dict[str, str]] = {
     "batch_active_updated_idx": "фоновые проверки: незавершённые батчи, которые давно не менялись",
     "batch_deadline_idx": "фоновые проверки: батчи с истёкшим дедлайном",
+    "batch_kind_active_idx": "`th.demand(kinds=...)`: активные батчи требуемых типов",
     "batch_kind_idx": "`th.list_batches(kinds=...)`: корни одного типа, от новых к старым",
     "batch_kind_key_uq": "идемпотентное создание корня и `th.find(kind, key)`",
     "batch_parent_idx": "обход дерева: пауза, отмена, `view()`",
@@ -246,6 +261,10 @@ _INDEXES: Final[dict[str, str]] = {
     "lease_batch_idx": "`handle.in_flight()` и `progress.in_flight`",
     "lease_until_idx": "фоновые проверки: истёкшие аренды",
     "outbox_available_idx": "отправка в брокер: что пора отправлять",
+    "outbox_deferred_idx": (
+        "отложенные записи батча: их число и причины, `th.demand()`, пробуждение "
+        "`release_deferred` и потолок `max_deferred_for`"
+    ),
     "outbox_batch_idx": (
         "пауза, продолжение, отмена, перенос старта и окно `max_in_flight` одного батча"
     ),

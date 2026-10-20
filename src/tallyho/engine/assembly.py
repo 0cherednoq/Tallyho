@@ -179,6 +179,8 @@ class _Facade:
     serializer: Serializer | None
     hooks: HookRegistry
     settings: EngineSettings
+    middleware: Sequence[object] = ()
+    """Цепочка ``ItemMiddleware`` верхнего слоя; engine её только передаёт."""
     _maintenance: Maintenance | None = None
     _operations: Operations | None = None
     _reads: Reads | None = None
@@ -427,6 +429,7 @@ class _Facade:
             tree_cache=tree_cache,
             heartbeat_every=heartbeat,
             defer_default_delay=self.settings.defer_default_delay,
+            middleware=self.middleware,
         )
         adapter.install_runtime(
             # Событие DLQ брокера разбирается по правилу сверки (UC-15).
@@ -619,6 +622,18 @@ class _Facade:
         async with begin_transaction(self.installation.engine) as conn:
             await operations.set_max_in_flight(conn, batch_id, limit, reason=reason)
 
+    async def release_deferred(
+        self,
+        target: AsyncSession | AsyncConnection | None,
+        batch_id: UUID,
+        reasons: Collection[str] | None,
+    ) -> int:
+        operations = self._live(self._operations)
+        if target is not None:
+            return await operations.release_deferred(target, batch_id, reasons)
+        async with begin_transaction(self.installation.engine) as conn:
+            return await operations.release_deferred(conn, batch_id, reasons)
+
     async def reschedule(
         self,
         target: AsyncSession | AsyncConnection | None,
@@ -684,6 +699,7 @@ def create(  # ruff: ignore[too-many-arguments]  # called through the pure engin
     serializer: Serializer | None,
     hooks: HookRegistry,
     settings: EngineSettings,
+    middleware: Sequence[object] = (),
 ) -> EngineFacade:
     """Создать engine-фасад одной установки.
 
@@ -698,4 +714,5 @@ def create(  # ruff: ignore[too-many-arguments]  # called through the pure engin
         serializer=serializer,
         hooks=hooks,
         settings=settings,
+        middleware=tuple(middleware),
     )
