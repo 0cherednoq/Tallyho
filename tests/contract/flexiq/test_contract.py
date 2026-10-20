@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import json
 import time
-from collections import Counter
 from contextlib import asynccontextmanager
 from dataclasses import replace
 from datetime import UTC, datetime, timedelta
@@ -26,6 +25,7 @@ from tallyho.storage.tables import build_metadata
 from tests.contract.flexiq.contract_app import DataClassPayload, ModelPayload
 from tests.helpers.db import schema_connection
 from tests.helpers.flexiq_version import installed_flexiq_supported
+from tests.helpers.rates import max_in_window, min_span, span
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Awaitable, Callable
@@ -36,6 +36,11 @@ if TYPE_CHECKING:
     from tests.contract.flexiq.contract_app import ContractApp
 
 __all__: list[str] = []
+
+RATE_LIMIT = 2
+"""`rate_limit` задачи `rate_limited` стенда: разрешено запусков в секунду."""
+RATE_EVENTS = 6
+"""Сколько задач ставит сценарий A-FQ-12 под этот лимит."""
 
 
 async def test_a_fq_01_arguments_and_task_identity(flexiq_contract: FlexiqContract) -> None:
@@ -698,14 +703,18 @@ async def test_a_fq_12_broker_and_tallyho_concurrency_limits_compose(
 
     async with app.th.batch("a-fq-12-rate", key="rate") as rate_batch:
         await rate_batch.add_calls(
-            [app.th.call(app.tasks["rate_limited"], str(index)) for index in range(6)]
+            [app.th.call(app.tasks["rate_limited"], str(index)) for index in range(RATE_EVENTS)]
         )
     rate_events = await flexiq_contract.wait_events("rate", count=6, timeout_seconds=10)
     _ = await flexiq_contract.wait_terminal(rate_batch.handle)
     rate_times = [float(cast("float", row["at"])) for row in rate_events]
-    rate_windows = Counter(int(at) for at in rate_times)
-    assert len(rate_windows) >= 3
-    assert max(rate_windows.values()) <= 2
+    # Лимитер «2/s» отсчитывает окна от своего первого разрешения, а не от целой
+    # секунды, поэтому проверяем то, что ограничение означает: работа растянулась
+    # и ни в одной скользящей секунде не больше 2 * limit событий — это предел
+    # фиксированного окна на границе двух окон (tests/helpers/rates.py).
+    assert len(rate_times) == RATE_EVENTS
+    assert span(rate_times) >= min_span(RATE_EVENTS, RATE_LIMIT)
+    assert max_in_window(rate_times) <= 2 * RATE_LIMIT
 
 
 async def test_a_fq_13_middleware_injection_and_predicate_are_preserved(
