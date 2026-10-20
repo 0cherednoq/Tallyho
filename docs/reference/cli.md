@@ -4,7 +4,7 @@
 
 ```bash
 tallyho migrate --dsn postgresql+asyncpg://app:secret@db/app --schema app
-# schema=app version=1
+# schema=app version=2
 ```
 
 | Команда | Что делает |

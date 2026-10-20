@@ -24,7 +24,7 @@ import hashlib
 import re
 from dataclasses import dataclass
 from datetime import timedelta
-from typing import TYPE_CHECKING, Final
+from typing import TYPE_CHECKING, Final, cast
 
 from sqlalchemy import MetaData, Text, func, literal_column, select, text
 from sqlalchemy.dialects.postgresql import insert
@@ -34,7 +34,7 @@ from tallyho.model.errors import ConfigurationError
 from tallyho.storage.tables import DEFAULT_PREFIX, build_metadata
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Mapping
+    from collections.abc import Callable, Iterable, Mapping
 
     from sqlalchemy import Index, Table, TypedColumns
     from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
@@ -52,8 +52,13 @@ __all__ = [
     "validate_schema",
 ]
 
-SCHEMA_VERSION: Final = 1
-"""Версия схемы, которую знает эта версия библиотеки."""
+SCHEMA_VERSION: Final = 2
+"""Версия схемы, которую знает эта версия библиотеки.
+
+Версия 1 опубликована (0.0.1, 0.0.2a1) и заморожена: её DDL закреплён golden-файлом
+``tests/unit/storage/golden/ddl_v1.sql``. Всё новое добавляется следующими версиями
+(D-088), иначе база, уже помеченная версией 1, молча осталась бы без новых объектов.
+"""
 
 VERSION_KEY: Final = "schema_version"
 """Ключ версии схемы в ``th_meta``."""
@@ -115,12 +120,15 @@ def validate_schema(schema: str | None) -> str | None:
 class _Installation:
     """Таблицы одной установки в её схеме.
 
-    ``tables`` — все таблицы в порядке имён, как ``sorted_tables``.
+    ``tables`` — все таблицы в порядке имён, как ``sorted_tables``;
+    ``since_v2`` — те из них, которые появились после замороженной версии 1,
+    поэтому их создаёт не она, а своя миграция.
     """
 
     schema: str | None
     tables: list[Table[TypedColumns]]
     meta: Table[MetaColumns]
+    since_v2: list[Table[TypedColumns]]
 
 
 def _installation(schema: str | None, prefix: str) -> _Installation:
@@ -144,16 +152,18 @@ def _installation(schema: str | None, prefix: str) -> _Installation:
         source.item_mark,
         source.expiry,
         source.window,
-        source.checkpoint,
     ]
+    checkpoint = source.checkpoint
     if schema is not None:
         target = MetaData()
         meta = meta.to_metadata(target, schema=schema)
         tables = [table.to_metadata(target, schema=schema) for table in tables]
+        checkpoint = checkpoint.to_metadata(target, schema=schema)
     return _Installation(
         schema=schema,
         tables=sorted([*tables, meta], key=lambda t: t.name),
         meta=meta,
+        since_v2=[cast("Table[TypedColumns]", checkpoint)],
     )
 
 
@@ -161,17 +171,44 @@ def _sorted_indexes(table: Table[TypedColumns]) -> list[Index]:
     return sorted(table.indexes, key=lambda index: str(index.name))
 
 
-def _v1(installation: _Installation) -> list[Executable]:
+def _create(tables: Iterable[Table[TypedColumns]]) -> list[Executable]:
     statements: list[Executable] = []
-    if installation.schema is not None:
-        statements.append(CreateSchema(installation.schema, if_not_exists=True))
-    for table in installation.tables:
+    for table in tables:
         statements.append(CreateTable(table))
         statements.extend(CreateIndex(index) for index in _sorted_indexes(table))
     return statements
 
 
-_MIGRATIONS: Final[Mapping[int, Callable[[_Installation], list[Executable]]]] = {1: _v1}
+def _v1(installation: _Installation) -> list[Executable]:
+    """Опубликованная и замороженная версия 1: вся схема, кроме более поздних таблиц.
+
+    Returns:
+        Операции версии 1.
+    """
+    statements: list[Executable] = []
+    if installation.schema is not None:
+        statements.append(CreateSchema(installation.schema, if_not_exists=True))
+    statements.extend(_create(installation.tables))
+    return statements
+
+
+def _v2(installation: _Installation) -> list[Executable]:
+    """Версия 2: закладка составной единицы работы (``th_checkpoint``).
+
+    Схему создаёт версия 1, но ревизия Alembic может начинаться и с версии 2 на
+    базе, которой ещё нет, поэтому ``CREATE SCHEMA IF NOT EXISTS`` повторяется.
+
+    Returns:
+        Операции версии 2.
+    """
+    statements: list[Executable] = []
+    if installation.schema is not None:
+        statements.append(CreateSchema(installation.schema, if_not_exists=True))
+    statements.extend(_create(installation.since_v2))
+    return statements
+
+
+_MIGRATIONS: Final[Mapping[int, Callable[[_Installation], list[Executable]]]] = {1: _v1, 2: _v2}
 
 
 def _lock_timeout_statement(lock_timeout: timedelta) -> Executable:

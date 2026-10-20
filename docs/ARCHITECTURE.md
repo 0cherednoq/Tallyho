@@ -1824,7 +1824,7 @@ async def my_task(x: int) -> None:
     item.incr("seen", x)  # фасад текущей задачи — модульный, не атрибут th
 
 
-await th.migrate()  # или ревизия Alembic: upgrade(..., version=1)
+await th.migrate()  # или ревизии Alembic: upgrade(..., version=1), затем version=2
 ```
 
 `th.install(adapter)` запускает в процессе relay (§3.2): отправка после commit не требует отдельного процесса maintenance. В том же цикле идёт сверка с DLQ брокера (UC-15). `th.install(None)` — установка без брокера для процессов обслуживания и чтения (CLI): `th.batch` и `th.call` в ней бросают `ConfigurationError`, relay не создаётся, `th.maintenance()` выполняет sweeper, финализацию и снимки.

@@ -1,7 +1,8 @@
-"""Миграции без БД: проверка имён и DDL версии 1 против golden-снимка схемы."""
+"""Миграции без БД: имена объектов, замороженная версия 1 и сумма версий против golden."""
 
 from __future__ import annotations
 
+import os
 from datetime import timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -23,6 +24,8 @@ if TYPE_CHECKING:
     from sqlalchemy.sql.base import Executable
 
 GOLDEN = Path(__file__).parent / "golden" / "ddl.sql"
+GOLDEN_V1 = Path(__file__).parent / "golden" / "ddl_v1.sql"
+UPDATE_GOLDEN_ENV = "TALLYHO_UPDATE_GOLDEN"
 DIALECT = create_mock_engine("postgresql+asyncpg://", executor=print).dialect
 
 
@@ -31,20 +34,46 @@ def compiled(statement: Executable) -> str:
     return str(statement.compile(dialect=DIALECT))
 
 
-def ddl_without_schema(schema: str) -> str:
-    """DDL таблиц и индексов версии 1 в формате golden-файла, без квалификатора схемы."""
+def ddl_without_schema(schema: str, *versions: int) -> str:
+    """DDL таблиц и индексов указанных версий в формате golden-файла, без схемы."""
     statements = [
         compiled(statement).replace(f"{schema}.", "")
-        for statement in migration_statements(1, schema=schema)
+        for version in versions
+        for statement in migration_statements(version, schema=schema)
         if isinstance(statement, CreateTable | CreateIndex)
     ]
     lines = "\n".join(f"{statement.strip()};\n" for statement in statements).splitlines()
     return "\n".join(line.rstrip() for line in lines) + "\n"
 
 
-def test_version_one_matches_tables_snapshot() -> None:
-    # Версия 1 создаёт всю схему: тот же golden-снимок, что у build_metadata.
-    assert ddl_without_schema("app") == GOLDEN.read_text(encoding="utf-8")
+def objects(ddl: str) -> set[str]:
+    """Операции DDL как множество: порядок между версиями контрактом не является."""
+    return {block.strip() for block in ddl.split(";\n") if block.strip()}
+
+
+def test_version_one_is_frozen() -> None:
+    # Версия 1 опубликована (0.0.1, 0.0.2a1): её DDL меняться не может (D-088).
+    ddl = ddl_without_schema("app", 1)
+    if os.environ.get(UPDATE_GOLDEN_ENV):
+        GOLDEN_V1.write_text(ddl, encoding="utf-8", newline="\n")
+    assert ddl == GOLDEN_V1.read_text(encoding="utf-8")
+
+
+def test_all_versions_together_match_tables_snapshot() -> None:
+    # Все миграции вместе создают ровно то, что описывает build_metadata.
+    versions = range(1, SCHEMA_VERSION + 1)
+    assert objects(ddl_without_schema("app", *versions)) == objects(
+        GOLDEN.read_text(encoding="utf-8")
+    )
+
+
+def test_later_version_creates_only_its_own_tables() -> None:
+    created = {
+        block.split("CREATE TABLE ")[1].split(" ")[0]
+        for block in objects(ddl_without_schema("app", 2))
+        if "CREATE TABLE " in block
+    }
+    assert created == {"th_checkpoint"}
 
 
 def test_statements_order() -> None:
