@@ -26,12 +26,14 @@ from tallyho.protocols.broker import (
     Verdict,
 )
 from tallyho.protocols.serialization import JsonSerializer, PayloadCodec, SerializerCodec
+from tallyho.runtime.exceptions import build_exception_policy
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Mapping, Sequence
 
     from tallyho.protocols.broker import Message
     from tallyho.protocols.serialization import CallArgs, Serializer
+    from tallyho.runtime.exceptions import ExceptionPolicy
     from tallyho.runtime.tracked import TaskRuntime
 
 __all__ = ["InlineBroker"]
@@ -101,6 +103,7 @@ class InlineBroker(Dispatcher, Runtime, PayloadCodec, RetryLimits):
         self._random = random.Random(seed)  # ruff: ignore[suspicious-non-cryptographic-random-usage]  # воспроизводимая инъекция дублей, не криптография
         self._codec = SerializerCodec(serializer or JsonSerializer())
         self._tasks: dict[str, _Task] = {}
+        self._policies: dict[str, ExceptionPolicy] = {}
         self._queue: deque[_Delivery] = deque()
         self._crashed: list[_Delivery] = []
         self._dead: list[Message] = []
@@ -176,6 +179,31 @@ class InlineBroker(Dispatcher, Runtime, PayloadCodec, RetryLimits):
             self._queue.append(delivery)
             if self._random.random() < self.duplicate_delivery_rate:
                 self._queue.append(delivery)
+
+    def on_exception(
+        self,
+        fn: Callable[P, Awaitable[R]],
+        *,
+        defer_on: object = None,
+        error_on: object = None,
+        skip_on: object = None,
+    ) -> None:
+        """Объявить судьбу исключений задачи, как опции декоратора адаптера (UC-18).
+
+        В настоящем адаптере ``defer_on`` / ``error_on`` / ``skip_on`` — опции
+        регистрации задачи. Здесь задачи регистрируются по первому вызову,
+        поэтому правила объявляются отдельным вызовом; неоднозначная
+        конфигурация, как и в адаптере, отклоняется сразу.
+
+        Args:
+            fn: Задача, которую тест ставит в батч.
+            defer_on: ``{Exc: Defer(...)}`` или ``{Exc: exc -> Defer}``.
+            error_on: ``{Exc: "метка"}``, ``{Exc: Error(...)}`` или функция.
+            skip_on: то же для ``Skip``.
+        """
+        self._policies[self.task_name(fn)] = build_exception_policy(
+            defer_on=defer_on, error_on=error_on, skip_on=skip_on
+        )
 
     @override
     def wrap(self, fn: Callable[P, Awaitable[R]]) -> Callable[P, Awaitable[R]]:
@@ -342,7 +370,9 @@ class InlineBroker(Dispatcher, Runtime, PayloadCodec, RetryLimits):
         maximum = self._message_retries(message)
         token = self._attempt.set(_Attempt(delivery.retry_count, maximum))
         try:
-            wrapped = self._require_runtime().wrap(task)
+            wrapped = self._require_runtime().wrap(
+                task, policy=self._policies.get(message.task_name)
+            )
             try:
                 _ = await wrapped(*args, **kwargs)
             except asyncio.CancelledError:

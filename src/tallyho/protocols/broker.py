@@ -268,15 +268,22 @@ class Runtime(Protocol):
 class WorkerRuntime(Protocol):
     """Собранный engine-owned around-runtime, безопасный для слоя адаптеров."""
 
-    def wrap(self, fn: Callable[P, Awaitable[R]]) -> Callable[P, Awaitable[R | None]]:
-        """Обернуть tracked-задачу, не раскрывая engine-типы адаптеру."""
+    def wrap(
+        self, fn: Callable[P, Awaitable[R]], *, policy: object = None
+    ) -> Callable[P, Awaitable[R | None]]:
+        """Обернуть tracked-задачу, не раскрывая engine-типы адаптеру.
+
+        ``policy`` — судьба исключений этой задачи (``ExceptionPolicy``
+        верхнего слоя, собранная адаптером при регистрации); здесь она
+        непрозрачна, как остальные runtime-типы.
+        """
         ...
 
 
 class WorkerFactory(Protocol):
     """Композиционная фабрика runtime без зависимости engine от верхнего слоя."""
 
-    def __call__(
+    def __call__(  # ruff: ignore[too-many-arguments]  # граница композиции engine → runtime
         self,
         *,
         completer: object,
@@ -285,8 +292,13 @@ class WorkerFactory(Protocol):
         tree_cache: object,
         heartbeat_every: timedelta,
         defer_default_delay: timedelta,
+        middleware: Sequence[object],
     ) -> WorkerRuntime:
-        """Собрать runtime из непрозрачных engine-сервисов."""
+        """Собрать runtime из непрозрачных engine-сервисов.
+
+        ``middleware`` — последовательность ``ItemMiddleware`` верхнего слоя;
+        здесь она непрозрачна, как ``completer`` и ``tree_cache``.
+        """
         ...
 
 

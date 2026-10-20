@@ -854,24 +854,24 @@ FlexiQ/acceptance команды зелёные; покрытие строк и 
 ### 6.6. Текущее состояние
 
 * **Ветка / исходный HEAD:** `main` / `98713b0`
-* **Текущая волна:** 1 (RM8.1, RM8.6)
-* **Последний проверенный зелёный коммит:** RM8.0 (документы)
-* **Готово:** 1 из 11
-* **Следующая задача:** RM8.1
+* **Текущая волна:** 5 завершена — весь набор RM8 готов
+* **Последний проверенный зелёный коммит:** RM8.10
+* **Готово:** 11 из 11
+* **Следующая задача:** нет
 
 | ID | Задача | Зависит | Статус | Коммиты |
 |---|---|---|---|---|
 | RM8.0 | контракт в ARCHITECTURE/ACCEPTANCE | — | done | RM8.0 |
-| RM8.1 | публичные `Outcome` и `WorkItem` | RM8.0 | todo | — |
-| RM8.2 | итог значением и `complete_in(..., outcome)` | RM8.1 | todo | — |
-| RM8.3 | `defer_on` / `error_on` / `skip_on` | RM8.2 | todo | — |
-| RM8.4 | `th_checkpoint` и миграция v1 | RM8.0 | todo | — |
-| RM8.5 | checkpoint в claim/runtime/finish | RM8.2, RM8.4 | todo | — |
-| RM8.6 | `release_deferred` | RM8.0 | todo | — |
-| RM8.7 | item middleware | RM8.1 | todo | — |
-| RM8.8 | интеграция Dishka | RM8.7 | todo | — |
-| RM8.9 | руководство, reference, typing | RM8.3, RM8.5, RM8.6, RM8.8 | todo | — |
-| RM8.10 | сквозная приёмка | RM8.9 | todo | — |
+| RM8.1 | публичные `Outcome` и `WorkItem` | RM8.0 | done | RM8.1 |
+| RM8.2 | итог значением и `complete_in(..., outcome)` | RM8.1 | done | RM8.2 |
+| RM8.3 | `defer_on` / `error_on` / `skip_on` | RM8.2 | done | RM8.3 |
+| RM8.4 | `th_checkpoint` и миграция v1 | RM8.0 | done | RM8.4 |
+| RM8.5 | checkpoint в claim/runtime/finish | RM8.2, RM8.4 | done | RM8.5 |
+| RM8.6 | `release_deferred` | RM8.0 | done | RM8.6 |
+| RM8.7 | item middleware | RM8.1 | done | RM8.7 |
+| RM8.8 | интеграция Dishka | RM8.7 | done | RM8.8 |
+| RM8.9 | руководство, reference, typing | RM8.3, RM8.5, RM8.6, RM8.8 | done | RM8.9 |
+| RM8.10 | сквозная приёмка | RM8.9 | done | RM8.10 |
 
 ### 6.7. Журнал
 
@@ -885,6 +885,245 @@ FlexiQ/acceptance команды зелёные; покрытие строк и 
 - Для следующих задач: …
 - Блокер: нет | что проверено и что нужно
 -->
+
+### 2026-10-20 · RM8.10 · done · RM8.10
+
+* Сделано: `tests/acceptance/test_work_item_api.py` — два сквозных сценария на PostgreSQL.
+  **A-WI-01**: domain-checker из A-RM-01 переписан на новый API — итог значением (`Ok`),
+  доменное исключение `NoCheckerAccountError` с судьбой `defer_on`, интерактор и `WorkItem`
+  из контейнера Dishka, `release_deferred` вместо короткого `delay` (срок отложения 5 минут
+  при неподвижных часах, то есть работу будит только пробуждение). Оракул совпал с A-RM-01:
+  `SUCCEEDED`, 20 из 20 `ok`, 0 ошибок, 0 отложенных записей, ровно 20 платных вызовов,
+  не больше одного параллельного запроса с ресурса, `max(attempt) == 0`, отказов ресурса > 0.
+  **A-WI-02**: пачка из 50 элементов с закладкой и доменной строкой на каждом; попытка
+  обрывается после 30-го, вторая начинает с 31-го (`attempts == [0, 30]`), в доменной
+  таблице ровно 50 строк позиций 0…49 без дублей, после итога `ok` строк `th_checkpoint` нет.
+* Остальные критерии §8 проверены на публичном API в интеграционных и юнит-тестах:
+  A-WI-03/04/09/10/11 — `tests/integration/runtime/test_checkpoint.py` (откат, чужая
+  попытка, счётчик statement'ов claim, одно обновление `th_item`, пачка из 50);
+  A-WI-05 — `test_outcomes.py`; A-WI-06 — `tests/unit/runtime/test_exception_policy.py` и
+  `tests/unit/adapters/flexiq/test_adapter.py` (отказ при регистрации);
+  A-WI-07 — `tests/integration/engine/test_release_deferred.py`;
+  A-WI-08 — `test_dishka.py`.
+* Гейты: `uv run poe fmt` и `uv run poe check` зелёные; `uv run poe test-all` — 2548
+  прошло, 11 пропущено, покрытие 97.78% при пороге 95%. Единственное падение —
+  `test_a_fq_12_broker_and_tallyho_concurrency_limits_compose`, и оно не связано с этим
+  набором: тест флакает сам по себе (standalone 3 прогона из 4 зелёные), а падает его
+  ассерт про `rate_limit` flexiq — события раскладываются по целым секундам
+  (`Counter(int(at))`), и после простойной секунды лимитер пропускает всплеск из трёх.
+  В диффе RM8 этого пути нет: в адаптере изменено только снятие трёх опций tallyho и
+  передача политики в `wrap`. Оракул чужого критерия A-FQ-12 не правил — это решение
+  владельца. Сценарии RM8 детерминированы: `InlineBroker(seed=...)` и `FakeClock`,
+  отдельный `--seed` им не нужен.
+* Отклонения от плана/доков: у `InlineBroker` появился `on_exception(fn, defer_on=,
+  error_on=, skip_on=)`. Без него сценарий A-WI-01 нельзя было собрать на тестовом брокере:
+  правила — опция регистрации задачи, а тестовый брокер регистрирует задачи по первому
+  вызову. §7.5 ACCEPTANCE уточнён: A-WI-01 и A-WI-02 идут на `InlineBroker`, а не на
+  compose-стенде с воркерами — брокер последовательный, и числовой оракул детерминирован
+  без хаоса.
+* Для следующих задач: набор RM8 закрыт.
+* Блокер: нет.
+
+### 2026-10-20 · RM8.9 · done · RM8.9
+
+* Сделано: страница «Задача и её итог» перестроена в порядке возврат `Outcome` → `*_on` →
+  `WorkItem` (и DI) → совместимый фасад `item`, добавлены разделы про отложение и обёртки
+  вокруг задачи. Новая страница `guide/batches/checkpoint.md` — рецепт пачки с закладкой,
+  таблица «что переживает закладка» и предупреждение про внешние неидемпотентные эффекты.
+  Новая страница `integrations/dishka.md` — подключение, задача с интерактором,
+  инфраструктурный адаптер закладки. В `guide/batches/operations.md` — раздел «Разбудить
+  отложенное» с рецептом контура ёмкости, где окно остаётся единственным регулятором
+  выпуска. Reference: `model.outcomes`, `WorkItem`, `build_exception_policy`/
+  `ExceptionPolicy`, `ItemMiddleware`, интеграция Dishka; обновлён CHANGELOG.
+* Гейты: G1 зелёный; `tests/examples/test_documentation.py` — 140 тестов (манифест страниц,
+  маркеры всех python-блоков, относительные ссылки и якоря); новые typing-кейсы
+  `work_item_cases` (закладка, `complete_in(..., outcome)`, `release_deferred`, задача с
+  `@inject` в `th.call` и `batch.add`).
+* Отклонения от плана/доков: все новые блоки помечены `tallyho-noexec` — это код
+  приложения (пул аккаунтов, доменные таблицы, контейнер), а поведение, которое они
+  описывают, исполняется тестами RM8.2–RM8.8 и приёмкой RM8.10. Ручного дублирования
+  `record_outcome`/`unchecked()` в примерах нет.
+* Для следующих задач: RM8.10 — сквозная приёмка.
+* Блокер: нет.
+
+### 2026-10-20 · RM8.8 · done · RM8.8
+
+* Сделано: extra `tallyho[dishka]` (`dishka>=1.4,<2`, в окружении 1.10.1) и пакет
+  `tallyho/integrations/dishka/`: `DishkaItemScope` — middleware, открывающая один
+  REQUEST-scope на попытку и кладущая в его контекст текущий `WorkItem`;
+  `TallyhoProvider` отдаёт `WorkItem` через `from_context`, то есть вне задачи его в
+  контейнере просто нет; `inject` и реэкспорт `FromDishka`. Новый слой
+  `tallyho.integrations` добавлен в контракт import-linter (`exhaustive = true`) рядом с
+  `cli | adapters | testing | observability`.
+* Гейты: G1 зелёный; `tests/integration/runtime/test_dishka.py` — зависимость получает
+  тот же `WorkItem`, что `item.require()`; scope закрывается на успехе, исключении и
+  отмене; на каждую попытку свой scope; вне задачи — `ConfigurationError` от
+  `current_container()` и `NoContextValueError` от контейнера (A-WI-08); отдельный
+  subprocess проверяет, что `import tallyho` не тянет dishka.
+* Отклонения от плана/доков: `inject` возвращает не `Callable[P, T]`, а протокол
+  `InjectedTask[R]` с `*args: object`. `Callable[..., T]` запрещён правилом «никакого
+  `Any`», а сохранить `P` нельзя: тогда `th.call` требовал бы внедряемый аргумент.
+  Цена — у задачи с `@inject` статически проверяется тип результата, а не список
+  аргументов; §11.2 это фиксирует. `dishka` читает аннотации в рантайме, поэтому в тестах
+  и в `scope.py` несколько импортов помечены как нужные вне `TYPE_CHECKING`.
+* Для следующих задач: RM8.9 — руководство и reference; все публичные имена уже на
+  месте (`WorkItem`, `Outcome`, `ItemMiddleware`, `ExceptionPolicy`, extras).
+* Блокер: нет.
+
+### 2026-10-20 · RM8.7 · done · RM8.7
+
+* Сделано: протокол `ItemMiddleware` (`runtime/middleware.py`) и цепочка вокруг вызова
+  задачи: `Tallyho(..., middleware=[...])` → `create_engine_facade` → `_Facade` →
+  `WorkerFactory` → `TaskRuntime`. Первый элемент списка — внешний; цепочка строится
+  внутри активированного контекста, но вокруг `_invoke`, поэтому возвращаемый `Outcome` и
+  исключение проходят через неё и получают обычную семантику RM8.2/RM8.3. Пустой список
+  оставляет прежний горячий путь без лишних кадров стека; колбэки и неотслеживаемые
+  вызовы не оборачиваются.
+* Гейты: G1 зелёный, import-linter без нарушений;
+  `tests/integration/runtime/test_middleware.py` — порядок до/после, доступность
+  `item.require()`, возврат `Outcome`, исключение, пропуск при дубле claim, пустая
+  цепочка, один экземпляр на несколько попыток, невызываемый элемент.
+* Отклонения от плана/доков: `api` не знает тип `ItemMiddleware` — он описан в `runtime`,
+  а через composition root едет как `Sequence[object]` (так же, как `completer` и
+  `tree_cache`). Иначе `api` импортировал бы `runtime`, что запрещено §3.3. Проверка
+  «элемент вызываемый» живёт в `TaskRuntime`, единственной точке сборки.
+* Для следующих задач: RM8.8 ставит свою middleware первой в список, чтобы REQUEST-scope
+  охватывал остальные.
+* Блокер: нет.
+
+### 2026-10-20 · RM8.5 · done · RM8.5
+
+* Сделано: claim читает закладку и `defers` тем же запросом (`lock_items`,
+  `LEFT JOIN th_checkpoint`, `FOR UPDATE OF th_item`) и отдаёт их в `ClaimResult`;
+  `WorkItem.checkpoint()` возвращает снимок claim, `checkpoint_in(session, position)` —
+  монотонный upsert в транзакции вызывающего с тем же fencing'ом, что `complete_in`, и
+  обновлением `th_lease.progress_done`. Локальный снимок двигается только после commit,
+  поэтому откат оставляет и закладку, и `checkpoint()` прежними. Итог `ok`/`skip`/
+  `cancelled` удаляет строку в той же транзакции, `error` — оставляет (D-085).
+* Гейты: G1 зелёный; `tests/integration/runtime/test_checkpoint.py` — 13 тестов:
+  запись вместе с доменными данными и чтение следующим claim, прогресс lease,
+  откат (A-WI-03), монотонность, валидация `position`, чужая попытка (A-WI-04),
+  удаление при `ok`/`skip` и сохранение при `error`, Item без закладки (A-WI-10),
+  пачка из 50 без обновления `th_item` (A-WI-11), `defers` из claim и счётчик
+  statement'ов claim (A-WI-09).
+* Отклонения от плана/доков: `with_for_update(of=item)` вместо `with_for_update()` —
+  PostgreSQL не блокирует nullable-сторону outer join; блокировать `th_checkpoint` и не
+  нужно. Порядок блокировок `checkpoint_in` — `th_item → th_lease → th_checkpoint`, без
+  `th_batch`: это префикс порядка `complete_in`, записанный в §9.2.
+* Для следующих задач: RM8.10 переносит сценарий «убийство на 30-м из 50» (A-WI-02) на
+  стенд с настоящими воркерами.
+* Блокер: нет.
+
+### 2026-10-20 · RM8.3 · done · RM8.3
+
+* Сделано: чистый `runtime/exceptions.py` — `ExceptionPolicy` и
+  `build_exception_policy(defer_on=, error_on=, skip_on=, retry_on=)`: разбор констант,
+  меток и функций-преобразователей, выбор по ближайшему классу MRO, отказ при двух
+  судьбах у одного класса и при пересечении с `retry_on` — всё при регистрации.
+  FlexiQ-адаптер забирает три опции себе (во flexiq они не уходят) и передаёт политику в
+  `runtime.wrap(fn, policy=...)`. Обёртка переводит исключение задачи до `_settle_failure`
+  и записывает итог тем же путём, что возвращённый `Outcome`.
+* Гейты: G1 зелёный; `tests/unit/runtime/test_exception_policy.py` (12 тестов разбора и
+  выбора), `tests/integration/runtime/test_exception_fates.py` (11 тестов: defer/error/
+  skip, MRO, необъявленное исключение, `LeaseLostError` и `CancelledError` без перевода,
+  падение правила, правило другого класса, конфликт с императивным итогом, валидация
+  политики), unit-тесты адаптера на удаление опций и отказ при двух судьбах.
+* Отклонения от плана/доков: `WorkerRuntime.wrap` получил keyword-параметр
+  `policy: object = None` — политика принадлежит задаче, а не установке, и доехать до
+  обёртки может только с ней. Значения правил принимаются как `object` и проверяются
+  явно: точные типы в сигнатуре заставили бы писать `cast` в каждом
+  `lambda exc: Defer(reason=exc.reason)`.
+* Для следующих задач: `_translated` не пишет в БД, а только заполняет буферы попытки, —
+  тот же `adopt`, что у RM8.2.
+* Блокер: нет.
+
+### 2026-10-20 · RM8.4 · done · RM8.4
+
+* Сделано: таблица `th_checkpoint` (`item_id` PK, `batch_id`, `position bigint NOT NULL`,
+  `updated_at`) с `fillfactor=50` и агрессивным autovacuum, без вторичных индексов; входит
+  в базовую схему v1 (D-080, `SCHEMA_VERSION` не поднимался), golden `ddl.sql` обновлён
+  штатным `TALLYHO_UPDATE_GOLDEN=1`. Retention дерева удаляет закладки тем же чанком, что
+  остальные side-таблицы Items (`Sweeper._purge_items_in`).
+* Гейты: G1 зелёный; интеграционно — новый
+  `tests/integration/storage/test_checkpoint_schema.py` (колонки, только PK,
+  `fillfactor`/autovacuum, у `th_item` по-прежнему только `fillfactor=85` и никаких колонок
+  закладки) и расширенный retention-тест sweeper. Alembic offline SQL и чистая установка
+  проходят существующими тестами миграций.
+* Отклонения от плана/доков: нет. `position` — отдельная колонка, не `jsonb`, как решено
+  в §7 вопросе 2.
+* Для следующих задач: RM8.5 читает закладку в `Completer.lock_items` — это единственный
+  запрос claim, поэтому `LEFT JOIN th_checkpoint` нужно добавить именно туда и обязательно
+  с `with_for_update(of=item)`: PostgreSQL не блокирует nullable-сторону outer join.
+  Там же рядом лежит `item.c.defers` для `WorkItem.defers`.
+* Блокер: нет.
+
+### 2026-10-20 · RM8.2 · done · RM8.2
+
+* Сделано: `WorkItem.adopt(outcome)` переводит `Ok`/`Skip`/`Error`/`Defer` в тот же
+  внутренний итог через существующие `ok`/`skip`/`error`/`defer` — новых путей записи в БД
+  нет. `_invoke` распознаёт только экземпляры `Outcome` (`None` и любое другое значение
+  сохраняют прежнюю семантику «успех») и возвращает исходный объект вызывающему без
+  изменений. `complete_in(session, outcome=None)` и делегирование фасада. Два источника
+  итога — `ConfigurationError`.
+* Гейты: G1 зелёный; `tests/integration/runtime/test_outcomes.py` — 15 тестов: каждый
+  итог значением, `defer` со `delay`/`until`/умолчанием, произвольное значение,
+  `complete_in` с итогом в транзакции и его откат, конфликт для всех четырёх итогов и
+  после `defer`.
+* Отклонения от плана/доков: конфликт итогов обнаруживается по уже заданному императивному
+  итогу; обёртка бросает `ConfigurationError` до записи возвращённого итога, и дальше
+  попытка идёт обычным путём исключения задачи (вердикт брокера) — это зафиксировано в
+  UC-18 и A-WI-05. Если `complete_in` уже закоммитил итог, возвращённый `Outcome` его не
+  переписывает: Item терминален и попытке больше не принадлежит, поэтому запись — no-op, а
+  возврат обёртки в этом случае контрактом не является (зависит от доставки
+  после-коммитного колбэка соединения).
+* Для следующих задач: RM8.3 подаёт результат перевода исключения в тот же `adopt`, уже
+  внутри ветки `except` обёртки — важно, что `adopt` не пишет в БД сам, а только
+  заполняет буферы попытки.
+* Блокер: нет.
+
+### 2026-10-20 · RM8.6 · done · RM8.6
+
+* Сделано: `Operations.release_deferred(target, batch_id, reasons)` →
+  `EngineFacade`/`assembly` → `BatchHandle.release_deferred(reasons=None, *, session=None)`.
+  Очищается только `defer_reason`, срок становится `greatest(start_at, now)` — отложенный
+  старт не обходится; `defers`, `first_deferred_at`, `attempt` и поколение не трогаются.
+  Пауза и окно остаются за relay: фактический выпуск идёт в пределах свободного места.
+  Возвращается число реально изменённых строк; `kick` relay — только после commit и только
+  если что-то изменилось. Причины валидируются как метки (пустая и U+001F — ошибка).
+* Гейты: G1 зелёный; `tests/integration/engine/test_release_deferred.py` — 14 тестов:
+  без фильтра, с фильтром, пустой и неизвестный набор, откат транзакции, окно 3 из 10
+  (A-WI-07: разбужены 10, выпущены 3, остальные запаркованы, `defers` цел), закрытое окно,
+  пауза, отложенный старт, идемпотентность, чужой батч, валидация. `release_deferred`
+  добавлена в матрицу `test_purged_operations`.
+* Отклонения от плана/доков: нет.
+* Для следующих задач: в тестах relay полный `scan_once` отдаёт записи только старше
+  `relay_grace`, поэтому после пробуждения часы теста нужно двигать на `GRACE`; возврат
+  `scan_once` — число принятых брокером сообщений, а запаркованные записи в него не входят.
+* Блокер: нет.
+
+### 2026-10-20 · RM8.1 · done · RM8.1
+
+* Сделано: новый `model/outcomes.py` — замороженные слотированные `Ok`, `Skip`, `Error`,
+  `Defer` и закрытый `Outcome`; валидация `Defer` (пустой `reason`, `delay` вместе с
+  `until`, отрицательный `delay`) живёт в model, и `WorkItem.defer` теперь переиспользует
+  её вместо своей копии. Реализация `ItemContext` переименована в `WorkItem`,
+  `ItemContext = WorkItem` оставлен алиасом; добавлен `item.require()`, который вне задачи
+  бросает `ConfigurationError` (остальные методы фасада по-прежнему no-op). Публичные
+  экспорты: `WorkItem`, `ItemContext`, `Outcome` и четыре варианта из `tallyho` и
+  `tallyho.model`. Диаграммы §3.4 и UC-03/UC-08 и `CONTRIBUTING.md` переведены на новое имя.
+* Гейты: `uv run poe fmt` и `uv run poe check` зелёные (1384 теста). Новые тесты:
+  `tests/unit/model/test_outcomes.py` (равенство, frozen+slots, значения по умолчанию,
+  валидация `Defer`, публичные экспорты), `test_context.py` (алиас, `require` внутри и вне
+  задачи), typing-кейсы на `require()`/`current()` и keyword-only поля итогов.
+* Отклонения от плана/доков: у `Ok`/`Skip`/`Error` есть ещё поле `mark` (keyword-only).
+  Без него возврат итога значением терял бы `mark=` императивного API; §11.2 и UC-18
+  обновлены под фактическую сигнатуру. Выбор keyword-only для `result`/`detail`/`mark`
+  повторяет фасад `item.*`.
+* Для следующих задач: `WorkItem.adopt(outcome)` для RM8.2 ещё нет — перевод итога-значения
+  в единый внутренний итог должен идти через существующие `ok/skip/error/defer`, иначе
+  появится второй путь записи. Поля `defers` и `checkpoint()` в `WorkItem` сознательно не
+  добавлены: их значения приходят из claim, это RM8.5.
+* Блокер: нет.
 
 ### 2026-10-20 · RM8.0 · done · RM8.0
 

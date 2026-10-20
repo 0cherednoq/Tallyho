@@ -166,7 +166,7 @@ flowchart TB
 flowchart TB
     api["tallyho.api<br/>Tallyho, BatchBuilder, BatchHandle, call"]
     hooks["tallyho.hooks<br/>registry, on_finalized, on_progress, on_policy_breach"]
-    item["tallyho.runtime<br/>tracked, item, callback, ItemContext"]
+    item["tallyho.runtime<br/>tracked, item, callback, WorkItem"]
     eng["tallyho.engine<br/>Completer, Relay, Sweeper,<br/>Finalizer, Snapshotter, Counters"]
     st["tallyho.storage<br/>tables, queries, migrations"]
     model["tallyho.model<br/>states, summaries, views, errors"]
@@ -236,7 +236,7 @@ classDiagram
         +release(session) None
         +items(states, labels) AsyncIterator~ItemView~
     }
-    class ItemContext {
+    class WorkItem {
         +UUID id
         +UUID batch_id
         +int attempt
@@ -250,7 +250,7 @@ classDiagram
         +ok(label, result) None
         +skip(label) None
         +error(label, detail) None
-        +complete_in(session) None
+        +complete_in(session, outcome) None
         +cancelled() bool
     }
     class BatchSummary {
@@ -331,7 +331,7 @@ classDiagram
     Tallyho --> Relay
     Tallyho --> Sweeper
     Tallyho --> Snapshotter
-    ItemContext --> Completer
+    WorkItem --> Completer
     Completer ..> Finalizer : после commit
     Sweeper ..> Finalizer
     Finalizer ..> BatchSummary : передаёт в on_finalized
@@ -341,7 +341,7 @@ classDiagram
     Relay ..> DeadLetterReconciler : после каждого scan
     DeadLetterReconciler --> Runtime : reconcile_dead
     DeadLetterReconciler ..> Finalizer
-    Runtime ..> ItemContext : создаёт на время задачи
+    Runtime ..> WorkItem : создаёт на время задачи
 ```
 
 ---
@@ -1043,7 +1043,7 @@ sequenceDiagram
         MW-->>B: успех, задача не вызывалась
     else захвачен
         C-->>MW: ok
-        MW->>MW: ContextVar = ItemContext, старт heartbeat
+        MW->>MW: ContextVar = WorkItem, старт heartbeat
         MW->>T: await task(*args)
         T->>MW: item.spawn / incr / ok(label) → в буфер
         T-->>MW: return
@@ -1109,7 +1109,7 @@ sequenceDiagram
 sequenceDiagram
     autonumber
     participant T as Задача expand_page
-    participant Ctx as ItemContext
+    participant Ctx as WorkItem
     participant C as Completer
     participant DB as PostgreSQL
     participant R as Relay
@@ -1525,8 +1525,9 @@ sequenceDiagram
     end
 ```
 
-**Итог — данные на выходе задачи.** `Ok(label=None, result=None)`, `Skip(label=None)`,
-`Error(label=None, detail=None)` и `Defer(reason, delay=None, until=None)` — замороженные
+**Итог — данные на выходе задачи.** `Ok(label=None, *, result=None, mark=None)`,
+`Skip(label=None, *, mark=None)`, `Error(label=None, *, detail=None, mark=None)` и
+`Defer(reason, delay=None, until=None)` — замороженные
 dataclass'ы модели, объединённые закрытым типом `Outcome`. Возврат `Outcome` эквивалентен
 соответствующему вызову `item.ok/skip/error/defer`: `Error` записывает ошибочный итог без
 исключения и ретраев, `Defer` возвращает Item в очередь, не тратя попытку. Возврат `None`
@@ -1535,8 +1536,10 @@ dataclass'ы модели, объединённые закрытым типом 
 проверяется в тесте сравнением: `assert await task(...) == Defer(reason="quota")`.
 
 **Два источника итога — всегда ошибка.** Если задача и вызвала `item.ok/skip/error/defer`,
-и вернула `Outcome`, обёртка бросает `ConfigurationError` до записи: правило «последний
-вызов выигрывает» здесь означало бы молчаливую потерю одного из двух итогов. Тот же запрет
+и вернула `Outcome`, обёртка бросает `ConfigurationError` до записи возвращённого итога:
+правило «последний вызов выигрывает» здесь означало бы молчаливую потерю одного из двух
+итогов. Дальше попытка завершается как любое исключение задачи — по вердикту брокера
+(UC-04), потому что это ошибка в коде, а не исход работы. Тот же запрет
 действует в `complete_in(session, outcome)`: передать итог аргументом, уже задав его
 императивно, нельзя. `complete_in(session)` без аргумента работает как раньше.
 
@@ -1904,7 +1907,7 @@ await th.migrate()  # или ревизия Alembic: upgrade(..., version=1)
 
 **Middleware вокруг задачи.** `ItemMiddleware` — протокол `async def __call__(work: WorkItem, call_next: Callable[[], Awaitable[object]]) -> object`. Цепочка задаётся один раз в `Tallyho(..., middleware=[...])`, первый элемент списка — внешний. Она вызывается после claim и активации контекста, но вокруг вызова задачи, поэтому возвращаемое значение и исключение проходят через неё и затем получают обычную семантику UC-18. Middleware не записывает итог и не владеет ретраями: для итога есть `Outcome`, для судьбы исключения — `*_on`. Колбэк-задачи и неотслеживаемые вызовы не оборачиваются; пустой список сохраняет текущий горячий путь без накладных расходов.
 
-**Контейнер зависимостей.** Extra `tallyho[dishka]` даёт `DishkaItemScope(container)` — middleware, которая открывает REQUEST-scope на каждую попытку и кладёт в его контекст текущий `WorkItem`, — и `TallyhoProvider`, который отдаёт этот `WorkItem` зависимостям. Инфраструктурные адаптеры (закладка, итог в транзакции) получают его конструктором, а вне задачи он в контейнере отсутствует, и разрешение падает с понятной ошибкой. Реэкспортированные `inject` и `FromDishka` убирают DI-параметры из видимой сигнатуры, поэтому `th.call(task, ...)` типизируется без них. Подстановки `WorkItem` по типу аргумента задачи нет (D-086).
+**Контейнер зависимостей.** Extra `tallyho[dishka]` даёт `DishkaItemScope(container)` — middleware, которая открывает REQUEST-scope на каждую попытку и кладёт в его контекст текущий `WorkItem`, — и `TallyhoProvider`, который отдаёт этот `WorkItem` зависимостям. Инфраструктурные адаптеры (закладка, итог в транзакции) получают его конструктором, а вне задачи он в контейнере отсутствует, и разрешение падает с понятной ошибкой. Реэкспортированные `inject` и `FromDishka` убирают DI-параметры из видимой сигнатуры, поэтому `th.call(task, ...)` типизируется без них: `inject` возвращает `InjectedTask[R]` — протокол с `*args: object`, у которого проверяется тип результата, а не список аргументов. «Сигнатура минус несколько параметров» в системе типов не выражается, и требовать внедряемый аргумент в вызове было бы хуже. Подстановки `WorkItem` по типу аргумента задачи нет (D-086).
 
 Метки итога — свободные строки. По умолчанию `ok()` без label → `"ok"`, исчерпанные попытки → `error("exhausted")`, lease истёк на последней попытке → `error("lease_expired")`, отмена → `cancelled`. `error()` по умолчанию помечается в `th_item_mark`, `ok()`/`skip()` — нет (переопределяется `mark=`).
 

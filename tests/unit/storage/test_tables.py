@@ -43,6 +43,7 @@ TABLE_SUFFIXES = (
     "item_mark",
     "expiry",
     "window",
+    "checkpoint",
     "meta",
 )
 

@@ -189,12 +189,17 @@ class ClaimResult:
         outcome: Исход.
         attempt: Номер попытки Item (``th_item.attempt``) после claim; для
             ``TERMINAL`` у ненайденного Item — 0.
-        depth: Глубина самоподпитки Item (для ``ItemContext.depth``).
+        depth: Глубина самоподпитки Item (для ``WorkItem.depth``).
+        defers: Сколько раз Item уже откладывали (``th_item.defers``).
+        checkpoint: Закладка прогресса (``th_checkpoint.position``) или
+            ``None``, если её нет. Читается тем же запросом claim (A-WI-09).
     """
 
     outcome: ClaimOutcome
     attempt: int = 0
     depth: int = 0
+    defers: int = 0
+    checkpoint: int | None = None
 
     @property
     def run(self) -> bool:
@@ -482,6 +487,9 @@ class _ItemRow:
     attempt: int
     depth: int
     weight: int
+    defers: int = 0
+    checkpoint: int | None = None
+    """Закладка прогресса, прочитанная тем же запросом, что строка Item (UC-19)."""
 
 
 @dataclass(slots=True, kw_only=True)
@@ -608,6 +616,7 @@ class _Tx:
         if not ids:
             return
         item = self.tables.item
+        checkpoint = self.tables.checkpoint
         result = await self.conn.execute(
             select(
                 item.c.id,
@@ -616,18 +625,26 @@ class _Tx:
                 item.c.attempt,
                 item.c.depth,
                 item.c.weight,
+                item.c.defers,
+                checkpoint.c.position,
             )
+            # Закладка приезжает тем же запросом: второго обращения в claim нет
+            # (A-WI-09). FOR UPDATE — только по th_item: nullable-сторону outer
+            # join PostgreSQL блокировать не умеет, да и не нужно.
+            .select_from(item.outerjoin(checkpoint, checkpoint.c.item_id == item.c.id))
             .where(item.c.id == any_(_uuids(ids)))
             .order_by(item.c.id)
-            .with_for_update()
+            .with_for_update(of=item)
         )
-        for item_id, batch_id, state, attempt, depth, weight in result:
+        for item_id, batch_id, state, attempt, depth, weight, defers, position in result:
             self.items[item_id] = _ItemRow(
                 batch_id=batch_id,
                 state=ItemState(state),
                 attempt=attempt,
                 depth=depth,
                 weight=weight,
+                defers=defers,
+                checkpoint=position,
             )
 
     async def lock_leases(self, item_ids: Iterable[UUID], *, lock: bool = True) -> None:
@@ -726,7 +743,11 @@ class _Tx:
             self.applied.claims[item_id] = ClaimResult(outcome=outcome)
             return
         self.applied.claims[item_id] = ClaimResult(
-            outcome=outcome, attempt=row.attempt, depth=row.depth
+            outcome=outcome,
+            attempt=row.attempt,
+            depth=row.depth,
+            defers=row.defers,
+            checkpoint=row.checkpoint,
         )
 
     async def _bump_attempts(self, item_ids: list[UUID]) -> None:
@@ -917,6 +938,51 @@ class _Tx:
         await self._to_outbox(waiting, self.now)
         await self._to_outbox(paused, _INFINITY)
         return ready
+
+    async def _delete_checkpoints(self, item_ids: list[UUID]) -> None:
+        """Удалить закладки прогресса завершённых Items (UC-19)."""
+        if not item_ids:
+            return
+        table = self.tables.checkpoint
+        _ = await self.conn.execute(
+            delete(table).where(table.c.item_id == any_(_uuids(sorted(item_ids))))
+        )
+
+    async def checkpoint(self, item: ItemRef, position: int) -> None:
+        """Записать закладку и видимый прогресс попытки (UC-19).
+
+        Запись монотонна: меньшее значение строку не меняет. Порядок попыток
+        после перехвата lease не гарантирован, а монотонность делает повтор
+        безвредным.
+        """
+        table = self.tables.checkpoint
+        stmt = insert(table).values(
+            item_id=item.id,
+            batch_id=item.batch_id,
+            position=position,
+            updated_at=self.now,
+        )
+        _ = await self.conn.execute(
+            stmt.on_conflict_do_update(
+                index_elements=[table.c.item_id],
+                set_={
+                    "position": func.greatest(table.c.position, stmt.excluded.position),
+                    "updated_at": stmt.excluded.updated_at,
+                },
+            )
+        )
+        lease = self.tables.lease
+        # Тот же прогресс видно в handle.in_flight() без отдельного item.progress.
+        _ = await self.conn.execute(
+            update(lease)
+            .where(lease.c.item_id == item.id)
+            .values(
+                progress_done=func.greatest(
+                    func.coalesce(lease.c.progress_done, literal(0, BigInteger())),
+                    literal(position, BigInteger()),
+                )
+            )
+        )
 
     async def _delete_expiry(self, item_ids: list[UUID]) -> None:
         if not item_ids:
@@ -1170,6 +1236,16 @@ class _Tx:
             self.applied.finalize.add(row.batch_id)
         await self._delete_leases(list(values))
         await self._delete_expiry(successful)
+        # Закладка живёт, пока работа не закончена: её удаляет только ok/skip/
+        # cancelled. При error она остаётся до retention, чтобы повтор не
+        # переделывал сделанное (D-085).
+        await self._delete_checkpoints(
+            [
+                finished_id
+                for finished_id in successful
+                if plain_values[finished_id].result_class is not ResultClass.ERROR
+            ]
+        )
         await self._write_marks(successful, plain_values)
         released = await self._release_window(successful)
         self.applied.kick.update(released)
@@ -1876,6 +1952,47 @@ class Completer:
             item_id=item.id, attempt=attempt, delta_ids=delta_ids, metric_slots=(), deferred=True
         )
         await after_commit(target, lambda: self._schedule_external(tx.applied, done))
+        return True
+
+    async def checkpoint_in(
+        self,
+        target: AsyncSession | AsyncConnection,
+        item: ItemRef,
+        *,
+        position: int,
+        attempt: int,
+    ) -> bool:
+        """Записать закладку в транзакции пользователя (путь B, UC-19).
+
+        Результат элемента и закладка коммитятся одной транзакцией: при её
+        откате не остаётся ни того, ни другого. ``th_item`` не обновляется —
+        горячая строка живёт под одно HOT-обновление (finish).
+
+        Args:
+            target: Открытая пользовательская сессия или соединение.
+            item: Item этой попытки.
+            position: Сколько элементов или шагов сделано, целое ``>= 0``.
+            attempt: Номер попытки из claim: записывает только владелец.
+
+        Returns:
+            ``True``, если закладка записана; ``False``, если Item терминальный
+            или попытка потеряла lease.
+
+        Raises:
+            ClosedError: Completer закрыт; транзакция пользователя не тронута.
+        """
+        if self._closing:
+            raise ClosedError(_CLOSED)
+        conn = await resolve_connection(target)
+        tx = _Tx(self, conn, user_tx=True)
+        # Порядок блокировок тот же, что у complete_in, без th_batch: закладка
+        # батч не трогает, поэтому её префикс порядка — th_item → th_lease.
+        await tx.lock_items([item.id])
+        await tx.lock_leases([item.id], lock=False)
+        if not tx.holds(item, attempt):
+            self._forget(item.id, attempt)
+            return False
+        await tx.checkpoint(item, position)
         return True
 
     async def release(self, item: ItemRef, *, attempt: int | None = None) -> bool:

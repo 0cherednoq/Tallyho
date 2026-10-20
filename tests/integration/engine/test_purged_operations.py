@@ -54,6 +54,7 @@ OPERATIONS: dict[str, Callable[[Operations, AsyncConnection, UUID], Awaitable[ob
     "reschedule": lambda ops, conn, batch_id: ops.reschedule(conn, batch_id, _LATER),
     "retry_finalize": lambda ops, conn, batch_id: ops.retry_finalize(conn, batch_id),
     "release": lambda ops, conn, batch_id: ops.release(conn, batch_id),
+    "release_deferred": lambda ops, conn, batch_id: ops.release_deferred(conn, batch_id),
 }
 
 

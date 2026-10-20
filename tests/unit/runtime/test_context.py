@@ -15,11 +15,13 @@ from tallyho.engine.producer import CallbackName
 from tallyho.engine.spawn import TreeNode, TreeSnapshot
 from tallyho.model.calls import TaskCall
 from tallyho.model.errors import ConfigurationError
+from tallyho.model.outcomes import Defer, Error, Ok, Skip
 from tallyho.model.states import ResultClass
 from tallyho.runtime import (
     CallbackContext,
     ItemContext,
     TaskRuntime,
+    WorkItem,
     bind_runtime,
     callback,
     item,
@@ -55,7 +57,7 @@ class FakeCompleter:
         return self.changed
 
 
-def _context() -> tuple[ItemContext, FakeCompleter]:
+def _context() -> tuple[WorkItem, FakeCompleter]:
     batch_id = uuid4()
     node = TreeNode(id=batch_id, root_id=batch_id, parent_id=None, key=None)
     tree = TreeSnapshot(root_id=batch_id, nodes={batch_id: node}, by_key={})
@@ -65,7 +67,7 @@ def _context() -> tuple[ItemContext, FakeCompleter]:
         _ = fn
         return TaskCall(task_name="task", args=args, kwargs=kwargs)
 
-    context = ItemContext(
+    context = WorkItem(
         ref=ItemRef(uuid4(), batch_id),
         attempt=2,
         depth=3,
@@ -99,6 +101,24 @@ def test_facades_are_safe_outside_task() -> None:
     item.error("ignored")
     item.expect(10)
     item.spawn(no_op)
+
+
+def test_item_context_is_alias_of_work_item() -> None:
+    assert ItemContext is WorkItem
+    context, _ = _context()
+    assert isinstance(context, ItemContext)
+
+
+def test_require_outside_task_is_explicit_error() -> None:
+    with pytest.raises(ConfigurationError, match="require"):
+        _ = item.require()
+
+
+def test_require_inside_task_returns_same_work_item() -> None:
+    context, _ = _context()
+    with activate_item(context):
+        assert item.require() is context
+        assert item.current() is context
 
 
 def test_sub_batch_outside_task_is_explicit_error() -> None:
@@ -336,6 +356,59 @@ def test_defer_and_outcome_are_mutually_exclusive() -> None:
     after_defer.defer(reason="ждём")
     with pytest.raises(ConfigurationError, match="после defer"):
         after_defer.ok("поздно")
+
+
+def test_adopt_maps_every_outcome_to_the_same_internal_result() -> None:
+    ok, _ = _context()
+    ok.adopt(Ok("chunk", result={"checked": 1}, mark=True))
+    value = ok.finish_result()
+    assert (value.result_class, value.label, value.result, value.mark) == (
+        ResultClass.OK,
+        "chunk",
+        {"checked": 1},
+        True,
+    )
+
+    skipped, _ = _context()
+    skipped.adopt(Skip("duplicate"))
+    assert skipped.finish_result().result_class is ResultClass.SKIP
+
+    failed, _ = _context()
+    failed.adopt(Error("invalid", detail={"code": 7}))
+    broken = failed.finish_result()
+    assert (broken.result_class, broken.error) == (ResultClass.ERROR, {"code": 7})
+
+    postponed, _ = _context()
+    postponed.adopt(Defer(reason="no_accounts", delay=timedelta(seconds=30)))
+    assert postponed.deferred
+    assert (postponed.defer_reason, postponed.defer_delay) == ("no_accounts", timedelta(seconds=30))
+
+
+def test_adopted_defer_without_delay_takes_default() -> None:
+    context, _ = _context()
+    context.adopt(Defer(reason="quota"))
+    assert context.defer_delay == context.defer_default_delay
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    [Ok("поздно"), Skip("поздно"), Error("поздно"), Defer(reason="поздно")],
+)
+def test_adopt_after_imperative_outcome_is_two_sources(outcome: Ok | Skip | Error | Defer) -> None:
+    after_ok, _ = _context()
+    after_ok.ok("первый")
+    with pytest.raises(ConfigurationError, match="дважды"):
+        after_ok.adopt(outcome)
+
+    after_defer, _ = _context()
+    after_defer.defer(reason="ждём")
+    with pytest.raises(ConfigurationError, match="дважды"):
+        after_defer.adopt(outcome)
+
+
+def test_complete_in_outside_task_with_outcome_is_noop() -> None:
+    session = cast("AsyncSession", object())
+    asyncio.run(item.complete_in(session, Ok("ignored")))
 
 
 def test_defer_outside_task_is_noop() -> None:

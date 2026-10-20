@@ -25,6 +25,7 @@ from tallyho.model.errors import (
     TallyhoError,
     UnsupportedOption,
 )
+from tallyho.model.outcomes import Defer
 from tallyho.model.states import OutboxKind
 from tallyho.protocols.broker import (
     DeadLetter,
@@ -50,6 +51,10 @@ if TYPE_CHECKING:
     from tallyho.protocols.broker import DeadLetters, WorkerRuntime
 
 __all__: list[str] = []
+
+
+class _NoResourceError(RuntimeError):
+    """Ресурса нет: судьба — отложить (UC-18)."""
 
 
 _DUPLICATE = "duplicate idempotency key"
@@ -508,6 +513,37 @@ def test_task_retry_on_also_retries_completer_errors(
     assert queue.task_options == [
         {"max_retries": 2, "retry_on": registered, "dont_retry_on": [KeyError]}
     ]
+
+
+def test_task_keeps_outcome_rules_for_tallyho() -> None:
+    # defer_on / error_on / skip_on — опции tallyho: во flexiq они не уходят,
+    # иначе брокер отверг бы незнакомую опцию (UC-18).
+    adapter, queue = _adapter()
+
+    task = adapter.task(
+        max_retries=2,
+        retry_on=[InvalidStateError],
+        defer_on={_NoResourceError: Defer(reason="no_accounts")},
+        error_on={ValueError: "invalid"},
+        skip_on={KeyError: "duplicate"},
+    )(_echo)
+
+    assert adapter.task_name(task).endswith("_echo")
+    assert queue.task_options == [
+        {"max_retries": 2, "retry_on": [InvalidStateError, CompleterError]}
+    ]
+
+
+def test_task_rejects_exception_with_two_fates_at_registration() -> None:
+    adapter, queue = _adapter()
+
+    with pytest.raises(ConfigurationError, match="одна судьба"):
+        _ = adapter.task(
+            retry_on=[_NoResourceError], defer_on={_NoResourceError: Defer(reason="x")}
+        )(_echo)
+
+    # Ошибка найдена при регистрации: задача во flexiq не попала.
+    assert queue.task_options == []
 
 
 @pytest.mark.parametrize("options", [{}, {"retry_on": None}, {"retry_on": []}])

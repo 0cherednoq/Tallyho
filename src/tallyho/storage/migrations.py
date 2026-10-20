@@ -144,6 +144,7 @@ def _installation(schema: str | None, prefix: str) -> _Installation:
         source.item_mark,
         source.expiry,
         source.window,
+        source.checkpoint,
     ]
     if schema is not None:
         target = MetaData()

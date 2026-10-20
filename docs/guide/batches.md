@@ -165,6 +165,7 @@ async def import_file(file_id: int) -> None:
 :hidden:
 
 batches/tasks
+batches/checkpoint
 batches/pipelines
 batches/failure-policies
 batches/operations

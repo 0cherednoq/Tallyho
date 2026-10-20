@@ -6,17 +6,46 @@ import asyncio
 from typing import TYPE_CHECKING, ParamSpec, assert_type
 from uuid import UUID
 
-from tallyho import BatchBuilder, Call, callback, item
+from tallyho import BatchBuilder, Call, Defer, Ok, Skip, WorkItem, callback, item
+from tallyho.integrations.dishka import (  # ruff: ignore[typing-only-first-party-import]  # dishka читает аннотации в рантайме
+    FromDishka,
+    inject,
+)
 from tallyho.runtime import CallbackContext
 from tallyho.runtime.context import CallbackFacade, ItemFacade, RuntimeSubBatch
 
 if TYPE_CHECKING:
+    from sqlalchemy.ext.asyncio import AsyncSession
+
     from tallyho import BatchHandle, Tallyho
 
 __all__: list[str] = []
 
 
 P = ParamSpec("P")
+
+
+class Interactor:
+    """Зависимость задачи, которую внедряет контейнер."""
+
+    async def __call__(self, value: int) -> int:
+        """Вернуть то же значение.
+
+        Returns:
+            Значение без изменений.
+        """
+        await asyncio.sleep(0)
+        return value
+
+
+@inject
+async def injected(value: int, interactor: FromDishka[Interactor]) -> Ok:
+    """Задача с внедряемой зависимостью: DI-параметр не виден вызывающему.
+
+    Returns:
+        Успешный итог.
+    """
+    return Ok("done", result=await interactor(value))
 
 
 async def unary(value: int, /) -> None:
@@ -53,6 +82,29 @@ async def cases(th: Tallyho, batch: BatchBuilder) -> None:
     item.spawn(unary, "bad")  # type: ignore[arg-type]  # pyright: ignore[reportCallIssue, reportArgumentType]  # EXPECTED_NEGATIVE
 
 
+async def work_item_cases(  # ruff: ignore[too-many-positional-arguments]  # кейсы берут весь публичный набор
+    th: Tallyho, batch: BatchBuilder, handle: BatchHandle, session: AsyncSession
+) -> None:
+    """RM8: закладка, итог в транзакции пользователя, пробуждение, DI."""
+    work = item.require()
+    assert_type(work, WorkItem)
+
+    # a) Закладка и итог значением пишутся в транзакции вызывающего.
+    await work.checkpoint_in(session, 7)
+    await work.complete_in(session, Ok("chunk"))
+    await work.complete_in(session)
+    await item.checkpoint_in(session, 7)
+    await work.checkpoint_in(session, "7")  # type: ignore[arg-type]  # pyright: ignore[reportArgumentType]  # EXPECTED_NEGATIVE
+
+    # b) release_deferred возвращает число разбуженных записей.
+    assert_type(await handle.release_deferred(), int)
+    assert_type(await handle.release_deferred(["no_accounts"]), int)
+
+    # c) Задача с @inject типизируется без DI-параметров.
+    _ = th.call(injected, 1)
+    await batch.add(injected, 1)
+
+
 def facade_cases(th: Tallyho, handle: BatchHandle) -> None:
     """Fix-13: публичный API задачи совпадает с ARCHITECTURE §11.2."""
     # a) Фасады задачи — модульные, не атрибуты Tallyho.
@@ -87,6 +139,23 @@ def facade_cases(th: Tallyho, handle: BatchHandle) -> None:
     if context is not None:
         assert_type(context.batch_id, UUID)
         _ = context.summary  # type: ignore[attr-defined]  # pyright: ignore[reportAttributeAccessIssue, reportUnknownVariableType]  # EXPECTED_NEGATIVE
+
+    # f2) Единица работы: current() мягкий, require() строгий (оба WorkItem).
+    work = item.require()
+    assert_type(work, WorkItem)
+    assert_type(work.attempt, int)
+    assert_type(item.current(), WorkItem | None)
+
+    # f3) Итоги-значения: метка позиционна, остальное keyword-only.
+    assert_type(Ok("chunk", result={"checked": 1}), Ok)
+    assert_type(Skip("duplicate"), Skip)
+    assert_type(Defer(reason="quota"), Defer)
+    _ = Ok("chunk", {"checked": 1})  # type: ignore[call-arg]  # pyright: ignore[reportCallIssue]  # EXPECTED_NEGATIVE
+    _ = Defer()  # type: ignore[call-arg]  # pyright: ignore[reportCallIssue]  # EXPECTED_NEGATIVE
+
+    # f4) Закладка: снимок — целое или None, запись принимает position.
+    assert_type(work.checkpoint(), int | None)
+    assert_type(work.defers, int)
 
     # g) Потоковое добавление: seal=False у th.batch (UC-02).
     assert_type(th.batch("import", key="file:1", seal=False), BatchBuilder)

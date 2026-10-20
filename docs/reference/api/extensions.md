@@ -60,3 +60,20 @@
 .. automodule:: tallyho.protocols.broker
    :members:
 ```
+
+## Контейнер зависимостей
+
+Extra `tallyho[dishka]`; как это подключается, описано на странице
+[Dishka](../../integrations/dishka.md).
+
+```{eval-rst}
+.. autoclass:: tallyho.integrations.dishka.DishkaItemScope
+   :members:
+
+.. autoclass:: tallyho.integrations.dishka.TallyhoProvider
+   :members:
+
+.. autofunction:: tallyho.integrations.dishka.inject
+
+.. autofunction:: tallyho.integrations.dishka.scope.current_container
+```

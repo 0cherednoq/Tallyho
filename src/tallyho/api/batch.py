@@ -469,6 +469,32 @@ class BatchHandle:
         """
         await self._engine.set_max_in_flight(session, self.id, None, reason=reason)
 
+    async def release_deferred(
+        self,
+        reasons: Collection[str] | None = None,
+        *,
+        session: AsyncSession | AsyncConnection | None = None,
+    ) -> int:
+        """Разбудить отложенные Items этого батча (ARCHITECTURE UC-20).
+
+        Нужно контуру, который управляет ёмкостью: ресурс появился, и работа,
+        отложенная из-за его нехватки, не должна ждать истечения своего
+        ``delay``. Пауза, отложенный старт и окно соблюдаются — выпуск идёт в
+        пределах свободного места окна. ``defers`` и ``first_deferred_at`` не
+        сбрасываются, поэтому потолки отложений продолжают действовать и
+        пробуждением их не обойти. Вызов идемпотентен.
+
+        Args:
+            reasons: Причины отложения, которые нужно разбудить; ``None`` —
+                все. Пустая коллекция ничего не меняет.
+            session: Сессия или соединение вызывающего: изменение входит в его
+                транзакцию, а relay получает пинок после commit.
+
+        Returns:
+            Число разбуженных записей.
+        """
+        return await self._engine.release_deferred(session, self.id, reasons)
+
     async def cancel(self, *, session: AsyncSession | AsyncConnection | None = None) -> None:
         """Запросить отмену поддерева."""
         await self._engine.cancel(session, self.id)

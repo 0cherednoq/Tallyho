@@ -280,6 +280,16 @@ class Facade(EngineFacade):
         self.calls.append(("set_max_in_flight", (target, batch_id, limit, reason)))
 
     @override
+    async def release_deferred(
+        self,
+        target: AsyncSession | AsyncConnection | None,
+        batch_id: UUID,
+        reasons: Collection[str] | None,
+    ) -> int:
+        self.calls.append(("release_deferred", (target, batch_id, reasons)))
+        return 7
+
+    @override
     async def reschedule(
         self,
         target: AsyncSession | AsyncConnection | None,
@@ -458,6 +468,10 @@ async def test_handle_delegates_reads_wait_and_mutations() -> None:
     await handle.cancel()
     assert ("set_max_in_flight", (None, ROOT_ID, 0, "нет кредитов")) in facade.calls
     assert ("set_max_in_flight", (None, ROOT_ID, None, None)) in facade.calls
+    assert await handle.release_deferred(["no_accounts"]) == 7
+    assert await handle.release_deferred() == 7
+    assert ("release_deferred", (None, ROOT_ID, ["no_accounts"])) in facade.calls
+    assert ("release_deferred", (None, ROOT_ID, None)) in facade.calls
     assert await handle.retry_failed(labels=["bad"]) == 4
     await handle.retry_finalize()
     await handle.release()
@@ -471,6 +485,7 @@ async def test_handle_delegates_reads_wait_and_mutations() -> None:
         "pause",
         "resume",
         "set_max_in_flight",
+        "release_deferred",
         "cancel",
         "retry_failed",
         "retry_finalize",

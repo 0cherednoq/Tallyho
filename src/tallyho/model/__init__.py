@@ -27,6 +27,7 @@ from tallyho.model.errors import (
     TallyhoError,
     UnsupportedOption,
 )
+from tallyho.model.outcomes import Defer, Error, Ok, Outcome, Skip
 from tallyho.model.policy import (
     FailurePolicy,
     OutcomeCounts,
@@ -78,7 +79,9 @@ __all__ = [
     "CompleterError",
     "ConcurrentModification",
     "ConfigurationError",
+    "Defer",
     "DownstreamFinalized",
+    "Error",
     "FailurePolicy",
     "HookMissingError",
     "HookTransactionError",
@@ -90,8 +93,10 @@ __all__ = [
     "LeaseLostError",
     "NodeCounters",
     "NotFoundError",
+    "Ok",
     "OnFeederFailed",
     "OutboxKind",
+    "Outcome",
     "OutcomeCounts",
     "PolicyAction",
     "PolicyBreach",
@@ -102,6 +107,7 @@ __all__ = [
     "RateTracker",
     "ResultClass",
     "SealError",
+    "Skip",
     "SpawnTargetError",
     "TallyhoError",
     "TaskCall",

@@ -17,7 +17,8 @@
   индексы;
 * FK не объявляются: целостность держит библиотека, retention удаляет деревом;
 * ``th_batch_attr`` — отдельная таблица: jsonb с GIN-индексом не лежит в часто
-  обновляемой строке ``th_batch``;
+  обновляемой строке ``th_batch``; по тому же правилу закладка прогресса живёт
+  в ``th_checkpoint``, а не колонкой ``th_item``;
 * partial-индексы записаны через коды :mod:`tallyho.model.states` (D-005).
   Чтобы планировщик взял такой индекс, запрос должен содержать то же условие
   литералом, а не bind-параметром.
@@ -454,6 +455,23 @@ class WindowColumns(TypedColumns):
 
 
 @final
+class CheckpointColumns(TypedColumns):
+    """Колонки ``th_checkpoint``: закладка составной единицы работы (§5.1, UC-19).
+
+    ``position`` — сколько элементов payload или шагов этого Item обработано.
+    Пишет только ``WorkItem.checkpoint_in`` в транзакции приложения, читает
+    claim через ``LEFT JOIN`` по PK. Таблица узкая и отдельная, потому что
+    закладка обновляется десятки раз за Item, а горячая строка ``th_item``
+    рассчитана ровно на одно HOT-обновление (finish).
+    """
+
+    item_id = Column(Uuid(), primary_key=True)
+    batch_id = _uuid()
+    position = _big()
+    updated_at = _utc()
+
+
+@final
 class MetaColumns(TypedColumns):
     """Колонки ``th_meta``: служебные значения установки, в том числе версия схемы."""
 
@@ -478,6 +496,7 @@ class Tables:
     item_mark: Table[ItemMarkColumns]
     expiry: Table[ExpiryColumns]
     window: Table[WindowColumns]
+    checkpoint: Table[CheckpointColumns]
     meta: Table[MetaColumns]
 
 
@@ -524,6 +543,12 @@ def build_metadata(
         item_mark=_table(f"{prefix}item_mark", metadata, ItemMarkColumns),
         expiry=_expiry(metadata, prefix),
         window=_window(metadata, prefix),
+        checkpoint=_table(
+            f"{prefix}checkpoint",
+            metadata,
+            CheckpointColumns,
+            postgresql_with={"fillfactor": _HOT_FILLFACTOR, **_AGGRESSIVE_AUTOVACUUM},
+        ),
         meta=_table(f"{prefix}meta", metadata, MetaColumns),
     )
 
