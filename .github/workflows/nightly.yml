@@ -43,7 +43,7 @@ jobs:
       seed: ${{ steps.seed.outputs.seed }}
       duration: ${{ steps.seed.outputs.duration }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
@@ -122,7 +122,7 @@ jobs:
     env:
       TALLYHO_TEST_DSN: postgresql+asyncpg://tallyho:tallyho@localhost:5432/tallyho
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
@@ -151,7 +151,7 @@ jobs:
       SEED: ${{ needs.setup.outputs.seed }}
       DURATION: ${{ needs.setup.outputs.duration }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
@@ -165,7 +165,7 @@ jobs:
           uv run poe acceptance --seed "${SEED}" --scenario "${{ matrix.scenario }}" \
             --chaos "${{ matrix.chaos }}" --duration "${DURATION}" --jobs 0
       # Журнал хаоса, oracle.json, containers.log — отчёт прогона (ACCEPTANCE §11).
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: ${{ !cancelled() }}
         with:
           name: a-ch-${{ matrix.chaos }}-${{ matrix.scenario }}-seed-${{ env.SEED }}
@@ -200,7 +200,7 @@ jobs:
     env:
       SEED: ${{ needs.setup.outputs.seed }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
@@ -211,7 +211,7 @@ jobs:
           echo "seed=${SEED}"
           echo "Воспроизвести: uv run poe acceptance-uc --uc ${{ matrix.uc }} --seed ${SEED} --scale 0.1 --jobs 2"
           uv run poe acceptance-uc --uc "${{ matrix.uc }}" --seed "${SEED}" --scale 0.1 --jobs 2
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: ${{ !cancelled() }}
         with:
           name: a-uc-part-${{ matrix.part }}-seed-${{ env.SEED }}
@@ -251,7 +251,7 @@ jobs:
       FLEXIQ_GIT_URL: ${{ vars.FLEXIQ_GIT_URL || 'https://github.com/ByteVeda/flexiq' }}
       FLEXIQ_GIT_REF: ${{ vars.FLEXIQ_GIT_REF || 'master' }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: astral-sh/setup-uv@v7
         with:
           enable-cache: true
@@ -288,7 +288,7 @@ jobs:
       matrix:
         id: [P-01, P-04]
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - id: harness
         name: Is the benchmark harness (T11.5) in place?
         run: |
@@ -308,7 +308,7 @@ jobs:
       - if: steps.harness.outputs.present == 'true'
         run: uv run poe bench --id "${{ matrix.id }}" --profile nightly
       - if: steps.harness.outputs.present == 'true' && !cancelled()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: bench-${{ matrix.id }}-seed-${{ needs.setup.outputs.seed }}
           path: .work-tmp/bench/
